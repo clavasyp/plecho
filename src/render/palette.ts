@@ -17,17 +17,17 @@ export const palette = {
   fog: '#0e1116',
 
   /** Рельеф — почти не читается, служит подложкой. */
-  terrain: '#161b22',
-  terrainEdge: '#1b212a',
+  terrain: '#1b232d',
+  terrainEdge: '#222b36',
 
   /** Дороги по классам: чем выше класс, тем светлее. */
-  roadFederal: '#39424f',
-  roadRegional: '#2b323c',
-  roadLocal: '#232932',
+  roadFederal: '#4d5a6b',
+  roadRegional: '#3a444f',
+  roadLocal: '#2f3640',
 
   /** Застройка. Разброс по высоте даёт силуэт, разброс по тону — объём. */
-  buildingLow: '#2a313b',
-  buildingHigh: '#3b4552',
+  buildingLow: '#39434f',
+  buildingHigh: '#5a6a7d',
 
   /** Акцент. Единственный тёплый цвет и единственный, который светится. */
   accent: '#ff7a1a',
@@ -46,15 +46,15 @@ export const palette = {
  */
 export const lighting = {
   keyColor: '#b8c7d9',
-  keyIntensity: 1.4,
+  keyIntensity: 2.4,
   /** Направление ключевого света — низкое солнце даёт длинные тени и объём. */
   keyPosition: [180, 260, 120] as const,
 
   fillColor: '#243040',
-  fillIntensity: 0.55,
+  fillIntensity: 0.7,
 
   ambientColor: '#1a2430',
-  ambientIntensity: 0.35,
+  ambientIntensity: 0.55,
 } as const
 
 /** Туман скрывает край карты и создаёт глубину. Значения в километрах. */
@@ -70,5 +70,5 @@ export const postFx = {
   bloomSmoothing: 0.4,
   vignetteDarkness: 0.55,
   vignetteOffset: 0.25,
-  noiseOpacity: 0.035,
+  noiseOpacity: 0.012,
 } as const

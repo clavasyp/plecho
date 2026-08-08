@@ -42,6 +42,7 @@ import type {
   VehiclePosition,
 } from '../sim/types'
 import { CFO_ORIGIN, project } from '../sim/world/projection'
+import { layers } from './layers'
 import { palette } from './palette'
 
 // ─── Форма машины ──────────────────────────────────────────────────────────
@@ -72,7 +73,7 @@ const RIG_LENGTH = CAB.length + COUPLING_GAP + TRAILER.length
  * Подъём над плоскостью дорог. Дороги и машины лежат на одной высоте, и без
  * зазора грани мерцают Z-конфликтом на пологих углах камеры.
  */
-const GROUND_CLEARANCE = 0.25
+const GROUND_CLEARANCE = layers.vehicle
 
 /**
  * Смещения частей относительно точки машины.

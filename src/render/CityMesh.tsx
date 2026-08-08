@@ -35,6 +35,7 @@ import { useShallow } from 'zustand/shallow'
 import { useGameStore } from '../app/store'
 import { Rng } from '../sim/rng'
 import { CFO_ORIGIN, project } from '../sim/world/projection'
+import { layers } from './layers'
 import { palette } from './palette'
 import type { City } from '../sim/types'
 
@@ -138,7 +139,7 @@ const LANDMARK_FACTOR = 1.55
  * Выше любой дороги (см. ROAD_ELEVATION в RoadMesh): площадка должна накрывать
  * концы дорожных лент, иначе ленты торчат из города обрубками.
  */
-const PAD_ELEVATION = 1
+const PAD_ELEVATION = layers.cityPad
 
 /** Насколько площадка шире самой застройки — это окраина и подъезды. */
 const PAD_MARGIN = 1.3
@@ -397,7 +398,7 @@ export function Cities(): JSX.Element {
     layout.buildings.forEach((building, index) => {
       // Коробка BoxGeometry центрирована, а здание стоит на земле — отсюда
       // подъём на половину высоты.
-      position.set(building.x, building.height / 2, building.z)
+      position.set(building.x, layers.buildingBase + building.height / 2, building.z)
       quaternion.setFromAxisAngle(axis, building.yaw)
       scale.set(building.width, building.height, building.depth)
 

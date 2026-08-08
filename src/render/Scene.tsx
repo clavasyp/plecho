@@ -27,12 +27,14 @@ import {
   Bloom,
   EffectComposer,
   Noise,
+  ToneMapping,
   Vignette,
 } from '@react-three/postprocessing'
-import { BlendFunction } from 'postprocessing'
+import { BlendFunction, ToneMappingMode } from 'postprocessing'
 import { useGameStore } from '../app/store'
 import { fogRange, lighting, palette, postFx } from './palette'
 import { Cities, cityPoint } from './CityMesh'
+import { CityPicker } from './CityPicker'
 import { Roads } from './RoadMesh'
 import { Vehicles } from './VehicleMesh'
 
@@ -335,6 +337,7 @@ export function Scene(): JSX.Element {
       <Roads />
       <Cities />
       <Vehicles />
+      <CityPicker />
 
       {/*
         Порядок эффектов не косметика — они применяются цепочкой, и каждый
@@ -368,6 +371,26 @@ export function Scene(): JSX.Element {
           luminanceSmoothing={postFx.bloomSmoothing}
           mipmapBlur
         />
+        {/*
+          Тональная компрессия обязана быть здесь явно.
+
+          @react-three/postprocessing на время своего монтирования принудительно
+          ставит рендереру NoToneMapping: он рассчитывает, что компрессией
+          займётся сам композер. Не добавить эффект в цепочку — значит остаться
+          вообще без неё, и вся сцена выходит плоской и тёмной, будто света не
+          хватает. Света хватает; не хватало кривой.
+
+          Место в цепочке — строго после Bloom и до Vignette: свечение считается
+          по линейной яркости сцены, а виньетка и зерно ложатся уже на
+          приведённое к экрану изображение.
+
+          Кривая — ACES, а не AgX. AgX бережнее к пересветам, но заметно гасит
+          середину, а вся сцена здесь и есть середина: тёмный рельеф под
+          рассеянным светом. На ней AgX съедал остатки контраста и карта
+          выглядела выцветшей.
+        */}
+        <ToneMapping mode={ToneMappingMode.ACES_FILMIC} />
+
         <Vignette
           offset={postFx.vignetteOffset}
           darkness={postFx.vignetteDarkness}

@@ -39,6 +39,7 @@ import type { JSX } from 'react'
 import { useShallow } from 'zustand/shallow'
 import { useGameStore } from '../app/store'
 import { cityPoint } from './CityMesh'
+import { layers as sceneLayers } from './layers'
 import { palette } from './palette'
 import type { CityId, RoadClass } from '../sim/types'
 
@@ -59,9 +60,9 @@ const ROAD_STYLE: Record<
   RoadClass,
   { width: number; color: string; elevation: number }
 > = {
-  федеральная: { width: 3.4, color: palette.roadFederal, elevation: 0.9 },
-  региональная: { width: 2.3, color: palette.roadRegional, elevation: 0.6 },
-  местная: { width: 1.4, color: palette.roadLocal, elevation: 0.3 },
+  федеральная: { width: 3.4, color: palette.roadFederal, elevation: sceneLayers.roadFederal },
+  региональная: { width: 2.3, color: palette.roadRegional, elevation: sceneLayers.roadRegional },
+  местная: { width: 1.4, color: palette.roadLocal, elevation: sceneLayers.roadLocal },
 }
 
 /** Порядок отрисовки: мелкие дороги ложатся первыми, крупные поверх. */

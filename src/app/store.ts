@@ -14,9 +14,12 @@
  */
 
 import { create } from 'zustand'
+import { setRoute } from '../sim/logistics/vehicle'
 import { createInitialState } from '../sim/state'
 import { tick } from '../sim/tick'
-import type { GameSpeed, GameState } from '../sim/types'
+import type { CityId, EdgeId, GameSpeed, GameState } from '../sim/types'
+import { buildGraph } from '../sim/world/graph'
+import { findRoute } from '../sim/world/pathfind'
 
 /**
  * Сид мира. Зафиксирован константой, а не взят из времени запуска: пока идёт
@@ -36,6 +39,14 @@ export type GameStore = {
   setSpeed: (speed: GameSpeed) => void
   /** Продвинуть симуляцию на N тиков. Вызывается из игрового цикла. */
   advance: (ticks: number) => void
+  /**
+   * Отправить машину игрока в город.
+   *
+   * Пока машина одна и линий ещё нет, это единственный способ отдать команду —
+   * и заодно единственное место, где поиск пути встречается с симуляцией.
+   * В срезе 4 отсюда вырастет назначение на линию.
+   */
+  dispatchTo: (destination: CityId) => void
 }
 
 const initialState = createInitialState(WORLD_SEED)
@@ -47,6 +58,44 @@ export const useGameStore = create<GameStore>((set) => ({
   speed: 1,
 
   setSpeed: (speed) => set({ speed }),
+
+  dispatchTo: (destination) =>
+    set((store) => {
+      const state = store.state
+      const vehicle = Object.values(state.vehicles).find(
+        (v) => v.ownerId === state.playerId,
+      )
+      if (vehicle === undefined) return store
+
+      // Откуда считать путь: из города, если машина стоит, и из того города,
+      // КУДА она едет, если она уже на ребре. Развернуть фуру посреди трассы
+      // нельзя — она доедет до ближайшего узла и только там свернёт.
+      const origin =
+        vehicle.position.kind === 'узел'
+          ? vehicle.position.nodeId
+          : otherEndOf(state, vehicle.position.edgeId, vehicle.position.fromId)
+
+      if (origin === null) return store
+
+      const route = findRoute(
+        buildGraph(state.world.edges),
+        origin,
+        destination,
+        vehicle.cruiseKmh,
+      )
+      if (route === null) return store
+
+      return {
+        ...store,
+        state: {
+          ...state,
+          vehicles: {
+            ...state.vehicles,
+            [vehicle.id]: setRoute(vehicle, route),
+          },
+        },
+      }
+    }),
 
   advance: (ticks) =>
     set((store) => {
@@ -66,3 +115,26 @@ export const useGameStore = create<GameStore>((set) => ({
       return { prev, state }
     }),
 }))
+
+/** Дальний конец ребра относительно того, откуда выехали. */
+function otherEndOf(
+  state: GameState,
+  edgeId: EdgeId,
+  fromId: CityId,
+): CityId | null {
+  const edge = state.world.edges[edgeId]
+  if (edge === undefined) return null
+  return edge.from === fromId ? edge.to : edge.from
+}
+
+/**
+ * Доступ к состоянию из консоли и из e2e — только в режиме разработки.
+ *
+ * Нужен, чтобы тест мог проверять симуляцию напрямую («машина доехала?»), а не
+ * угадывать её состояние по пикселям. В продакшен-сборке ветка вырезается
+ * целиком: import.meta.env.DEV — константа на этапе сборки, и минификатор
+ * выбрасывает мёртвый код вместе с ссылкой на стор.
+ */
+if (import.meta.env.DEV) {
+  ;(globalThis as unknown as { __plecho?: unknown }).__plecho = useGameStore
+}
