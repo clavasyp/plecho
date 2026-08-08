@@ -1,0 +1,62 @@
+name: Сборка и деплой
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Параллельные деплои конфликтуют — держим одну очередь
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Тесты и сборка
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Установка зависимостей
+        run: npm ci
+
+      - name: Линтер
+        run: npm run lint
+
+      - name: Тесты симуляции
+        run: npm test
+
+      - name: Сборка
+        run: npm run build
+
+      # Артефакт для Pages нужен только с основной ветки
+      - name: Подготовка артефакта
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    name: Публикация
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Деплой в Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
