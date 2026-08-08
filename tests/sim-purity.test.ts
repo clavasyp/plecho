@@ -16,7 +16,18 @@ import { describe, expect, it } from 'vitest'
  * комментарием и он падает в общем прогоне.
  */
 
-const SIM_DIR = join(process.cwd(), 'src', 'sim')
+/**
+ * Проверяются ОБА каталога, и это важно.
+ *
+ * src/sim импортирует src/data (начальное состояние собирается из городов и
+ * дорог), поэтому нечистота в данных нечистота и в симуляции — но сканирование
+ * одного лишь src/sim её бы не заметило. Дыру нашла ревизия; закрываем список
+ * каталогов, а не один путь.
+ */
+const PURE_DIRS = [
+  join(process.cwd(), 'src', 'sim'),
+  join(process.cwd(), 'src', 'data'),
+]
 
 /** Пакеты, привязывающие код к браузеру или к слою представления. */
 const FORBIDDEN_PACKAGES = [
@@ -81,10 +92,15 @@ function stripStringsAndComments(code: string): string {
     .replace(/`(?:\\.|[^`\\])*`/g, '``')
 }
 
-const files = collectSourceFiles(SIM_DIR)
+const files = PURE_DIRS.flatMap(collectSourceFiles)
 
-describe('чистота src/sim', () => {
-  it('в sim есть исходники — тест не проходит вхолостую', () => {
+describe('чистота src/sim и src/data', () => {
+  it('исходники найдены — тест не проходит вхолостую', () => {
+    // Порог не «больше нуля», а по каталогам: опечатка в пути к одному из них
+    // сделала бы половину проверки бесшумно пустой.
+    for (const dir of PURE_DIRS) {
+      expect(collectSourceFiles(dir).length, dir).toBeGreaterThan(0)
+    }
     expect(files.length).toBeGreaterThan(0)
   })
 
