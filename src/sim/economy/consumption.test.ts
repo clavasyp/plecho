@@ -77,7 +77,19 @@ function makeState(cities: City[]): GameState {
       industries: {},
     },
     companies: {
-      [PLAYER]: { id: PLAYER, name: 'Игрок', money: 0, controller: 'человек' },
+      // Поля среза 3 (линии, суточный итог, банкротство) достраиваются
+      // пустыми: потреблению они не нужны, но без них фикстура не собирается.
+      [PLAYER]: {
+        id: PLAYER,
+        name: 'Игрок',
+        money: 0,
+        controller: 'человек',
+        lines: {},
+        dailyRevenue: 0,
+        dailyCosts: 0,
+        bankrupt: false,
+        daysInDebt: 0,
+      },
     },
     playerId: PLAYER,
     vehicles: {},

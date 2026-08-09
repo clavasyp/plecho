@@ -1,157 +1,139 @@
 import { describe, expect, it } from 'vitest'
-import { CARGO_RATE } from '../../data/recipes'
+import { EDGES } from '../../data/roads'
 import {
-  DELIVERY_FIXED_SHARE,
-  DELIVERY_REFERENCE_KM,
-  deliveryRevenue,
-} from './finance'
+  FUEL_PRICE_PER_LITER,
+  HANDLING_PER_TON,
+  MAINTENANCE_PER_KM,
+  TARIFF_PER_TON_KM,
+} from '../../data/operating'
+import { CARGO_PREMIUM } from '../../data/recipes'
+import type { CargoType } from '../types'
+import { deliveryRevenue } from './finance'
 
 /**
- * Числа здесь считаются на бумаге по формуле из шапки finance.ts:
+ * Тариф считается за тонно-километр плюс погрузка, всё с надбавкой за груз:
  *
- *     руб = тонны × ставка × (0.4 + 0.6 × км / 200)
+ *     руб = тонны × (погрузка + тариф × км) × надбавка
  *
- * Там, где проверяется смысл, а не арифметика, стоят расстояния из настоящего
- * графа дорог: 185 км — Москва — Тула по М-2, 395 — Москва — Смоленск по М-1.
+ * Ожидания выводятся из констант, а не вписаны числами: перебалансировка
+ * тарифа не должна ронять проверки, в которых не меняется ни одно правило.
  */
 
+/** Реальные плечи из графа дорог. */
 const MOSCOW_TULA_KM = 185
 const MOSCOW_SMOLENSK_KM = 395
 
-describe('deliveryRevenue: смысл ставки', () => {
-  it('на опорном плече равна ставке за тонну без поправок', () => {
-    // Главное свойство формулы: CARGO_RATE читается буквально ровно на 200 км.
-    for (const cargo of Object.keys(CARGO_RATE) as (keyof typeof CARGO_RATE)[]) {
-      expect(deliveryRevenue(cargo, 1, DELIVERY_REFERENCE_KM)).toBeCloseTo(
-        CARGO_RATE[cargo],
-        9,
-      )
-    }
+/** Расход стартового ЗИЛа, литров на 100 км. */
+const ZIL_FUEL_PER_100KM = 30
+/** Грузоподъёмность стартового ЗИЛа, тонн. */
+const ZIL_TONS = 6
+
+/** Переменные расходы на километр: топливо плюс обслуживание. */
+const COST_PER_KM =
+  (ZIL_FUEL_PER_100KM / 100) * FUEL_PRICE_PER_LITER + MAINTENANCE_PER_KM
+
+const ALL_CARGO = Object.keys(CARGO_PREMIUM) as CargoType[]
+
+describe('deliveryRevenue: устройство тарифа', () => {
+  it('складывается из погрузки и тонно-километров', () => {
+    const revenue = deliveryRevenue('зерно', ZIL_TONS, MOSCOW_TULA_KM)
+    const expected =
+      ZIL_TONS *
+      (HANDLING_PER_TON + TARIFF_PER_TON_KM * MOSCOW_TULA_KM) *
+      CARGO_PREMIUM['зерно']
+
+    expect(revenue).toBeCloseTo(expected, 9)
   })
 
-  it('дорогой груз оплачивается лучше дешёвого на том же плече', () => {
-    const flour = deliveryRevenue('мука', 6, MOSCOW_TULA_KM)
-    const grain = deliveryRevenue('зерно', 6, MOSCOW_TULA_KM)
-
-    // 1600 против 900 — отношение выручки в точности отношение ставок.
-    expect(flour / grain).toBeCloseTo(1600 / 900, 9)
-  })
-})
-
-describe('deliveryRevenue: тоннаж', () => {
-  it('растёт с тоннажем', () => {
+  it('растёт линейно с тоннажем', () => {
     const one = deliveryRevenue('мука', 1, MOSCOW_TULA_KM)
     const six = deliveryRevenue('мука', 6, MOSCOW_TULA_KM)
-
-    expect(six).toBeGreaterThan(one)
+    expect(six).toBeCloseTo(one * 6, 9)
   })
 
-  it('строго пропорциональна тоннажу — скидок за объём нет', () => {
-    // Скидка за объём была бы отдельным решением про экономику, а не побочным
-    // эффектом формулы. Пока её нет, это должно быть видно тестом.
-    const six = deliveryRevenue('мука', 6, MOSCOW_TULA_KM)
-    const twelve = deliveryRevenue('мука', 12, MOSCOW_TULA_KM)
+  it('растёт с расстоянием, но не пропорционально ему', () => {
+    const near = deliveryRevenue('мука', ZIL_TONS, MOSCOW_TULA_KM)
+    const far = deliveryRevenue('мука', ZIL_TONS, MOSCOW_SMOLENSK_KM)
 
-    expect(twelve).toBeCloseTo(six * 2, 9)
+    expect(far).toBeGreaterThan(near)
+    // Постоянная часть за погрузку не зависит от плеча, поэтому выручка растёт
+    // медленнее расстояния: вдвое дальше — меньше чем вдвое дороже.
+    expect(far / near).toBeLessThan(MOSCOW_SMOLENSK_KM / MOSCOW_TULA_KM)
   })
 
-  it('нулевой и отрицательный тоннаж денег не приносит', () => {
-    expect(deliveryRevenue('мука', 0, MOSCOW_TULA_KM)).toBe(0)
-    expect(deliveryRevenue('мука', -6, MOSCOW_TULA_KM)).toBe(0)
+  it('надбавка за груз умеренная, а не кратная', () => {
+    // Здесь была главная ошибка баланса: ставки от 800 до 2000 перебивали
+    // штраф за порожний пробег, и метрика переставала предсказывать прибыль.
+    const values = Object.values(CARGO_PREMIUM)
+    expect(Math.max(...values) / Math.min(...values)).toBeLessThan(1.5)
+  })
+
+  it('битые данные дают ноль, а не NaN', () => {
+    expect(deliveryRevenue('зерно', Number.NaN, 100)).toBe(0)
+    expect(deliveryRevenue('зерно', 6, Number.NaN)).toBe(0)
+    expect(deliveryRevenue('зерно', 0, 100)).toBe(0)
+    expect(deliveryRevenue('зерно', 6, 0)).toBe(0)
+    expect(deliveryRevenue('зерно', -6, 100)).toBe(0)
+    expect(deliveryRevenue('несуществующий' as CargoType, 6, 100)).toBe(0)
   })
 })
 
-describe('deliveryRevenue: расстояние', () => {
-  it('растёт с расстоянием', () => {
-    const near = deliveryRevenue('мука', 6, MOSCOW_TULA_KM)
-    const far = deliveryRevenue('мука', 6, MOSCOW_SMOLENSK_KM)
+/**
+ * ГЛАВНЫЙ ИНВАРИАНТ ИГРЫ.
+ *
+ * Кольцо с одним гружёным плечом обязано быть убыточным, с двумя гружёными —
+ * прибыльным. На этом стоит весь замысел: «порожний пробег превращает
+ * прибыльный рейс в убыточный».
+ *
+ * Это не проверка формулы, а проверка смысла. Прошлая версия тарифа его не
+ * выполняла, и обнаружилось это только численным прогоном ревизии: кольцо с
+ * 0.24% порожнего пробега давало −18 666 руб в сутки, а с 68.89% — плюс.
+ * Тестов, которые бы это поймали, не было ни одного.
+ *
+ * Проверяется на КАЖДОМ грузе и КАЖДОМ реальном ребре карты, а не на одном
+ * разобранном примере: ровно так предыдущая ошибка и проскочила.
+ */
+describe('инвариант баланса: порожнее плечо съедает прибыль', () => {
+  const legs = EDGES.map((edge) => edge.km)
 
-    expect(far).toBeGreaterThan(near)
-  })
-
-  it('монотонна по расстоянию на всём графе', () => {
-    // Все длины рёбер из data/roads.ts по возрастанию: выручка не должна нигде
-    // проседать, иначе где-то в мире нашёлся бы рейс, который выгодно укоротить.
-    const distances = [110, 131, 175, 183, 185, 190, 200, 210, 226, 230, 247,
-      265, 328, 395, 410]
-
-    for (let i = 1; i < distances.length; i++) {
-      expect(deliveryRevenue('мука', 6, distances[i])).toBeGreaterThan(
-        deliveryRevenue('мука', 6, distances[i - 1]),
-      )
+  it.each(ALL_CARGO)('%s: кольцо с одним гружёным плечом убыточно', (cargo) => {
+    for (const km of legs) {
+      const revenue = deliveryRevenue(cargo, ZIL_TONS, km)
+      const ringCost = 2 * km * COST_PER_KM
+      expect(revenue, `${cargo}, плечо ${km} км`).toBeLessThan(ringCost)
     }
   })
 
-  it('короткое плечо всё равно оплачивается — постоянная часть тарифа', () => {
-    // Плечо в четверть опорного приносит заметно больше четверти денег: за
-    // подачу и погрузку платят одинаково на любом расстоянии.
-    const quarter = deliveryRevenue('мука', 6, DELIVERY_REFERENCE_KM / 4)
-    const full = deliveryRevenue('мука', 6, DELIVERY_REFERENCE_KM)
-
-    expect(quarter / full).toBeCloseTo(DELIVERY_FIXED_SHARE + 0.6 * 0.25, 9)
-    expect(quarter / full).toBeGreaterThan(0.25)
+  it.each(ALL_CARGO)('%s: кольцо с двумя гружёными плечами прибыльно', (cargo) => {
+    for (const km of legs) {
+      const revenue = 2 * deliveryRevenue(cargo, ZIL_TONS, km)
+      const ringCost = 2 * km * COST_PER_KM
+      expect(revenue, `${cargo}, плечо ${km} км`).toBeGreaterThan(ringCost)
+    }
   })
 
-  it('вдвое дальше — меньше чем вдвое дороже', () => {
-    // Обратная сторона постоянной части: тариф деградирует по расстоянию, как
-    // в жизни. Если бы удвоение расстояния удваивало выручку, короткие плечи
-    // ничем не отличались бы от длинных.
-    const near = deliveryRevenue('мука', 6, 100)
-    const far = deliveryRevenue('мука', 6, 200)
-
-    expect(far).toBeLessThan(near * 2)
-    expect(far).toBeGreaterThan(near)
+  it('условие держится структурно, а не по совпадению чисел', () => {
+    // На длинных плечах постоянная часть исчезает, и оба неравенства сводятся
+    // к одному, не зависящему ни от расстояния, ни от груза:
+    //     расход/км  <  тонны × тариф × надбавка  <  2 × расход/км
+    // Разбор — в шапке src/data/operating.ts.
+    for (const premium of Object.values(CARGO_PREMIUM)) {
+      const perKm = ZIL_TONS * TARIFF_PER_TON_KM * premium
+      expect(perKm).toBeGreaterThan(COST_PER_KM)
+      expect(perKm).toBeLessThan(2 * COST_PER_KM)
+    }
   })
 
-  it('нулевое плечо не оплачивается', () => {
-    // Иначе город, где рядом стоят производитель и потребитель, превращается в
-    // печатный станок: тонны ездят между складами, не сходя с места.
-    expect(deliveryRevenue('мука', 6, 0)).toBe(0)
-    expect(deliveryRevenue('мука', 6, -185)).toBe(0)
-  })
-})
+  it('на карте нет плеча короче порога, где инвариант ломается', () => {
+    // Ниже порога постоянная часть за погрузку перевешивает, и кольцо с
+    // порожним возвратом снова становится выгодным.
+    // Связывает МАКСИМАЛЬНАЯ надбавка: чем дороже груз, тем выше порог.
+    const worstPremium = Math.max(...Object.values(CARGO_PREMIUM))
+    const threshold =
+      (ZIL_TONS * HANDLING_PER_TON * worstPremium) /
+      (2 * COST_PER_KM - ZIL_TONS * TARIFF_PER_TON_KM * worstPremium)
 
-describe('deliveryRevenue: реальные рейсы', () => {
-  it('Москва — Тула, шесть тонн муки: 9168 рублей', () => {
-    // 6 × 1600 × (0.4 + 0.6 × 185/200). Якорь баланса: если число поедет,
-    // поедет и весь расчёт окупаемости из шапки finance.ts.
-    expect(deliveryRevenue('мука', 6, MOSCOW_TULA_KM)).toBeCloseTo(9168, 6)
-  })
-
-  it('Тула — Калуга, шесть тонн зерна: 3942 рубля', () => {
-    // Самый бедный рейс из проверенных: дешёвое сырьё по короткой региональной
-    // трассе. Он обязан оставаться прибыльным, но на грани.
-    expect(deliveryRevenue('зерно', 6, 110)).toBeCloseTo(3942, 6)
-  })
-
-  it('Москва — Смоленск, шесть тонн муки: 15 216 рублей', () => {
-    expect(deliveryRevenue('мука', 6, MOSCOW_SMOLENSK_KM)).toBeCloseTo(15216, 6)
-  })
-
-  it('дальнее плечо проигрывает ближнему в рублях на километр круга', () => {
-    // Не дефект, а сердце игры: порожний возврат съедает выигрыш дальнего
-    // рейса, и лечится это обратной загрузкой, а не выбором плеча подлиннее.
-    const nearPerKm = deliveryRevenue('мука', 6, MOSCOW_TULA_KM) / (2 * 185)
-    const farPerKm = deliveryRevenue('мука', 6, MOSCOW_SMOLENSK_KM) / (2 * 395)
-
-    expect(nearPerKm).toBeGreaterThan(farPerKm)
-  })
-})
-
-describe('deliveryRevenue: битые входы', () => {
-  it('NaN и бесконечности дают ноль, а не заражают баланс', () => {
-    // NaN в деньгах компании неизлечим: все сравнения с ним ложны, и
-    // банкротство не наступает никогда.
-    expect(deliveryRevenue('мука', Number.NaN, 185)).toBe(0)
-    expect(deliveryRevenue('мука', 6, Number.NaN)).toBe(0)
-    expect(deliveryRevenue('мука', Number.POSITIVE_INFINITY, 185)).toBe(0)
-    expect(deliveryRevenue('мука', 6, Number.POSITIVE_INFINITY)).toBe(0)
-  })
-
-  it('неизвестный груз денег не приносит', () => {
-    // Груз, которого нет в CARGO_RATE, — это опечатка в данных, а не бесплатная
-    // перевозка по нулевой ставке.
-    const unknown = 'щебень' as Parameters<typeof deliveryRevenue>[0]
-    expect(deliveryRevenue(unknown, 6, 185)).toBe(0)
+    const shortest = Math.min(...EDGES.map((edge) => edge.km))
+    expect(shortest, `порог ${threshold.toFixed(1)} км`).toBeGreaterThan(threshold)
   })
 })

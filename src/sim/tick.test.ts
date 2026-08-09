@@ -1,47 +1,65 @@
 import { describe, expect, it } from 'vitest'
 import {
+  BANKRUPTCY_GRACE_DAYS,
+  DRIVER_WAGE_PER_DAY,
+  FUEL_PRICE_PER_LITER,
+  MAINTENANCE_PER_KM,
+  ZIL_PRICE,
+} from '../data/operating'
+import {
   CONSUMER_CARGO,
   CONSUMPTION_PER_1K,
   RECIPE_BY_INDUSTRY,
 } from '../data/recipes'
 import { setRoute } from './logistics/vehicle'
-import { createInitialState, PLAYER_ID, START_MONEY } from './state'
+import {
+  createInitialState,
+  PLAYER_ID,
+  START_MONEY,
+  STARTER_CAPACITY_TONS,
+  STARTER_CRUISE_KMH,
+  STARTER_FUEL_PER_100KM,
+} from './state'
 import { HOURS_PER_TICK, tick, tickMany } from './tick'
-import { TICKS_PER_DAY, cityId, vehicleId } from './types'
+import { TICKS_PER_DAY, cityId, lineId, vehicleId } from './types'
 import type {
   CargoType,
   CityId,
+  Company,
   GameState,
   Industry,
   IndustryType,
+  Line,
+  LineId,
+  Stop,
   Tons,
   Vehicle,
   VehicleId,
 } from './types'
 import { buildGraph } from './world/graph'
-import { findRoute } from './world/pathfind'
+import { findRoute, shortestKm } from './world/pathfind'
 
 /**
  * Тик проверяется на НАСТОЯЩЕМ мире: города, дороги и предприятия берутся из
- * начального состояния, а не подделываются. Это интеграционный тест среза 2 —
- * его задача не в том, чтобы поймать ошибку в отдельной формуле (для этого
- * есть тесты рядом с самими формулами), а в том, чтобы доказать два
- * утверждения, ради которых срез и делался:
+ * начального состояния, а не подделываются. Это интеграционный тест всей
+ * симуляции — его задача не в том, чтобы поймать ошибку в отдельной формуле
+ * (для этого есть тесты рядом с самими формулами), а в том, чтобы доказать
+ * утверждения, ради которых делались срезы.
  *
- *   1. Мир БЕЗ игрока задыхается. За десять суток ВСЁ производство на карте
- *      встаёт: и источники, и переработка упираются в потолок склада, города
- *      проедают завезённое, и ни рубля ниоткуда не появляется.
- *   2. Мир С игроком оживает. Та же цепочка при работающей машине производит,
- *      а счёт компании растёт.
+ * СРЕЗ 2 доказывал, что мир зависит от игрока: без машины всё производство на
+ * карте встаёт, с машиной — оживает. Эти прогоны здесь остались.
  *
- * Если оба прогона дают одно и то же — экономики нет, есть декорация.
+ * СРЕЗ 3 доказывает главное про ДЕНЬГИ, и это тот же самый мир, увиденный с
+ * другой стороны. Раньше выручка была единственным потоком в экономике, и любой
+ * рейс был выгоден по определению. Теперь у машины есть расходы, и они не
+ * зависят от того, есть ли в кузове груз: топливо жжётся по километрам, резина
+ * стирается по километрам, водителю платят по времени. Порожнее плечо стоит
+ * ровно столько же, сколько гружёное, и приносит ноль.
  *
- * Важная деталь первого прогона, которую стоит держать в голове при чтении
- * тестов: переработка встаёт НЕ от голода. Данные дают ей запас сырья на трое
- * суток, и она успевает набить свой склад продукцией раньше, чем съест этот
- * запас. То есть завод останавливается, имея полный склад сырья, — просто
- * складывать выпуск больше некуда. Это и есть «мир зависит от игрока» в самой
- * чистой форме: не хватает не ресурсов, не хватает ВЫВОЗА.
+ * Отсюда главный тест среза — два прогона по тридцать суток на ОДНОМ И ТОМ ЖЕ
+ * кольце, отличающиеся одной строчкой в инструкции остановки. Пробег в них
+ * совпадает до километра, расходы совпадают до рубля, и вся разница — в том,
+ * идёт ли обратное плечо гружёным. Одна компания в плюсе, другая разорена.
  */
 
 const MOSCOW = cityId('moscow')
@@ -49,18 +67,29 @@ const TULA = cityId('tula')
 const KALUGA = cityId('kaluga')
 const BRYANSK = cityId('bryansk')
 const SMOLENSK = cityId('smolensk')
+const YAROSLAVL = cityId('yaroslavl')
 
 /** Сутки в тиках — 96. Экономика живёт сутками, тик для неё слишком мелок. */
 const DAY = TICKS_PER_DAY
 
-/** Крейсерская скорость стартового ЗИЛа. */
-const ZIL_KMH = 70
-
 /** Эталонный мир. Сид фиксирован — прогоны обязаны совпадать между запусками. */
 const WORLD = createInitialState(20250808)
 
+const GRAPH = buildGraph(WORLD.world.edges)
+
+const ZIL: VehicleId = vehicleId('zil')
+const RING: LineId = lineId('ring')
+
 // ─── Фикстуры ──────────────────────────────────────────────────────────────
 
+/**
+ * Машина по образцу стартового ЗИЛа.
+ *
+ * Все характеристики берутся из state.ts, а не выписываются числами. Прогон на
+ * тридцать суток считает расходы по расходу топлива и грузоподъёмности, и
+ * выписанная руками «шестёрка» разъехалась бы с миром при первой же
+ * перебалансировке — молча, потому что тест продолжал бы считать свою правду.
+ */
 function makeVehicle(
   id: string,
   at: CityId,
@@ -72,9 +101,13 @@ function makeVehicle(
     ownerId: PLAYER_ID,
     position: { kind: 'узел', nodeId: at },
     route,
-    cruiseKmh: 90,
+    lineId: null,
+    stopIndex: 0,
+    blockedTicks: 0,
+    cruiseKmh: STARTER_CRUISE_KMH,
+    fuelPer100Km: STARTER_FUEL_PER_100KM,
     odometer: 0,
-    capacity: 6,
+    capacity: STARTER_CAPACITY_TONS,
     cargo: null,
     loadedKm: 0,
     emptyKm: 0,
@@ -96,14 +129,47 @@ function withVehicles(vehicles: Vehicle[]): GameState {
 /**
  * Мир без предприятий — для тестов, где проверяется ТОЛЬКО движение.
  *
- * Погрузка автоматическая, поэтому в живом мире машина, постоявшая в городе с
- * готовой продукцией, уедет из него гружёной. Для проверок «машина не
- * изменилась» и «машины не влияют друг на друга» это лишняя переменная:
- * убираем предприятия и остаёмся с чистой кинематикой.
+ * Погрузка машины без линии автоматическая, поэтому в живом мире машина,
+ * постоявшая в городе с готовой продукцией, уедет из него гружёной. Для
+ * проверок «машина не изменилась» и «машины не влияют друг на друга» это лишняя
+ * переменная: убираем предприятия и остаёмся с чистой кинематикой.
  */
 function movementOnly(vehicles: Vehicle[]): GameState {
   const base = withVehicles(vehicles)
   return { ...base, world: { ...base.world, industries: {} } }
+}
+
+/** Остановка линии: где встать, что выгрузить, что взять. */
+function stop(nodeId: CityId, unload: CargoType[], load: CargoType[]): Stop {
+  return { nodeId, unload, load }
+}
+
+/**
+ * Мир с одной линией и одной машиной на ней.
+ *
+ * Машина ставится в МОСКВЕ, а не на первой остановке. Так партия и начинается
+ * (HOME_CITY), и заодно это единственный способ не потерять первую погрузку:
+ * машина, поставленная прямо на свою нулевую остановку, на первом же тике
+ * считается её обслужившей и уезжает дальше по кольцу пустой.
+ */
+function withLine(stops: Stop[], at: CityId = MOSCOW): GameState {
+  const truck = makeVehicle('zil', at, [], { lineId: RING, stopIndex: 0 })
+  const line: Line = {
+    id: RING,
+    name: 'Кольцо',
+    stops,
+    assignedVehicles: [truck.id],
+  }
+  const player = WORLD.companies[PLAYER_ID]
+
+  return {
+    ...WORLD,
+    companies: {
+      ...WORLD.companies,
+      [PLAYER_ID]: { ...player, lines: { [RING]: line } },
+    },
+    vehicles: { [truck.id]: truck } as Record<VehicleId, Vehicle>,
+  }
 }
 
 /**
@@ -138,11 +204,7 @@ function dailyDemand(population: number, cargo: CargoType): Tons {
 }
 
 /** Завезти городу запас потребительских товаров ровно на N суток. */
-function seedCityStock(
-  state: GameState,
-  id: CityId,
-  days: number,
-): GameState {
+function seedCityStock(state: GameState, id: CityId, days: number): GameState {
   const city = state.world.cities[id]
   const stock: Partial<Record<CargoType, Tons>> = {}
   for (const cargo of CONSUMER_CARGO) {
@@ -154,6 +216,53 @@ function seedCityStock(
       ...state.world,
       cities: { ...state.world.cities, [id]: { ...city, stock } },
     },
+  }
+}
+
+// ─── Деньги прогона ────────────────────────────────────────────────────────
+
+/**
+ * Расходы парка за прогон, посчитанные ПО КОНСТАНТАМ ДАННЫХ, а не по состоянию.
+ *
+ * Формула повторяет контракт data/operating.ts: топливо по километрам, ТО по
+ * километрам, зарплата по суткам на каждую машину. Дублирование намеренное и
+ * полезное — оно превращает арифметику расходов в проверяемое утверждение:
+ * разойдись фаза расходов с этой формулой, и выведенная ниже выручка уедет в
+ * абсурд (например, станет отрицательной у машины, которая точно возила груз).
+ */
+function operatingCosts(vehicles: Vehicle[], days: number): number {
+  let total = DRIVER_WAGE_PER_DAY * days * vehicles.length
+  for (const vehicle of vehicles) {
+    total += (vehicle.odometer / 100) * vehicle.fuelPer100Km * FUEL_PRICE_PER_LITER
+    total += vehicle.odometer * MAINTENANCE_PER_KM
+  }
+  return total
+}
+
+/** Итоги прогона одной машины: чем обычно и меряется линия. */
+type Outcome = {
+  end: GameState
+  truck: Vehicle
+  /** Доля порожних километров, 0..1 — главная метрика мастерства в игре. */
+  emptyShare: number
+  money: number
+  /** Заработано перевозками: остаток счёта плюс всё, что съели расходы. */
+  revenue: number
+  costs: number
+}
+
+function outcomeOf(end: GameState, days: number): Outcome {
+  const truck = end.vehicles[ZIL]
+  const money = end.companies[PLAYER_ID].money
+  const costs = operatingCosts([truck], days)
+
+  return {
+    end,
+    truck,
+    emptyShare: truck.odometer > 0 ? truck.emptyKm / truck.odometer : 0,
+    money,
+    revenue: money - START_MONEY + costs,
+    costs,
   }
 }
 
@@ -216,21 +325,40 @@ function violations(state: GameState): string[] {
         `перегруз ${vehicle.id}: ${vehicle.cargo.tons} т при ${vehicle.capacity}`,
       )
     }
-    // Разнесённых километров не может быть больше пройденных. Разность —
-    // это пробег с последней погрузки, по нему фаза прибытия считает плечо
-    // доставки; уйди она в минус, и рейс оплатился бы за отрицательное плечо.
     check(
       vehicle.loadedKm >= 0 && vehicle.emptyKm >= 0,
       `счётчики ${vehicle.id}: ${vehicle.loadedKm} / ${vehicle.emptyKm}`,
     )
+    // Разнесённых километров не может быть больше пройденных — и меньше тоже:
+    // разнесение живёт в фазе движения и закрывает каждый километр сразу.
     check(
-      vehicle.loadedKm + vehicle.emptyKm <= vehicle.odometer + 1e-6,
-      `разнесено больше пройденного у ${vehicle.id}: ${vehicle.loadedKm} + ${vehicle.emptyKm} > ${vehicle.odometer}`,
+      Math.abs(vehicle.loadedKm + vehicle.emptyKm - vehicle.odometer) < 1e-6,
+      `пробег ${vehicle.id} не сходится: ${vehicle.loadedKm} + ${vehicle.emptyKm} ≠ ${vehicle.odometer}`,
+    )
+    // Расход топлива обязан быть положительным у каждой машины: нулевой
+    // означает машину, которая ездит даром, и порожний пробег перестаёт
+    // что-либо стоить.
+    check(
+      Number.isFinite(vehicle.fuelPer100Km) && vehicle.fuelPer100Km > 0,
+      `расход топлива ${vehicle.id} = ${vehicle.fuelPer100Km}`,
+    )
+    check(
+      Number.isInteger(vehicle.stopIndex) && vehicle.stopIndex >= 0,
+      `индекс остановки ${vehicle.id} = ${vehicle.stopIndex}`,
     )
   }
 
   for (const company of Object.values(state.companies)) {
     check(Number.isFinite(company.money), `счёт ${company.id} = ${company.money}`)
+    check(
+      Number.isFinite(company.dailyRevenue) && company.dailyRevenue >= 0,
+      `суточная выручка ${company.id} = ${company.dailyRevenue}`,
+    )
+    check(
+      Number.isFinite(company.dailyCosts) && company.dailyCosts >= 0,
+      `суточные расходы ${company.id} = ${company.dailyCosts}`,
+    )
+    check(company.daysInDebt >= 0, `суток в минусе ${company.id} = ${company.daysInDebt}`)
   }
 
   return bad
@@ -257,15 +385,11 @@ function runDays(
 }
 
 /**
- * Прогон с ИГРОКОМ ЗА РУЛЁМ: машина челноком ходит между двумя городами.
+ * Прогон РАЗОВЫМИ РЕЙСАМИ: машина челноком ходит между двумя городами.
  *
- * Маршрут выдаётся заново каждый раз, когда машина доехала и встала. Это ровно
- * то, что делает игрок в срезе 2 кнопкой «отправить», и это единственный
- * способ дать машине постоять в узле: advanceVehicle доедает остаток тика и
- * проходит промежуточные города НАСКВОЗЬ, поэтому машина с длинным
- * заготовленным маршрутом почти никогда не оказывается в узле на границе тика —
- * а погрузка бывает только на стоянке. В срезе 3 эту работу возьмут на себя
- * линии, и здесь останется назначение на линию.
+ * Маршрут выдаётся заново каждый раз, когда машина доехала и встала — ровно то,
+ * что делал игрок в срезе 2 кнопкой «отправить». Оставлено намеренно: линии не
+ * отменили разовые рейсы, и поведение машины БЕЗ линии обязано остаться прежним.
  */
 function runShuttle(
   state: GameState,
@@ -306,6 +430,15 @@ function runShuttle(
   return { end: current, broken }
 }
 
+/** Рекурсивная заморозка. Возвращает тот же объект — удобно для инлайна. */
+function deepFreeze<T>(value: T): T {
+  if (value === null || typeof value !== 'object') return value
+  for (const inner of Object.values(value as Record<string, unknown>)) {
+    deepFreeze(inner)
+  }
+  return Object.freeze(value)
+}
+
 // ─── Время ─────────────────────────────────────────────────────────────────
 
 describe('tick: время', () => {
@@ -332,6 +465,62 @@ describe('tick: время', () => {
     const state = withVehicles([])
     expect(tickMany(state, 0)).toBe(state)
     expect(tickMany(state, -5)).toBe(state)
+  })
+})
+
+// ─── Порядок фаз ───────────────────────────────────────────────────────────
+
+describe('tick: порядок фаз', () => {
+  it('диспетчеризация идёт ДО движения: машина на линии выезжает тем же тиком', () => {
+    const state = withLine(FULL_RING)
+
+    const after = tick(state)
+
+    // Один тик: диспетчер выдал маршрут, движение по нему тут же поехало.
+    // Переставь фазы местами — и машина простояла бы этот тик в городе, а
+    // потом теряла бы по тику на каждой остановке каждого круга.
+    expect(after.vehicles[ZIL].route.length).toBeGreaterThan(0)
+    expect(after.vehicles[ZIL].odometer).toBeGreaterThan(0)
+  })
+
+  it('расходы берут километры ЭТОГО тика, а не прошлого', () => {
+    // Москва без предприятий, машина уходит порожней: выручки в этом тике нет
+    // и весь сдвиг счёта — это расходы.
+    const state = withVehicles([makeVehicle('zil', MOSCOW, [TULA])])
+
+    const after = tick(state)
+    const truck = after.vehicles[ZIL]
+    const spent = START_MONEY - after.companies[PLAYER_ID].money
+
+    expect(truck.odometer).toBeGreaterThan(0)
+
+    // Переменная часть за пройденные километры обязана быть списана уже сейчас.
+    // Посчитай расходы до движения — и первый тик стоил бы одну зарплату, а
+    // топливо всю партию отставало бы ровно на тик.
+    const variable =
+      (truck.odometer / 100) * truck.fuelPer100Km * FUEL_PRICE_PER_LITER +
+      truck.odometer * MAINTENANCE_PER_KM
+
+    expect(spent).toBeGreaterThanOrEqual(variable - 1e-6)
+    // Сверху ограничено теми же километрами плюс зарплатой: за один тик больше
+    // суточной зарплаты водителю не платят ни при каком раскладе.
+    expect(spent).toBeLessThanOrEqual(variable + DRIVER_WAGE_PER_DAY)
+  })
+
+  it('стоящая машина всё равно стоит денег', () => {
+    // Машина стоит в Ярославле и никуда не едет — километров ноль, значит и
+    // переменных расходов ноль. Остаётся зарплата, и она обязана списаться:
+    // пропусти фазу расходов для неподвижной машины — и держать простаивающий
+    // парк станет бесплатно, а «лишняя машина убыточна» перестанет быть правдой.
+    const state = withVehicles([makeVehicle('zil', YAROSLAVL, [])])
+
+    const after = tick(state)
+
+    expect(after.vehicles[ZIL].odometer).toBe(0)
+    expect(after.companies[PLAYER_ID].money).toBeLessThan(START_MONEY)
+    expect(START_MONEY - after.companies[PLAYER_ID].money).toBeLessThanOrEqual(
+      DRIVER_WAGE_PER_DAY,
+    )
   })
 })
 
@@ -367,25 +556,28 @@ describe('tick: чистота', () => {
     expect(() => tickMany(state, 300)).not.toThrow()
   })
 
+  it('не трогает вложенные объекты и на линии: компания, линия, остановки', () => {
+    // Отдельный прогон под срез 3. Линия лежит ВНУТРИ компании, а остановка —
+    // внутри линии: до неё три уровня копирования, и пропущенный уровень
+    // проявился бы как «остановки поменялись сами собой» через много часов
+    // игры. Заморозка ловит это на первом же тике.
+    const state = deepFreeze(withLine(FULL_RING))
+    expect(() => tickMany(state, DAY * 3)).not.toThrow()
+  })
+
   it('не подменяет объект машины, если та стоит без задания', () => {
     const parked = makeVehicle('v1', MOSCOW, [])
     const state = movementOnly([parked])
 
     const after = tick(state)
 
+    // Деньги у компании при этом меняются — водителю платят и на стоянке, — но
+    // сама машина обязана остаться тем же объектом: по совпадению ссылок рендер
+    // отличает стоящие машины от едущих.
     expect(after.vehicles).toBe(state.vehicles)
     expect(after.vehicles[parked.id]).toBe(parked)
   })
 })
-
-/** Рекурсивная заморозка. Возвращает тот же объект — удобно для инлайна. */
-function deepFreeze<T>(value: T): T {
-  if (value === null || typeof value !== 'object') return value
-  for (const inner of Object.values(value as Record<string, unknown>)) {
-    deepFreeze(inner)
-  }
-  return Object.freeze(value)
-}
 
 // ─── Детерминизм ───────────────────────────────────────────────────────────
 
@@ -440,6 +632,29 @@ describe('tick: детерминизм', () => {
       JSON.stringify(tickMany(middle, DAY)),
     )
   })
+
+  it('линия переживает сохранение и загрузку', () => {
+    // Линия — первая структура игры, которую игрок строит САМ, и потерять её
+    // при загрузке значит потерять партию. Проверяется не только равенство
+    // объектов, но и продолжение прогона: машина обязана ехать дальше по тому
+    // же кольцу, а не встать, потеряв связь с линией.
+    const middle = tickMany(withLine(FULL_RING), DAY * 3)
+    const loaded = JSON.parse(JSON.stringify(middle)) as GameState
+
+    expect(loaded).toEqual(middle)
+    expect(loaded.companies[PLAYER_ID].lines[RING].stops).toHaveLength(
+      FULL_RING.length,
+    )
+    expect(loaded.vehicles[ZIL].lineId).toBe(RING)
+
+    const a = tickMany(loaded, DAY)
+    const b = tickMany(middle, DAY)
+    expect(JSON.stringify(a)).toBe(JSON.stringify(b))
+    // Машина за эти сутки действительно ехала — сравнение живых состояний.
+    expect(a.vehicles[ZIL].odometer).toBeGreaterThan(
+      middle.vehicles[ZIL].odometer,
+    )
+  })
 })
 
 // ─── Движение ──────────────────────────────────────────────────────────────
@@ -478,13 +693,10 @@ describe('tick: движение', () => {
     const state = movementOnly([makeVehicle('v1', MOSCOW, [TULA])])
 
     // ИНВАРИАНТ: гружёный плюс порожний всегда равны одометру, в любой момент,
-    // включая середину ребра. Разнесение живёт в фазе движения, потому что
-    // только там известно, гружена машина или нет.
-    //
-    // Раньше счета закрывались на остановках, и машина с грузом, которому нигде
-    // нет получателя, не доезжала до закрытия никогда: в прогоне на 100 суток
-    // так терялось 99.5% одометра, а метрика порожнего пробега — главная
-    // метрика мастерства в игре — показывала неправду.
+    // включая середину ребра. В срезе 3 это уже не про аккуратность учёта:
+    // каждый километр из emptyKm — сожжённая солярка, за которую никто не
+    // заплатил, и разойдись эти счета с одометром, метрика порожнего пробега
+    // перестала бы совпадать с деньгами.
     const enRoute = tickMany(state, 4).vehicles[vehicleId('v1')]
     expect(enRoute.position.kind).toBe('ребро')
     expect(enRoute.odometer).toBeGreaterThan(0)
@@ -498,7 +710,7 @@ describe('tick: движение', () => {
   })
 })
 
-// ─── Главный тест среза: мир без игрока ────────────────────────────────────
+// ─── Мир без игрока ────────────────────────────────────────────────────────
 
 describe('десять суток без единой машины: мир задыхается', () => {
   const start = withVehicles([])
@@ -565,7 +777,7 @@ describe('десять суток без единой машины: мир за�
       ).toBeGreaterThan(atStart[recipe.output] ?? 0)
 
       // И это ключевое: сырьё ещё ОСТАЛОСЬ. Значит причина остановки — не
-      // голод, а невывоз. Ровно то утверждение, ради которого сделан срез:
+      // голод, а невывоз. Ровно то утверждение, ради которого сделан срез 2:
       // мир зависит от игрока, даже когда у него всё есть.
       for (const input of recipe.inputs) {
         expect(
@@ -597,10 +809,12 @@ describe('десять суток без единой машины: мир за�
     expect(shrunk).toBeGreaterThan(0)
   })
 
-  it('мир без перевозок не приносит ни рубля', () => {
-    // Денег в системе не прибавляется из ниоткуда. Это же и означает, что
-    // пересидеть партию на стартовом капитале нельзя.
+  it('пустой парк не приносит и не стоит ни рубля', () => {
+    // Денег в системе не прибавляется из ниоткуда, и не убавляется тоже:
+    // расходы считаются на МАШИНУ, а машин нет. Компания без парка — это
+    // компания на паузе, и партия так не проигрывается.
     expect(day10.companies[PLAYER_ID].money).toBe(START_MONEY)
+    expect(day10.companies[PLAYER_ID].bankrupt).toBe(false)
   })
 })
 
@@ -646,14 +860,13 @@ describe('город проедает завезённый запас', () => {
   })
 })
 
-// ─── Главный тест среза: мир с игроком ─────────────────────────────────────
+// ─── Мир с игроком: разовые рейсы никуда не делись ─────────────────────────
 
 describe('десять суток с машиной на цепочке: мир оживает', () => {
   const source = industryOfType(WORLD, 'элеватор')
   const plant = industryOfType(WORLD, 'мукомольный')
 
-  const ZIL = vehicleId('zil')
-  const hauler = makeVehicle('zil', source.cityId, [], { cruiseKmh: ZIL_KMH })
+  const hauler = makeVehicle('zil', source.cityId, [])
 
   const working = withVehicles([hauler])
   const idle = withVehicles([])
@@ -669,15 +882,12 @@ describe('десять суток с машиной на цепочке: мир 
    */
   let sourceLateTicks = 0
   let sourceLateTicksAlone = 0
-  /** Баланс на конец каждых суток — по нему видно, растёт он или замер. */
-  const moneyByDay: number[] = []
 
   const busy = runShuttle(working, ZIL, source.cityId, plant.cityId, 10, (s) => {
     if (s.world.industries[plant.id].utilization > 0) plantWorkedTicks++
     if (s.tick > DAY * 5 && s.world.industries[source.id].utilization > 0) {
       sourceLateTicks++
     }
-    if (s.tick % DAY === 0) moneyByDay.push(s.companies[PLAYER_ID].money)
   })
 
   const alone = runDays(idle, 10, (s) => {
@@ -702,9 +912,7 @@ describe('десять суток с машиной на цепочке: мир 
     // Гружёные километры появились — значит был хотя бы один полный цикл
     // «взял на элеваторе, отдал на комбинате».
     expect(truck.loadedKm).toBeGreaterThan(0)
-    expect(truck.loadedKm + truck.emptyKm).toBeLessThanOrEqual(
-      truck.odometer + 1e-6,
-    )
+    expect(truck.loadedKm + truck.emptyKm).toBeCloseTo(truck.odometer, 6)
   })
 
   it('завод работает только потому, что ему возят сырьё', () => {
@@ -733,12 +941,214 @@ describe('десять суток с машиной на цепочке: мир 
     expect(sourceLateTicks).toBeGreaterThan(0)
   })
 
-  it('деньги растут и продолжают расти', () => {
-    expect(moneyByDay).toHaveLength(10)
-    expect(moneyByDay[4]).toBeGreaterThan(START_MONEY)
-    expect(moneyByDay[9]).toBeGreaterThan(moneyByDay[4])
+  it('челнок зарабатывает — и всё равно разоряется на порожнем возврате', () => {
+    const outcome = outcomeOf(busy.end, 10)
 
-    // Без машины счёт не меняется вообще: мир сам по себе не платит.
+    // Выручка есть: машина возила и ей платили.
+    expect(outcome.revenue).toBeGreaterThan(0)
+
+    // И её не хватает. Челнок «туда с зерном, обратно порожняком» — это ровно
+    // тот случай, который разобран в data/operating.ts: обратное плечо жжёт
+    // столько же топлива, а приносит ноль. Пока расходов не было, такой рейс
+    // выглядел прибыльным; в срезе 3 он показывает, чего стоит.
+    expect(outcome.revenue).toBeLessThan(outcome.costs)
+    expect(outcome.money).toBeLessThan(START_MONEY)
+
+    // Без машины счёт не меняется вообще: мир сам по себе не платит и не тратит.
     expect(alone.end.companies[PLAYER_ID].money).toBe(START_MONEY)
+  })
+})
+
+// ─── ГЛАВНЫЙ ТЕСТ СРЕЗА ────────────────────────────────────────────────────
+
+/*
+ * КОЛЬЦО «НЕФТЬ — ТОПЛИВО»: Смоленск → Ярославль → Москва → Смоленск.
+ *
+ * Смоленская нефтебаза отгружает нефть, ярославский НПЗ превращает её в
+ * топливо, Москва топливо съедает. Три плеча, из которых два могут идти
+ * гружёными, и одно — возврат от потребителя к источнику — гружёным не пойдёт
+ * никогда: в Москве нет ни одного предприятия (см. data/industries.ts), везти
+ * из неё нечего и некому.
+ *
+ * Почему именно эта цепочка, а не более короткая зерновая. Тридцать суток — это
+ * долго, и на такой дистанции линия должна не только считаться, но и РАБОТАТЬ:
+ * источник обязан не иссякнуть, завод — не задохнуться, потребитель — не
+ * наесться. Единственный потребитель в игре, который не наедается никогда, —
+ * Москва, а единственный завод, чей выпуск столица съедает быстрее, чем один
+ * ЗИЛ успевает возить, — НПЗ. Кольца, замкнутые на малые города, за месяц
+ * забивают им склады и перестают быть показательными.
+ *
+ * Оба прогона идут по ОДНОМУ И ТОМУ ЖЕ кольцу и различаются одной строчкой:
+ * забирает ли машина топливо в Ярославле. Пробег, топливо, резина и зарплата в
+ * них совпадают — различается только выручка.
+ */
+
+const FULL_RING: Stop[] = [
+  // Нефтебаза: грузим нефть. Выгружать здесь нечего — обратного груза для
+  // источника в этой цепочке не существует.
+  stop(SMOLENSK, [], ['нефть']),
+  // НПЗ: сдаём нефть и тем же движением забираем готовое топливо. Вот эта
+  // строчка и есть обратная загрузка целиком.
+  stop(YAROSLAVL, ['нефть'], ['топливо']),
+  // Столица: сдаём топливо. Дальше по кольцу — возврат за нефтью.
+  stop(MOSCOW, ['топливо'], []),
+]
+
+/** То же кольцо, но обратное плечо идёт порожняком: топливо никто не берёт. */
+const ONE_LEG_RING: Stop[] = [
+  stop(SMOLENSK, [], ['нефть']),
+  stop(YAROSLAVL, ['нефть'], []),
+  stop(MOSCOW, ['топливо'], []),
+]
+
+describe('тридцать суток на кольце: гружёное обратное плечо против порожнего', () => {
+  const DAYS = 30
+
+  // Длины плеч берутся из графа дорог, а не выписываются числами: правка
+  // километража в data/roads.ts обязана менять ожидания теста сама.
+  const LEG_SUPPLY = shortestKm(GRAPH, SMOLENSK, YAROSLAVL)
+  const LEG_DELIVERY = shortestKm(GRAPH, YAROSLAVL, MOSCOW)
+  const LEG_HOME = shortestKm(GRAPH, MOSCOW, SMOLENSK)
+  const RING_KM = LEG_SUPPLY + LEG_DELIVERY + LEG_HOME
+
+  /** Доля кольца, которая порожняком идёт всегда: возврат из столицы. */
+  const INEVITABLE_EMPTY = LEG_HOME / RING_KM
+  /** Доля кольца, которая порожняком пойдёт без обратной загрузки. */
+  const ABANDONED_EMPTY = (LEG_DELIVERY + LEG_HOME) / RING_KM
+
+  const full = runDays(withLine(FULL_RING), DAYS)
+  const empty = runDays(withLine(ONE_LEG_RING), DAYS)
+
+  const loaded = outcomeOf(full.end, DAYS)
+  const hollow = outcomeOf(empty.end, DAYS)
+
+  it('состояние остаётся исправным оба прогона', () => {
+    expect(full.broken).toEqual([])
+    expect(empty.broken).toEqual([])
+  })
+
+  it('кольцо замкнуто и без обратной загрузки половина его порожняя', () => {
+    // Геометрия задачи, а не результат прогона: возврат из Москвы за нефтью —
+    // это почти треть кольца, и гружёным он не будет никогда. Сняв загрузку в
+    // Ярославле, игрок добавляет к нему ещё и плечо до столицы — ровно половину
+    // кольца.
+    expect(INEVITABLE_EMPTY).toBeGreaterThan(0)
+    expect(INEVITABLE_EMPTY).toBeLessThan(ABANDONED_EMPTY)
+    expect(ABANDONED_EMPTY).toBeCloseTo(0.5, 2)
+  })
+
+  it('оба прогона проезжают одни и те же километры', () => {
+    // Самое важное утверждение теста. Машина одна и та же, кольцо одно и то же,
+    // время одно и то же — значит одинаковы и топливо, и резина, и зарплата.
+    // Всё, чем прогоны отличаются, лежит в выручке.
+    expect(hollow.truck.odometer).toBeCloseTo(loaded.truck.odometer, 0)
+    expect(hollow.costs).toBeCloseTo(loaded.costs, 0)
+  })
+
+  it('кольцо с гружёным обратным плечом выводит компанию в плюс', () => {
+    expect(loaded.revenue).toBeGreaterThan(loaded.costs)
+    expect(loaded.money).toBeGreaterThan(START_MONEY)
+    expect(loaded.end.companies[PLAYER_ID].bankrupt).toBe(false)
+
+    // Заработанного хватает на вторую машину — то самое первое накопление, ради
+    // которого игрок и строит первое кольцо.
+    expect(loaded.money - START_MONEY).toBeGreaterThan(ZIL_PRICE)
+  })
+
+  it('порожний пробег гружёного кольца — ровно его геометрия', () => {
+    // Ни километром больше неизбежного возврата: машина идёт гружёной везде,
+    // где кольцо это позволяет.
+    expect(loaded.emptyShare).toBeCloseTo(INEVITABLE_EMPTY, 2)
+    expect(loaded.emptyShare).toBeLessThan(ABANDONED_EMPTY)
+  })
+
+  it('без обратной загрузки то же кольцо разоряет компанию', () => {
+    // Выручка не исчезла — машина по-прежнему возит нефть на завод. Она просто
+    // перестала покрывать расходы, которые не изменились ни на рубль.
+    expect(hollow.revenue).toBeGreaterThan(0)
+    expect(hollow.revenue).toBeLessThan(hollow.costs)
+
+    // Стартового капитала на месяц такой работы не хватает с большим запасом.
+    expect(hollow.money).toBeLessThan(0)
+  })
+
+  it('порожний пробег без обратной загрузки подскакивает к половине кольца', () => {
+    expect(hollow.emptyShare).toBeGreaterThan(loaded.emptyShare)
+
+    /*
+     * Верхняя граница — геометрическая половина кольца, и до неё порожний
+     * пробег НЕ ДОТЯГИВАЕТ. Причина поучительна сама по себе: НПЗ, у которого
+     * перестали забирать топливо, забивает свой склад и сбрасывает выпуск до
+     * того, что съедает сам Ярославль. Принимать полную ходку нефти он больше
+     * не успевает, машина увозит остаток обратно — и эти километры считаются
+     * гружёными, хотя пользы от них ноль. Порожний пробег в такой линии не
+     * просто высок, он ещё и ЛЬСТИТ: часть провала прячется в тоннах, которые
+     * возят по кругу.
+     */
+    expect(hollow.emptyShare).toBeLessThanOrEqual(ABANDONED_EMPTY + 0.02)
+    expect(hollow.emptyShare).toBeGreaterThan(ABANDONED_EMPTY * 0.6)
+  })
+
+  it('вся разница между прогонами — в выручке обратного плеча', () => {
+    // Выручка полного кольца заметно больше: к нефти на завод добавилось
+    // топливо в столицу, а топливо — самый дорогой груз в игре.
+    expect(loaded.revenue).toBeGreaterThan(hollow.revenue * 1.5)
+    // И именно эта добавка переворачивает знак итога.
+    expect(loaded.money - hollow.money).toBeGreaterThan(0)
+  })
+})
+
+// ─── Партия без линий ──────────────────────────────────────────────────────
+
+describe('партия без единой линии проедает капитал и кончается банкротством', () => {
+  /** Суток до нуля на счету: машина стоит, но водителю платят каждый день. */
+  const DAYS_TO_ZERO = START_MONEY / DRIVER_WAGE_PER_DAY
+  /** С запасом в двое суток на округления и на день обнуления. */
+  const LIMIT_DAYS = Math.ceil(DAYS_TO_ZERO) + BANKRUPTCY_GRACE_DAYS + 2
+
+  const parked = withVehicles([makeVehicle('zil', MOSCOW, [])])
+
+  const early = tickMany(parked, DAY * Math.floor(DAYS_TO_ZERO / 2))
+  const end = tickMany(parked, DAY * LIMIT_DAYS)
+
+  const company = (state: GameState): Company => state.companies[PLAYER_ID]
+
+  it('машина не двигается: линии нет, разовых рейсов не выдавали', () => {
+    expect(end.vehicles[ZIL].odometer).toBe(0)
+    expect(end.vehicles[ZIL].lineId).toBeNull()
+  })
+
+  it('капитал тает с первого же дня', () => {
+    expect(company(early).money).toBeLessThan(START_MONEY)
+    // Тают именно зарплаты: километров нет, значит нет ни топлива, ни резины.
+    const days = Math.floor(DAYS_TO_ZERO / 2)
+    expect(START_MONEY - company(early).money).toBeCloseTo(
+      DRIVER_WAGE_PER_DAY * days,
+      -2,
+    )
+  })
+
+  it('пока деньги есть, компания не банкрот', () => {
+    expect(company(early).money).toBeGreaterThan(0)
+    expect(company(early).bankrupt).toBe(false)
+    expect(company(early).daysInDebt).toBe(0)
+  })
+
+  it('минус не убивает сразу — отсрочка есть', () => {
+    // Уйти в минус на день нормально: закупился топливом, зарплата пришлась на
+    // неудачный момент. Проверяем, что первый же день долга не обнуляет партию.
+    const justInDebt = tickMany(parked, DAY * (Math.ceil(DAYS_TO_ZERO) + 1))
+    expect(company(justInDebt).money).toBeLessThan(0)
+    expect(company(justInDebt).bankrupt).toBe(false)
+  })
+
+  it('не выбравшись из долга за отпущенный срок, компания разоряется', () => {
+    // Главное утверждение: «ничего не возить» — это проигрыш, а не бесконечное
+    // ожидание. Мир не платит сам по себе, а парк стоит денег каждый день.
+    expect(company(end).money).toBeLessThan(0)
+    // Отсрочка отсчитывается тиками по 1/96 суток, поэтому ровно тридцати не
+    // выйдет никогда — сравниваем с допуском в один тик.
+    expect(company(end).daysInDebt).toBeGreaterThan(BANKRUPTCY_GRACE_DAYS - 0.02)
+    expect(company(end).bankrupt).toBe(true)
   })
 })

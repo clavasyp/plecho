@@ -1,10 +1,24 @@
 import { describe, expect, it } from 'vitest'
 import { CITIES } from '../data/cities'
 import { INDUSTRIES } from '../data/industries'
+import {
+  DRIVER_WAGE_PER_DAY,
+  FUEL_PRICE_PER_LITER,
+  MAINTENANCE_PER_KM,
+  ZIL_PRICE,
+} from '../data/operating'
 import { RECIPES, RECIPE_BY_INDUSTRY } from '../data/recipes'
 import { EDGES } from '../data/roads'
-import { createInitialState, START_MONEY, START_YEAR } from './state'
+import { DELIVERY_REFERENCE_KM } from './economy/finance'
+import {
+  createInitialState,
+  createZil,
+  START_MONEY,
+  START_YEAR,
+  STARTER_FUEL_PER_100KM,
+} from './state'
 import { dateFromTick } from './time'
+import { cityId, companyId, vehicleId } from './types'
 
 describe('createInitialState', () => {
   it('детерминирован: один сид — идентичный JSON', () => {
@@ -72,6 +86,23 @@ describe('createInitialState', () => {
     expect(player.controller).toBe('человек')
     expect(player.name.length).toBeGreaterThan(0)
     expect(player.money).toBe(START_MONEY)
+  })
+
+  it('компания начинает без линий, без итогов и не банкротом', () => {
+    const state = createInitialState(1)
+    const player = state.companies[state.playerId]
+
+    // Первую сеть проектирует игрок. Готовое кольцо на старте отобрало бы у
+    // него ровно то решение, ради которого срез 3 и сделан.
+    expect(player.lines).toEqual({})
+
+    // Суточный итог ещё не подводился — первые сутки не прошли. Ноль здесь
+    // означает «данных нет», а не «сработали в ноль».
+    expect(player.dailyRevenue).toBe(0)
+    expect(player.dailyCosts).toBe(0)
+
+    expect(player.bankrupt).toBe(false)
+    expect(player.daysInDebt).toBe(0)
   })
 
   it('ключи машин и компаний совпадают с идентификаторами внутри', () => {
@@ -226,29 +257,116 @@ describe('createInitialState: стартовая машина', () => {
     // она обязана быть нулём, иначе первый же рейс оплатится не за то плечо.
     expect(truck.loadedKm + truck.emptyKm).toBe(truck.odometer)
   })
+
+  it('машина не назначена ни на какую линию', () => {
+    const truck = Object.values(createInitialState(1).vehicles)[0]
+    // Линий на старте нет вовсе, и назначенная машина указывала бы на
+    // несуществующую — диспетчеризация молча пропускала бы её каждый тик.
+    expect(truck.lineId).toBeNull()
+    expect(truck.stopIndex).toBe(0)
+  })
+
+  it('расход топлива — паспортные тридцать литров ЗИЛ-130', () => {
+    const truck = Object.values(createInitialState(1).vehicles)[0]
+
+    // Ноль здесь означал бы машину, которая ездит даром: порожний пробег
+    // перестал бы что-либо стоить, и главная механика среза исчезла бы, не
+    // уронив ни одного теста.
+    expect(truck.fuelPer100Km).toBe(STARTER_FUEL_PER_100KM)
+    expect(truck.fuelPer100Km).toBeGreaterThan(0)
+    // Диапазон грузового карбюраторного двигателя тех лет: ниже двадцати
+    // литров он не опускался, выше сорока не поднимался даже с прицепом.
+    expect(truck.fuelPer100Km).toBeGreaterThanOrEqual(20)
+    expect(truck.fuelPer100Km).toBeLessThanOrEqual(40)
+  })
+})
+
+describe('createZil: одна сборка машины на всю игру', () => {
+  const OWNER = companyId('someone')
+  const WHERE = cityId('tula')
+
+  it('купленная машина ничем не отличается от стартовой', () => {
+    const starter = Object.values(createInitialState(1).vehicles)[0]
+    const bought = createZil(vehicleId('zil-2'), starter.ownerId, WHERE)
+
+    // Сравниваем всё, кроме того, что и обязано отличаться. Две сборки машины
+    // в двух местах однажды разойдутся в поле, которое ничего не роняет, —
+    // например, в расходе топлива, и купленная машина станет выгоднее
+    // стартовой без единой красной строчки в прогоне.
+    const shape = (v: typeof starter) => ({ ...v, id: '', position: null })
+    expect(shape(bought)).toEqual(shape(starter))
+  })
+
+  it('машина рождается стоящей в указанном городе, порожней и без линии', () => {
+    const truck = createZil(vehicleId('zil-7'), OWNER, WHERE)
+
+    expect(truck.id).toBe('zil-7')
+    expect(truck.ownerId).toBe(OWNER)
+    expect(truck.position).toEqual({ kind: 'узел', nodeId: WHERE })
+    expect(truck.route).toEqual([])
+    expect(truck.cargo).toBeNull()
+    expect(truck.lineId).toBeNull()
+    expect(truck.odometer).toBe(0)
+    expect(truck.loadedKm).toBe(0)
+    expect(truck.emptyKm).toBe(0)
+  })
+
+  it('две машины не делят ни одного объекта', () => {
+    const first = createZil(vehicleId('zil-2'), OWNER, WHERE)
+    const second = createZil(vehicleId('zil-3'), OWNER, WHERE)
+
+    // Общий массив маршрута означал бы, что отправленная машина тянет за собой
+    // весь парк. Дефект тихий: обе машины «просто едут одинаково».
+    expect(first.route).not.toBe(second.route)
+    expect(first.position).not.toBe(second.position)
+  })
 })
 
 describe('createInitialState: стартовый капитал', () => {
-  it('денег примерно на один гружёный рейс, но не на вторую машину', () => {
+  /** Переменные расходы машины на километр: топливо плюс обслуживание. */
+  const perKm =
+    (STARTER_FUEL_PER_100KM / 100) * FUEL_PRICE_PER_LITER + MAINTENANCE_PER_KM
+
+  it('второй машины на старте не купить', () => {
     const state = createInitialState(1)
     const money = state.companies[state.playerId].money
-    const truck = Object.values(state.vehicles)[0]
 
     expect(money).toBe(START_MONEY)
-    expect(money).toBeGreaterThan(0)
+    // Смысл суммы: первое решение в игре («расширяться или сначала научиться
+    // возить») обязан принимать игрок, а не стартовый баланс.
+    expect(money).toBeLessThan(ZIL_PRICE)
+    // Но и не настолько мало, чтобы копить вслепую: вторая машина должна быть
+    // видимой целью, а не мечтой.
+    expect(money).toBeGreaterThan(ZIL_PRICE / 2)
+  })
 
-    // Порядок величины привязан к грузоподъёмности и ставке за тонну: баланс
-    // должен читаться игроком как «один рейс», иначе связь между работой и
-    // деньгами не видна с первого дня. Ставка зерна — 900 руб/т на опорном
-    // плече, поправку на расстояние здесь намеренно не учитываем: проверяется
-    // порядок величины, а не точная выручка.
-    const oneLoadOfGrain = truck.capacity * 900
-    expect(money).toBeGreaterThan(oneLoadOfGrain * 0.5)
-    expect(money).toBeLessThan(oneLoadOfGrain * 3)
+  it('денег хватает на несколько суток работы', () => {
+    const state = createInitialState(1)
+    const money = state.companies[state.playerId].money
 
-    // Подержанный ЗИЛ в том же счёте стоит порядка 15 000. Второй машины на
-    // старте не купить — первое решение в игре принимает игрок, а не баланс.
-    expect(money).toBeLessThan(15_000)
+    // Мера снизу — круг «туда и обратно» на опорном плече тарифа (200 км в
+    // каждую сторону, см. DELIVERY_REFERENCE_KM). Партия обязана пережить
+    // несколько таких кругов даже при нулевой выручке: игрок не может
+    // разориться раньше, чем понял правила.
+    const referenceRing = 2 * DELIVERY_REFERENCE_KM * perKm
+    expect(money).toBeGreaterThan(referenceRing * 2)
+
+    // Мера сверху по той же шкале: капитал не должен покрывать бесконечное
+    // катание. Десяти кругов без единой доставки быть не должно.
+    expect(money).toBeLessThan(referenceRing * 10)
+  })
+
+  it('простой тоже проедает капитал, но медленно', () => {
+    const state = createInitialState(1)
+    const money = state.companies[state.playerId].money
+
+    // Машина в гараже стоит одну зарплату в сутки. Две недели — нижняя
+    // граница: игрок должен успеть разобраться в интерфейсе, ничего не возя.
+    const idleDays = money / DRIVER_WAGE_PER_DAY
+    expect(idleDays).toBeGreaterThan(14)
+    // И верхняя: пересидеть партию в гараже нельзя, месяцем простоя капитал
+    // кончается.
+    expect(idleDays).toBeLessThan(60)
   })
 })
 

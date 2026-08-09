@@ -56,11 +56,18 @@ function makeState(...industries: Industry[]): GameState {
       industries: Object.fromEntries(industries.map((it) => [it.id, it])),
     },
     companies: {
+      // Поля среза 3 (линии, суточный итог, банкротство) достраиваются
+      // пустыми: производству они не нужны, но без них фикстура не собирается.
       [PLAYER]: {
         id: PLAYER,
         name: 'Игрок',
         money: 0,
         controller: 'человек',
+        lines: {},
+        dailyRevenue: 0,
+        dailyCosts: 0,
+        bankrupt: false,
+        daysInDebt: 0,
       },
     },
     playerId: PLAYER,

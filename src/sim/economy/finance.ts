@@ -10,7 +10,8 @@
  * CARGO_RATE (src/data/recipes.ts) и там же обоснованы.
  */
 
-import { CARGO_RATE } from '../../data/recipes'
+import { CARGO_PREMIUM } from '../../data/recipes'
+import { HANDLING_PER_TON, TARIFF_PER_TON_KM } from '../../data/operating'
 import type { CargoType, Tons } from '../types'
 
 /**
@@ -109,17 +110,19 @@ export function deliveryRevenue(
   tons: Tons,
   km: number,
 ): number {
-  const rate = CARGO_RATE[cargo]
+  const premium = CARGO_PREMIUM[cargo]
 
-  if (!Number.isFinite(rate) || !Number.isFinite(tons) || !Number.isFinite(km)) {
+  if (
+    !Number.isFinite(premium) ||
+    !Number.isFinite(tons) ||
+    !Number.isFinite(km)
+  ) {
     return 0
   }
   if (tons <= 0 || km <= 0) return 0
 
-  const perTon =
-    rate *
-    (DELIVERY_FIXED_SHARE +
-      DELIVERY_DISTANCE_SHARE * (km / DELIVERY_REFERENCE_KM))
-
-  return tons * perTon
+  // Тонно-километр плюс погрузка, всё умножено на надбавку за сложность груза.
+  // Разбор границ, при которых из этой формулы следует главный инвариант
+  // баланса, — в шапке src/data/operating.ts.
+  return tons * (HANDLING_PER_TON + TARIFF_PER_TON_KM * km) * premium
 }

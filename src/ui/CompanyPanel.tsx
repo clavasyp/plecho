@@ -1,25 +1,36 @@
 /**
- * Панель компании: деньги, порожний пробег и парк.
+ * Панель компании: деньги, суточный итог, порожний пробег, линии и парк.
  *
- * Панель отвечает на три вопроса, и они НАМЕРЕННО разного веса на экране.
+ * Панель отвечает на пять вопросов, и они НАМЕРЕННО разного веса на экране.
  *
  *   «Сколько у меня денег» — крупно: это счёт партии.
- *   «Сколько парк едет пустым» — почти так же крупно: это единственное число,
- *     по которому видно мастерство, а не удачу (docs/КОНЦЕПТ.md, раздел 4).
+ *   «Куда идёт счёт» — следом и почти так же крупно: суточный итог.
+ *   «Сколько парк едет пустым» — крупно: единственное число, по которому видно
+ *     мастерство, а не удачу (docs/КОНЦЕПТ.md, раздел 4).
+ *   «Какая линия виновата» — списком: порожняк и экономика каждого кольца.
  *   «Где сейчас каждая машина» — мелким списком: справка, в которую заглядывают
  *     глазами, а не следят за ней непрерывно.
  *
- * Порожний пробег вынесен ОТДЕЛЬНЫМ ЧИСЛОМ, а не строкой в списке машин, ровно
- * потому, что он про парк целиком. Средний процент по компании — это то, что
- * игрок оптимизирует; процент конкретного ЗИЛа сам по себе не говорит ничего,
- * пока его не с чем сложить.
+ * ПОЧЕМУ СУТОЧНЫЙ ИТОГ СТОИТ ВТОРЫМ, СРАЗУ ПОД ДЕНЬГАМИ. Прибыль в тайкуне —
+ * это ПОТОК, а не остаток на счету, и растущие деньги при убыточной сети —
+ * обычное дело в начале партии: игрок проедает стартовый капитал и узнаёт об
+ * этом в день, когда тот кончился. Поэтому убыток обязан быть виден раньше, чем
+ * его последствия: он берёт акцент и стоит выше всего остального, что панель
+ * умеет показать. Отсрочка до банкротства печатается тут же — не «у вас
+ * проблемы», а «столько-то суток осталось».
  *
- * НИ ОДНОЙ ЦИФРЫ ПАНЕЛЬ НЕ СЧИТАЕТ ПО-СВОЕМУ. Деньги берутся из состояния
- * компании, порожний пробег складывается из счётчиков loadedKm/emptyKm, которые
- * ведёт фаза прибытия (src/sim/logistics/loading.ts). Интерфейс со своей
- * формулой рано или поздно разойдётся с симуляцией — так же тихо, как когда-то
- * разошлись две формулы скорости (разбор — в шапке src/sim/world/speed.ts), и
- * найти расхождение будет нечем: обе цифры выглядят правдоподобно.
+ * Порожний пробег показан ДВАЖДЫ и по-разному, и это не дублирование. Сверху —
+ * по парку целиком: то, что игрок оптимизирует. В списке линий — по каждому
+ * кольцу: то, чем он это чинит. Среднее по компании говорит, что беда есть;
+ * строка линии говорит, где именно.
+ *
+ * НИ ОДНОЙ ЦИФРЫ ПАНЕЛЬ НЕ СЧИТАЕТ ПО-СВОЕМУ. Деньги и суточные потоки берутся
+ * из состояния компании, порожний пробег складывается из счётчиков
+ * loadedKm/emptyKm, которые ведёт фаза движения, экономика кольца собирается в
+ * ui/lineEconomy.ts из формул симуляции. Интерфейс со своей формулой рано или
+ * поздно разойдётся с симуляцией — так же тихо, как когда-то разошлись две
+ * формулы скорости (разбор — в шапке src/sim/world/speed.ts), и найти
+ * расхождение будет нечем: обе цифры выглядят правдоподобно.
  *
  * Стили заданы прямо в разметке — по той же причине, что и в TimeControls:
  * панель единственный владелец этих правил, а источник цветов ровно один
@@ -27,19 +38,31 @@
  * чтобы у них нашлось действительно общее.
  */
 
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import type { CSSProperties, JSX } from 'react'
 
 import { useGameStore } from '../app/store'
+import { BANKRUPTCY_GRACE_DAYS, ZIL_PRICE } from '../data/operating'
 import { palette } from '../render/palette'
+import { buildGraph } from '../sim/world/graph'
 import type {
   City,
   CityId,
   Edge,
   EdgeId,
+  Line,
+  LineId,
   Vehicle,
   VehicleId,
 } from '../sim/types'
+import {
+  emptyShare,
+  fleetByLine,
+  noFleet,
+  planLines,
+  type LinePlan,
+} from './lineEconomy'
+import { useLineSelection } from './lineSelection'
 
 /**
  * Моноширинный стек — только для ЦИФР.
@@ -87,15 +110,37 @@ function formatInteger(value: number): string {
   return INTEGER.format(Math.round(value))
 }
 
-/** «1 машина», «2 машины», «5 машин» — иначе панель выглядит как черновик. */
-function pluralVehicles(count: number): string {
-  const hundreds = count % 100
-  if (hundreds >= 11 && hundreds <= 14) return 'машин'
-  const units = count % 10
-  if (units === 1) return 'машина'
-  if (units >= 2 && units <= 4) return 'машины'
-  return 'машин'
+/**
+ * Число со знаком: «+12 400», «-4 200», «0».
+ *
+ * Знак ставится сам, а не берётся у форматтера: Intl печатает минус только у
+ * отрицательных, и колонка итогов дёргалась бы на один знак при каждом переходе
+ * через ноль. Плюс у прибыли к тому же читается как утверждение, а не как
+ * отсутствие минуса.
+ */
+function formatSigned(value: number): string {
+  if (!Number.isFinite(value)) return '—'
+  const rounded = Math.round(value)
+  if (rounded === 0) return '0'
+  return `${rounded > 0 ? '+' : '-'}${INTEGER.format(Math.abs(rounded))}`
 }
+
+/**
+ * Русское склонение по числу. «1 машина», «2 машины», «5 машин» — иначе панель
+ * выглядит как черновик.
+ */
+function plural(count: number, forms: readonly [string, string, string]): string {
+  const hundreds = count % 100
+  if (hundreds >= 11 && hundreds <= 14) return forms[2]
+  const units = count % 10
+  if (units === 1) return forms[0]
+  if (units >= 2 && units <= 4) return forms[1]
+  return forms[2]
+}
+
+const VEHICLE_FORMS = ['машина', 'машины', 'машин'] as const
+const LINE_FORMS = ['линия', 'линии', 'линий'] as const
+const DAY_FORMS = ['сутки', 'суток', 'суток'] as const
 
 // ─── Разбор состояния в строки списка ──────────────────────────────────────
 
@@ -207,26 +252,6 @@ function buildRow(
 }
 
 /**
- * Доля порожнего пробега по парку, 0..1. null — считать пока не из чего.
- *
- * Складываются счётчики, а не усредняются проценты машин: машина, сделавшая
- * один рейс, и машина, отработавшая полгода, имеют совершенно разный вес, и
- * среднее по процентам врало бы в пользу новичков в парке.
- *
- * ВАЖНО про «пока не из чего». Сумма loadedKm + emptyKm — это пробег, УЖЕ
- * разнесённый по счетам, а разносится он только в моменты погрузки и разгрузки
- * (см. unaccountedKm в logistics/loading.ts). Пока первая машина едет первое
- * плечо, обе суммы — нули, и честный ответ здесь «нет данных», а не «0%».
- * Показать ноль означало бы поздравить игрока с идеальной работой ровно в тот
- * момент, когда он ещё ничего не сделал.
- */
-function emptyShare(loadedKm: number, emptyKm: number): number | null {
-  const total = loadedKm + emptyKm
-  if (!Number.isFinite(total) || total <= 0) return null
-  return emptyKm / total
-}
-
-/**
  * Цвет числа по зоне.
  *
  * Одна и та же оранжевая линия палитры, три ступени нагрева: спокойный светлый
@@ -243,6 +268,18 @@ function shareColor(share: number): string {
   if (share < EMPTY_SHARE_GOOD) return palette.text
   if (share < EMPTY_SHARE_BAD) return palette.accentDim
   return palette.accent
+}
+
+/**
+ * Цвет итога: убыток — акцент, прибыль — обычный текст.
+ *
+ * Прибыль НЕ подсвечивается ничем, и это принципиально. Зелёный «хорошо» рядом с
+ * оранжевым «плохо» — это второй акцент, то есть конец стилевого замка ради
+ * информации, которая и так читается по знаку числа. Панель обязана молчать,
+ * пока всё в порядке.
+ */
+function profitColor(profit: number): string {
+  return profit < 0 ? palette.accent : palette.text
 }
 
 // ─── Стили ─────────────────────────────────────────────────────────────────
@@ -273,6 +310,14 @@ const panelStyle: CSSProperties = {
    */
   width: 268,
   boxSizing: 'border-box',
+  /*
+   * Потолок высоты. Разделов в панели стало пять, и на невысоком экране она
+   * упёрлась бы в верхний край и вылезла за него вместе с деньгами — то есть
+   * ровно тем, ради чего она есть. Внутренние списки прокручиваются сами, этот
+   * потолок нужен на случай, когда даже свёрнутых разделов больше, чем места.
+   */
+  maxHeight: 'calc(100vh - 32px)',
+  overflowY: 'auto',
 
   background: palette.panel,
   border: `1px solid ${palette.panelBorder}`,
@@ -355,6 +400,42 @@ const tickStyle: CSSProperties = {
   background: palette.panel,
 }
 
+/**
+ * Шкала потока: выручка и расходы двумя полосками на ОДНОЙ длине.
+ *
+ * Общий масштаб — вся суть приёма. Две шкалы, каждая со своим максимумом,
+ * показали бы обе полными и не сказали бы ничего; на общем масштабе длиннее та,
+ * которой больше, и вопрос «съедают ли расходы выручку» решается взглядом, без
+ * вычитания в уме. Полоски тоньше метрики порожнего пробега (3 против 4) —
+ * иллюстрация к числу, а не самостоятельный прибор.
+ */
+const flowTrackStyle: CSSProperties = {
+  height: 3,
+  borderRadius: 2,
+  background: palette.panelBorder,
+  overflow: 'hidden',
+}
+
+const flowFillStyle: CSSProperties = {
+  height: '100%',
+  borderRadius: 2,
+  transition: 'width 240ms, background-color 240ms',
+}
+
+/**
+ * Предупреждение о банкротстве.
+ *
+ * Стоит вплотную к суточному итогу и в акценте: это не украшение отчёта, а
+ * обратный отсчёт. Рамки и заливки нет намеренно — плашка-баннер в углу карты
+ * читалась бы как ошибка приложения, а не как состояние компании.
+ */
+const alarmStyle: CSSProperties = {
+  marginTop: 6,
+  fontSize: 11,
+  lineHeight: 1.2,
+  color: palette.accent,
+}
+
 const listStyle: CSSProperties = {
   display: 'flex',
   flexDirection: 'column',
@@ -365,6 +446,84 @@ const listStyle: CSSProperties = {
    */
   maxHeight: 220,
   overflowY: 'auto',
+}
+
+/** Список линий короче списка машин: линий у игрока единицы, машин — десятки. */
+const lineListStyle: CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  maxHeight: 168,
+  overflowY: 'auto',
+}
+
+/**
+ * Строка линии — кнопка, а не div.
+ *
+ * Строка выбирает линию (та же выбранная линия подсвечивается на карте), то
+ * есть это управляющий элемент, и он обязан быть доступен с клавиатуры и
+ * озвучен экранным диктором. Стили гасят всё, что браузер рисует кнопке по
+ * умолчанию.
+ *
+ * ВЫБОР ОБОЗНАЧЕН ЛЕВОЙ РИСКОЙ, а не заливкой строки. Заливка акцентом на всю
+ * ширину превратила бы список в оранжевую полосу — при том, что акцента в
+ * панели уже два законных потребителя (убыток и порожний пробег выше нормы).
+ * Риска занимает два пикселя и не спорит ни с чем.
+ */
+function lineRowStyle(selected: boolean, hovered: boolean): CSSProperties {
+  return {
+    display: 'block',
+    width: '100%',
+    padding: '6px 0 6px 8px',
+    textAlign: 'left',
+    borderTop: `1px solid ${palette.panelBorder}`,
+    borderRight: 'none',
+    borderBottom: 'none',
+    borderLeft: `2px solid ${selected ? palette.accent : 'transparent'}`,
+    background: 'transparent',
+    color: 'inherit',
+    font: 'inherit',
+    lineHeight: 1.25,
+    cursor: 'pointer',
+    // Наведение подсвечивает только текст названия (см. ниже), поэтому здесь
+    // остаётся один переход рамки — им и держится ощущение отклика.
+    transition: 'border-color 120ms',
+    opacity: hovered ? 1 : 0.92,
+  }
+}
+
+/**
+ * Кнопка покупки.
+ *
+ * Цена написана НА КНОПКЕ, а не спрятана в подсказку: решение «покупать ли
+ * вторую машину» — главное решение первого часа игры, и принимать его вслепую
+ * игрок не должен. Недоступная кнопка не исчезает и не блокируется намертво: она
+ * гаснет до textDim и продолжает показывать цену, потому что цель, которой не
+ * видно, копить невозможно.
+ */
+function buyButtonStyle(enabled: boolean, hovered: boolean): CSSProperties {
+  return {
+    width: '100%',
+    height: 26,
+    marginTop: 8,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '0 8px',
+    boxSizing: 'border-box',
+
+    background: 'transparent',
+    border: `1px solid ${enabled && hovered ? palette.accent : palette.panelBorder}`,
+    borderRadius: 4,
+    color: enabled
+      ? hovered
+        ? palette.accent
+        : palette.text
+      : palette.textDim,
+
+    font: `11px/1 ${MONO}`,
+    cursor: enabled ? 'pointer' : 'default',
+    transition: 'color 120ms, border-color 120ms',
+  }
 }
 
 const rowStyle: CSSProperties = {
@@ -417,6 +576,32 @@ function markerStyle(loaded: boolean): CSSProperties {
 
 // ─── Компонент ─────────────────────────────────────────────────────────────
 
+/**
+ * Пустой реестр линий.
+ *
+ * Константа, а не литерал в селекторе: `?? {}` возвращал бы новый объект на
+ * каждый вызов, zustand считал бы его изменившимся значением и перерисовывал бы
+ * панель на каждом тике — вместе с поиском путей по всем линиям.
+ */
+const NO_LINES: Record<LineId, Line> = {}
+
+/** Подсказка к строке линии — вся арифметика потолка в одном месте. */
+function planTitle(name: string, plan: LinePlan): string {
+  if (plan.broken) {
+    return `${name}: кольцо не собирается — меньше двух остановок или между ними нет дорог.`
+  }
+
+  const planned = Math.round((plan.emptyShare ?? 0) * 100)
+
+  return [
+    `${name}: круг ${formatInteger(plan.ringKm)} км, порожним ${planned}% по замыслу.`,
+    `Выручка ${formatInteger(plan.revenue)} − расходы ${formatInteger(
+      plan.costs,
+    )} = ${formatSigned(plan.profit)} руб за круг.`,
+    'Это ПОТОЛОК: полный кузов, груз всегда есть, скорость крейсерская. Факт бывает только хуже, поэтому отрицательный потолок означает, что линия убыточна всегда.',
+  ].join('\n')
+}
+
 export function CompanyPanel(): JSX.Element {
   /*
    * Подписки узкие и по одному полю — как в TimeControls. Деньги и имя компании
@@ -432,9 +617,49 @@ export function CompanyPanel(): JSX.Element {
   const money = useGameStore(
     (store) => store.state.companies[store.state.playerId]?.money ?? 0,
   )
+  /*
+   * Потоки — тоже примитивы, и подписка на них ведёт себя так же. Величины
+   * скользящие (dayWindow в economy/operating.ts), поэтому меняются каждый тик,
+   * и это ровно то, что нужно: суточный итог обязан быть свежим.
+   */
+  const dailyRevenue = useGameStore(
+    (store) => store.state.companies[store.state.playerId]?.dailyRevenue ?? 0,
+  )
+  const dailyCosts = useGameStore(
+    (store) => store.state.companies[store.state.playerId]?.dailyCosts ?? 0,
+  )
+  const daysInDebt = useGameStore(
+    (store) => store.state.companies[store.state.playerId]?.daysInDebt ?? 0,
+  )
+  const bankrupt = useGameStore(
+    (store) => store.state.companies[store.state.playerId]?.bankrupt ?? false,
+  )
+  /*
+   * Линии возвращаются ссылкой, и ссылка эта СТАБИЛЬНА между тиками: фаза
+   * расходов пересобирает запись компании, но объект lines оставляет прежним.
+   * Значит, тяжёлый пересчёт экономики колец ниже случается только тогда, когда
+   * игрок действительно правит сеть.
+   */
+  const lines = useGameStore(
+    (store) => store.state.companies[store.state.playerId]?.lines ?? NO_LINES,
+  )
+  const buyVehicle = useGameStore((store) => store.buyVehicle)
+
   const vehicles = useGameStore((store) => store.state.vehicles)
   const cities = useGameStore((store) => store.state.world.cities)
   const edges = useGameStore((store) => store.state.world.edges)
+
+  /*
+   * Выбранная линия живёт в отдельном store (ui/lineSelection.ts): это «на что
+   * игрок смотрит», а не «что в мире происходит». Панель и карта берут её
+   * оттуда вдвоём, поэтому клик по строке подсвечивает кольцо на карте, а не
+   * заводит вторую, свою идею о выборе.
+   */
+  const selectedLine = useLineSelection((store) => store.line)
+  const selectLine = useLineSelection((store) => store.selectLine)
+
+  const [hoveredLine, setHoveredLine] = useState<LineId | null>(null)
+  const [hoveredBuy, setHoveredBuy] = useState(false)
 
   /*
    * Парк игрока, а не все машины мира. Конкурент в срезе 5 будет владеть своими
@@ -451,6 +676,34 @@ export function CompanyPanel(): JSX.Element {
     [fleet, cities, edges],
   )
 
+  /*
+   * Потолок кольца — самое дорогое, что делает панель: поиск путей по всем
+   * плечам всех линий. Зависимости здесь только от сети и от самих линий,
+   * поэтому за партию он пересчитывается ровно столько раз, сколько игрок
+   * правил линии, а не по пять раз в секунду.
+   */
+  const plans = useMemo(
+    () => planLines(buildGraph(edges), lines),
+    [edges, lines],
+  )
+
+  /* А вот парк линии обязан быть свежим — его считаем каждый тик, одним
+     проходом по машинам. */
+  const fleets = useMemo(
+    () => fleetByLine(vehicles, playerId),
+    [vehicles, playerId],
+  )
+
+  const lineRows = useMemo(
+    () =>
+      (Object.keys(lines) as LineId[]).map((id) => ({
+        line: lines[id],
+        plan: plans[id],
+        fleet: fleets[id] ?? noFleet(),
+      })),
+    [lines, plans, fleets],
+  )
+
   const mileage = useMemo(() => {
     let loadedKm = 0
     let emptyKm = 0
@@ -465,6 +718,38 @@ export function CompanyPanel(): JSX.Element {
 
   const share = mileage.share
   const totalKm = mileage.loadedKm + mileage.emptyKm
+
+  /*
+   * Суточный итог. Разность считается здесь, а не берётся из состояния, потому
+   * что её там нет: в Company лежат два потока, и вычитание — это показ, а не
+   * правило. Оба слагаемых при этом чужие, свои формулы панель не заводит.
+   */
+  const profit = dailyRevenue - dailyCosts
+
+  /*
+   * Общий масштаб двух полосок. Единица в знаменателе — не «на всякий случай»:
+   * в первые тики партии оба потока нулевые, и без неё ширина вышла бы NaN.
+   */
+  const flowMax = Math.max(dailyRevenue, dailyCosts, 1)
+  const flowWidth = (value: number): number =>
+    Number.isFinite(value) && value > 0 ? (value / flowMax) * 100 : 0
+
+  /*
+   * Обратный отсчёт до банкротства. daysInDebt копится по 1/96 за тик, поэтому
+   * округляем ВВЕРХ: «через 0 суток» при живой компании выглядело бы ошибкой, а
+   * запас в неполные сутки у игрока есть всегда.
+   */
+  const graceLeft = Math.max(
+    0,
+    Math.ceil(BANKRUPTCY_GRACE_DAYS - (Number.isFinite(daysInDebt) ? daysInDebt : 0)),
+  )
+  const alarm = bankrupt
+    ? 'компания разорена — партия окончена'
+    : daysInDebt > 0
+      ? `в минусе: банкротство через ${graceLeft} ${plural(graceLeft, DAY_FORMS)}`
+      : null
+
+  const canBuy = !bankrupt && money >= ZIL_PRICE
 
   return (
     <div style={panelStyle}>
@@ -487,6 +772,73 @@ export function CompanyPanel(): JSX.Element {
           </span>
           <span style={unitStyle}>руб</span>
         </div>
+      </div>
+
+      {/* ─── Суточный итог ──────────────────────────────────────────── */}
+      <div
+        title={`Итог последних суток: выручка ${formatInteger(
+          dailyRevenue,
+        )} − расходы ${formatInteger(dailyCosts)} = ${formatSigned(
+          profit,
+        )} руб.\nСкользящее окно в сутки: показывает поток, а не остаток на счету — растущие деньги при убыточной сети обычное дело в начале партии.`}
+      >
+        {/*
+          ОТКУДА БЕРУТСЯ ЭТИ ДВА ЧИСЛА. Расходы кладёт в окно фаза расходов, а
+          выручку — тот, кто её начисляет, то есть фаза прибытия, и класть она
+          обязана ЧЕРЕЗ creditRevenue (sim/economy/operating.ts). Прибавить рубли
+          к money напрямую, минуя эту функцию, — ошибка бесшумная: деньги на
+          счету растут правильно, а суточный итог показывает одни расходы, и
+          панель выглядит сломанной, хотя сломан стык.
+        */}
+        <div style={{ ...shareRowStyle, marginBottom: 6 }}>
+          <span style={captionStyle}>за сутки</span>
+          <span style={{ ...unitStyle, fontSize: 10 }}>
+            {profit < 0 ? 'убыток' : 'прибыль'}
+          </span>
+        </div>
+
+        <div style={{ ...shareRowStyle, marginBottom: 6 }}>
+          <span style={{ ...shareStyle, color: profitColor(profit) }}>
+            {formatSigned(profit)}
+          </span>
+          {/*
+            Слагаемые стоят рядом с итогом мелким шрифтом, а не под ним
+            строками: игроку нужен ответ «сколько теряю», а разбор «на чём» —
+            только когда ответ его не устроил.
+          */}
+          <span style={{ ...unitStyle, fontFamily: MONO }}>
+            {formatInteger(dailyRevenue)} / {formatInteger(dailyCosts)}
+          </span>
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+          <div style={flowTrackStyle}>
+            <div
+              style={{
+                ...flowFillStyle,
+                width: `${flowWidth(dailyRevenue)}%`,
+                background: palette.textDim,
+              }}
+            />
+          </div>
+          {/*
+            Расходы — тёплые, выручка — холодная. Тот же язык, что и на карте, где
+            гружёный прицеп тёплый, а порожний холодный: тёплое означает «здесь
+            деньги двигаются». В акцент расходы уходят только когда обгоняют
+            выручку, то есть когда полоска и так длиннее.
+          */}
+          <div style={flowTrackStyle}>
+            <div
+              style={{
+                ...flowFillStyle,
+                width: `${flowWidth(dailyCosts)}%`,
+                background: profit < 0 ? palette.accent : palette.accentDim,
+              }}
+            />
+          </div>
+        </div>
+
+        {alarm !== null && <div style={alarmStyle}>{alarm}</div>}
       </div>
 
       {/* ─── Порожний пробег ────────────────────────────────────────── */}
@@ -540,14 +892,144 @@ export function CompanyPanel(): JSX.Element {
         </div>
       </div>
 
+      {/* ─── Линии ──────────────────────────────────────────────────── */}
+      <div>
+        <div style={{ ...shareRowStyle, marginBottom: 2 }}>
+          <span style={captionStyle}>линии</span>
+          <span style={{ ...unitStyle, fontFamily: MONO }}>
+            {lineRows.length} {plural(lineRows.length, LINE_FORMS)}
+          </span>
+        </div>
+
+        {lineRows.length === 0 ? (
+          <div style={{ ...unitStyle, paddingTop: 6 }}>линий нет</div>
+        ) : (
+          <div style={lineListStyle}>
+            {lineRows.map(({ line, plan, fleet }) => {
+              const chosen = line.id === selectedLine
+              const fact = fleet.emptyShare
+
+              return (
+                <button
+                  key={line.id}
+                  type="button"
+                  onClick={() => selectLine(line.id)}
+                  onMouseEnter={() => setHoveredLine(line.id)}
+                  onMouseLeave={() => setHoveredLine(null)}
+                  style={lineRowStyle(chosen, hoveredLine === line.id)}
+                  aria-pressed={chosen}
+                  title={planTitle(line.name, plan)}
+                >
+                  <div style={rowTopStyle}>
+                    <span
+                      style={{
+                        fontSize: 12,
+                        color: chosen ? palette.accent : palette.text,
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {line.name}
+                    </span>
+                    {/*
+                      Линия без машин — не мелочь и не «ещё не настроил»: она
+                      занимает место в сети и не везёт ничего. Поэтому строка не
+                      молчит, а называет это словами, приглушённым тёплым.
+                    */}
+                    <span
+                      style={{
+                        marginLeft: 'auto',
+                        flex: '0 0 auto',
+                        fontFamily: MONO,
+                        fontSize: 11,
+                        color:
+                          fleet.count === 0
+                            ? palette.accentDim
+                            : palette.textDim,
+                      }}
+                    >
+                      {fleet.count === 0
+                        ? 'без машин'
+                        : `${fleet.count} ${plural(fleet.count, VEHICLE_FORMS)}`}
+                    </span>
+                  </div>
+
+                  <div style={rowBottomStyle}>
+                    {/*
+                      Слева ФАКТ, справа ЗАМЫСЕЛ, и путать их нельзя. Порожний
+                      пробег — то, как эти машины ездили на самом деле; итог
+                      круга — потолок, посчитанный по кольцу (разбор в
+                      ui/lineEconomy.ts). У линии, которая ещё не проехала ни
+                      километра, слева честный прочерк, а справа уже есть ответ:
+                      именно ради него потолок и считается.
+                    */}
+                    <span>
+                      порожняк{' '}
+                      <span
+                        style={{
+                          fontFamily: MONO,
+                          color:
+                            fact === null ? palette.textDim : shareColor(fact),
+                        }}
+                      >
+                        {fact === null ? '—' : `${Math.round(fact * 100)}%`}
+                      </span>
+                    </span>
+
+                    <span
+                      style={{
+                        flex: '0 0 auto',
+                        fontFamily: MONO,
+                        color: plan.broken
+                          ? palette.textDim
+                          : profitColor(plan.profit),
+                      }}
+                    >
+                      {plan.broken
+                        ? 'не достроена'
+                        : `круг ${formatSigned(plan.profit)}`}
+                    </span>
+                  </div>
+                </button>
+              )
+            })}
+          </div>
+        )}
+      </div>
+
       {/* ─── Парк ───────────────────────────────────────────────────── */}
       <div>
         <div style={{ ...shareRowStyle, marginBottom: 2 }}>
           <span style={captionStyle}>парк</span>
           <span style={{ ...unitStyle, fontFamily: MONO }}>
-            {rows.length} {pluralVehicles(rows.length)}
+            {rows.length} {plural(rows.length, VEHICLE_FORMS)}
           </span>
         </div>
+
+        {/*
+          Кнопка стоит НАД списком, а не под ним: список прокручивается и в конце
+          партии длиннее экрана, и кнопка, привязанная к его низу, уехала бы из
+          виду ровно тогда, когда парк пора расширять.
+        */}
+        <button
+          type="button"
+          onClick={buyVehicle}
+          disabled={!canBuy}
+          onMouseEnter={() => setHoveredBuy(true)}
+          onMouseLeave={() => setHoveredBuy(false)}
+          style={buyButtonStyle(canBuy, hoveredBuy)}
+          title={
+            bankrupt
+              ? 'Компания разорена: покупать нечего и не на что'
+              : canBuy
+                ? `Купить ЗИЛ за ${formatInteger(ZIL_PRICE)} руб`
+                : `Не хватает ${formatInteger(ZIL_PRICE - money)} руб. Покупка в кредит появится позже`
+          }
+        >
+          <span>купить ЗИЛ</span>
+          <span>{formatInteger(ZIL_PRICE)} руб</span>
+        </button>
 
         {rows.length === 0 ? (
           <div style={{ ...unitStyle, paddingTop: 6 }}>машин нет</div>

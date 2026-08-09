@@ -56,7 +56,15 @@ function makeVehicle(at: CityId, route: CityId[], cruiseKmh = 90): Vehicle {
     ownerId: PLAYER,
     position: { kind: 'узел', nodeId: at },
     route,
+    // Без линии: движение одинаково для машины на линии и вне её, а маршрут
+    // здесь выдаётся руками. Диспетчеризация проверяется в logistics/line.
+    lineId: null,
+    stopIndex: 0,
+    blockedTicks: 0,
     cruiseKmh,
+    // Расход у стартового ЗИЛа. Движение денег не считает, но нулевой расход
+    // в фикстуре — плохой образец: с него его копируют в новые тесты.
+    fuelPer100Km: 30,
     odometer: 0,
     // Груза в тестах движения нет: они про километры и время, а не про тонны.
     // Грузоподъёмность взята у ЗИЛ-130 — стартовой машины партии.
@@ -90,11 +98,18 @@ function makeState(edges: readonly Edge[], vehicle: Vehicle): GameState {
       industries: {},
     },
     companies: {
+      // Поля среза 3 (линии, суточный итог, банкротство) достраиваются
+      // пустыми: движению они не нужны, но без них фикстура не собирается.
       [PLAYER]: {
         id: PLAYER,
         name: 'Игрок',
         money: 0,
         controller: 'человек',
+        lines: {},
+        dailyRevenue: 0,
+        dailyCosts: 0,
+        bankrupt: false,
+        daysInDebt: 0,
       },
     },
     playerId: PLAYER,
