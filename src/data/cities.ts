@@ -21,9 +21,9 @@
  */
 
 import { cityId } from '../sim/types'
-import type { City, CityId } from '../sim/types'
+import type { CityStatic, CityId } from '../sim/types'
 
-export const CITIES: City[] = [
+export const CITIES: CityStatic[] = [
   {
     // Единственный потребитель такого масштаба: 13 миллионов против 560 тысяч
     // у второго города списка. Вокруг Москвы важно не производство, а спрос —
@@ -133,6 +133,6 @@ export const CITIES: City[] = [
  * Строится из CITIES, а не пишется руками: два независимых списка неизбежно
  * разъезжаются, а здесь рассинхронизация невозможна по построению.
  */
-export const CITIES_BY_ID: Record<CityId, City> = Object.fromEntries(
+export const CITIES_BY_ID: Record<CityId, CityStatic> = Object.fromEntries(
   CITIES.map((city) => [city.id, city]),
-) as Record<CityId, City>
+) as Record<CityId, CityStatic>

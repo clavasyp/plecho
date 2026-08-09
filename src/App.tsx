@@ -9,6 +9,8 @@
 import { Canvas } from '@react-three/fiber'
 import { useGameLoop } from './app/loop'
 import { Scene } from './render/Scene'
+import { CityPanel } from './ui/CityPanel'
+import { CompanyPanel } from './ui/CompanyPanel'
 import { TimeControls } from './ui/TimeControls'
 import './App.css'
 
@@ -36,6 +38,8 @@ export default function App() {
 
       <div className="ui-layer">
         <TimeControls />
+        <CompanyPanel />
+        <CityPanel />
       </div>
     </>
   )

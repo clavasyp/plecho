@@ -235,3 +235,53 @@ export function routeCost(
 
   return hours
 }
+
+/**
+ * Кратчайшее расстояние по дорогам между городами, километры.
+ *
+ * Это ТАРИФНОЕ расстояние, и оно намеренно считается отдельно от маршрута.
+ * Машина едет по самому быстрому пути, а платят ей по кратчайшему — ровно так
+ * устроен тариф в перевозках, и ровно это лишает смысла любые ухищрения с
+ * пробегом. Накрутить одометр кругами можно, накрутить тариф — нет.
+ *
+ * Дейкстра по километрам, а не по часам: здесь важна геометрия сети, а не то,
+ * кто и на чём по ней едет. Поэтому и крейсерская скорость не нужна.
+ *
+ * Бесконечность — города не связаны. Ноль — это один и тот же город.
+ */
+export function shortestKm(graph: RoadGraph, from: CityId, to: CityId): number {
+  if (!hasCity(graph, from) || !hasCity(graph, to)) {
+    return Number.POSITIVE_INFINITY
+  }
+  if (from === to) return 0
+
+  const best = new Map<CityId, number>([[from, 0]])
+  const settled = new Set<CityId>()
+
+  for (;;) {
+    let current: CityId | undefined
+    let currentKm = Number.POSITIVE_INFINITY
+    for (const [city, km] of best) {
+      if (!settled.has(city) && km < currentKm) {
+        current = city
+        currentKm = km
+      }
+    }
+
+    if (current === undefined) break
+    if (current === to) return currentKm
+
+    settled.add(current)
+
+    for (const neighbor of neighbors(graph, current)) {
+      if (settled.has(neighbor.cityId)) continue
+      const candidate = currentKm + neighbor.edge.km
+      const known = best.get(neighbor.cityId)
+      if (known === undefined || candidate < known) {
+        best.set(neighbor.cityId, candidate)
+      }
+    }
+  }
+
+  return best.get(to) ?? Number.POSITIVE_INFINITY
+}

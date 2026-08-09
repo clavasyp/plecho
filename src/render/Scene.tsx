@@ -35,6 +35,7 @@ import { useGameStore } from '../app/store'
 import { fogRange, lighting, palette, postFx } from './palette'
 import { Cities, cityPoint } from './CityMesh'
 import { CityPicker } from './CityPicker'
+import { Industries } from './IndustryMesh'
 import { Roads } from './RoadMesh'
 import { Vehicles } from './VehicleMesh'
 
@@ -336,6 +337,7 @@ export function Scene(): JSX.Element {
 
       <Roads />
       <Cities />
+      <Industries />
       <Vehicles />
       <CityPicker />
 

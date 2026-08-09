@@ -103,6 +103,21 @@ export function advanceVehicle(
    */
   let stepsLeft = route.length * 2 + 8
 
+  /**
+   * Километры этого тика, разнесённые по счетам сразу.
+   *
+   * Разнесение живёт ЗДЕСЬ, а не в фазе прибытия, и это принципиально. Машина
+   * знает, гружена ли она, ровно в тот момент, когда едет, — и только здесь.
+   * Раньше счётчики закрывались на остановках, и машина с грузом, которому
+   * нигде на карте нет получателя, не доезжала до закрытия никогда: её пробег
+   * не попадал ни в гружёный, ни в порожний. В прогоне на 100 суток так
+   * потерялось 99.5% одометра, а метрика порожнего пробега — главная метрика
+   * мастерства в игре — показывала неправду.
+   */
+  let loadedKm = 0
+  let emptyKm = 0
+  const carrying = vehicle.cargo !== null
+
   while (hoursLeft > 0 && stepsLeft-- > 0) {
     if (position.kind === 'узел') {
       // Стоим без задания — время просто не расходуется.
@@ -147,6 +162,8 @@ export function advanceVehicle(
     if (hoursToEnd > hoursLeft) {
       const travelledKm = speed * hoursLeft
       odometer += travelledKm
+      if (carrying) loadedKm += travelledKm
+      else emptyKm += travelledKm
       position = {
         ...position,
         progress: position.progress + travelledKm / edge.km,
@@ -157,6 +174,8 @@ export function advanceVehicle(
     // Доехали до узла. Остаток времени остаётся у машины и тратится дальше —
     // на следующей итерации она встанет на следующее ребро.
     odometer += remainingKm
+    if (carrying) loadedKm += remainingKm
+    else emptyKm += remainingKm
     hoursLeft -= hoursToEnd
 
     const arrivedAt = otherEnd(edge, position.fromId)
@@ -180,7 +199,14 @@ export function advanceVehicle(
     return vehicle
   }
 
-  return { ...vehicle, position, route, odometer }
+  return {
+    ...vehicle,
+    position,
+    route,
+    odometer,
+    loadedKm: vehicle.loadedKm + loadedKm,
+    emptyKm: vehicle.emptyKm + emptyKm,
+  }
 }
 
 /**

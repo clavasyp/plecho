@@ -3,6 +3,7 @@ import { CITIES_BY_ID } from '../../data/cities'
 import { EDGES } from '../../data/roads'
 import { cityId, companyId, edgeId, vehicleId } from '../types'
 import type {
+  City,
   CityId,
   Edge,
   EdgeId,
@@ -57,6 +58,12 @@ function makeVehicle(at: CityId, route: CityId[], cruiseKmh = 90): Vehicle {
     route,
     cruiseKmh,
     odometer: 0,
+    // Груза в тестах движения нет: они про километры и время, а не про тонны.
+    // Грузоподъёмность взята у ЗИЛ-130 — стартовой машины партии.
+    capacity: 6,
+    cargo: null,
+    loadedKm: 0,
+    emptyKm: 0,
   }
 }
 
@@ -66,11 +73,21 @@ function makeState(edges: readonly Edge[], vehicle: Vehicle): GameState {
     tick: 0,
     startYear: 1994,
     world: {
-      cities: CITIES_BY_ID,
+      // Города из данных статические, а City в состоянии — живой: у него есть
+      // склад и счётчик снабжения. Достраиваем их пустыми: движению они не
+      // нужны, но без них фикстура не собирается.
+      cities: Object.fromEntries(
+        Object.values(CITIES_BY_ID).map((city) => [
+          city.id,
+          { ...city, stock: {}, suppliedDays: 0 },
+        ]),
+      ) as Record<CityId, City>,
       edges: Object.fromEntries(edges.map((e) => [e.id, e])) as Record<
         EdgeId,
         Edge
       >,
+      // Предприятия в тестах движения не участвуют.
+      industries: {},
     },
     companies: {
       [PLAYER]: {
