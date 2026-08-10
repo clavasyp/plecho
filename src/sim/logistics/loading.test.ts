@@ -26,10 +26,12 @@ import type {
   LineId,
   Stop,
   Tons,
+  TrailerType,
   Vehicle,
   VehicleId,
 } from '../types'
 import { CITY_STOCK_DAYS, cityCapacity, runArrivals } from './loading'
+import { canCarry } from './trailer'
 
 /**
  * Мир в этих тестах синтетический и намеренно крошечный: один-два города,
@@ -90,6 +92,26 @@ const TEST_EDGES: Edge[] = [
 
 /** Грузоподъёмность ЗИЛ-130 — стартовой машины партии. */
 const ZIL_TONS = 6
+
+/**
+ * Класс стартовой машины.
+ *
+ * Фаза прибытия справочник техники не читает вовсе: грузоподъёмность лежит на
+ * самой машине (Vehicle.capacity), потому что прицеп и износ со временем
+ * уводят её от паспортной. Поле нужно только для полноты объекта.
+ */
+const ZIL_CLASS = 'zil-130'
+
+/**
+ * Кузов по умолчанию для машин этих тестов.
+ *
+ * Тент выбран не случайно: это единственный кузов, в котором едут ВСЕ грузы,
+ * встречающиеся в тестах ниже, — зерно, мука, пиломатериалы. Дай машинам
+ * специализированный прицеп, и половина тестов про склады, приоритеты и
+ * километры начала бы падать по совершенно посторонней причине. Тесты про сам
+ * кузов ставят прицеп явно.
+ */
+const DEFAULT_TRAILER: TrailerType = 'тент'
 
 /**
  * Расход ЗИЛ-130, л/100 км.
@@ -162,6 +184,16 @@ function makeVehicle(
     lineId: null,
     stopIndex: 0,
     blockedTicks: 0,
+    classId: ZIL_CLASS,
+    trailer: DEFAULT_TRAILER,
+    // Водитель, износ и поломка фазу прибытия не касаются: без водителя машина
+    // не едет, но стоящая под погрузкой грузится — это работа склада, а не
+    // рейс. Поля заполнены «здоровыми» значениями, чтобы тест погрузки не
+    // зависел от того, что решат фазы водителей и износа.
+    driverId: null,
+    wear: 0,
+    kmSinceService: 0,
+    brokenDown: false,
     cruiseKmh: 70,
     fuelPer100Km: ZIL_FUEL_PER_100KM,
     odometer: 0,
@@ -202,6 +234,10 @@ function makeState(
       LineId,
       Line
     >,
+    // Водителей у этой компании нет вовсе, и фазе прибытия это безразлично:
+    // машина без водителя не едет, но стоящая под погрузкой грузится — это
+    // работа склада, а не рейс.
+    drivers: {},
     dailyRevenue: 0,
     dailyCosts: 0,
     bankrupt: false,
@@ -569,14 +605,20 @@ describe('runArrivals: разгрузка раньше погрузки', () => 
   })
 
   it('гружёная машина не догружается поверх своего груза', () => {
-    // Груза для неё в Калуге нет, но есть готовая продукция нефтебазы. Кузов
-    // занят — значит занят.
+    // Сдать нефть в Калуге некому (нефтебаза — источник, город наливное не
+    // потребляет), а взять есть что, и кузов под это подходит: цистерна с
+    // двумя тоннами могла бы долить ещё четыре. Кузов занят — значит занят.
+    //
+    // Прицеп здесь нарочно ПОДХОДЯЩИЙ. Поставь тент — и машина не догрузилась
+    // бы из-за несовместимости, а тест про занятый кузов зеленел бы, ничего
+    // про занятость не проверяя.
     const state = makeState(
       [makeCity(KALUGA, 100_000)],
       [makeIndustry('depot', 'нефтебаза', KALUGA, { 'нефть': 100 })],
       [
         makeVehicle(V1, KALUGA, {
-          cargo: { type: 'зерно', tons: 2, originId: MOSCOW },
+          trailer: 'цистерна',
+          cargo: { type: 'нефть', tons: 2, originId: MOSCOW },
           odometer: LEG_KM,
         }),
       ],
@@ -584,7 +626,7 @@ describe('runArrivals: разгрузка раньше погрузки', () => 
 
     const after = runArrivals(state)
 
-    expect(truck(after).cargo).toMatchObject({ type: 'зерно', tons: 2 })
+    expect(truck(after).cargo).toMatchObject({ type: 'нефть', tons: 2 })
     expect(plant(after, 'depot').stock['нефть']).toBe(100)
   })
 })
@@ -805,6 +847,9 @@ describe('runArrivals: машина на линии', () => {
   })
 
   it('второй груз в списке берётся, когда первого в городе нет', () => {
+    // Оба груза списка машине по кузову (тент везёт и пиломатериалы, и зерно),
+    // и это существенно: возьми первым топливо, машина отказалась бы от него
+    // из-за цистерны, и тест проверял бы совместимость вместо приоритета.
     const state = makeState(
       [makeCity(TULA, 100_000)],
       [makeIndustry('elevator', 'элеватор', TULA, { 'зерно': 100 })],
@@ -813,7 +858,7 @@ describe('runArrivals: машина на линии', () => {
       [
         makeLine(
           RING,
-          [makeStop(TULA, [], ['топливо', 'зерно']), makeStop(MOSCOW)],
+          [makeStop(TULA, [], ['пиломатериалы', 'зерно']), makeStop(MOSCOW)],
           [V1],
         ),
       ],
@@ -1037,6 +1082,184 @@ describe('runArrivals: машина на линии', () => {
     // Обе взяли зерно: линия велела, а вторая нашла сама.
     expect(truck(after, V1).cargo).toMatchObject({ type: 'зерно' })
     expect(truck(after, V2).cargo).toMatchObject({ type: 'зерно' })
+  })
+})
+
+// ─── Кузов ─────────────────────────────────────────────────────────────────
+
+describe('runArrivals: погрузка считается с кузовом', () => {
+  /**
+   * То же кольцо, что и выше, но кузов машины задаётся снаружи.
+   *
+   * Тула: элеватор отдаёт зерно, город принимает муку.
+   * Москва: мукомольный принимает зерно и отдаёт муку.
+   *
+   * Кольцо спроектировано ПРАВИЛЬНО — оба плеча гружёные. Единственное, что
+   * меняется между прогонами, — прицеп под машиной, и в этом весь смысл: цена
+   * ошибки в специализации парка видна в километрах, а не в исключении.
+   */
+  function ringState(trailer: TrailerType | null): GameState {
+    return makeState(
+      [makeCity(TULA, FLOUR_CITY_POP), makeCity(MOSCOW, 100_000)],
+      [
+        makeIndustry('elevator', 'элеватор', TULA, { 'зерно': 100 }),
+        makeIndustry('mill', 'мукомольный', MOSCOW, { 'мука': 100 }),
+      ],
+      [makeVehicle(V1, TULA, { lineId: RING, stopIndex: 0, trailer })],
+      0,
+      [
+        makeLine(
+          RING,
+          [
+            makeStop(TULA, ['мука'], ['зерно']),
+            makeStop(MOSCOW, ['зерно'], ['мука']),
+          ],
+          [V1],
+        ),
+      ],
+    )
+  }
+
+  /** Полный круг Тула → Москва → Тула. Возвращает состояние в конце круга. */
+  function runRing(state: GameState): GameState {
+    const atTula = runArrivals(state)
+    const atMoscow = runArrivals(
+      withVehicle(atTula, drive(truck(atTula), LEG_KM, MOSCOW, 1)),
+    )
+    return runArrivals(
+      withVehicle(atMoscow, drive(truck(atMoscow), LEG_KM, TULA, 0)),
+    )
+  }
+
+  it('тягач без прицепа не грузится в режиме разовых рейсов', () => {
+    const state = makeState(
+      [makeCity(TULA, 100_000)],
+      [makeIndustry('elevator', 'элеватор', TULA, { 'зерно': 100 })],
+      [makeVehicle(V1, TULA, { trailer: null })],
+    )
+
+    const after = runArrivals(state)
+
+    // Не сделано ничего — состояние даже не пересобиралось.
+    expect(after).toBe(state)
+    expect(truck(after).cargo).toBeNull()
+    expect(plant(after, 'elevator').stock['зерно']).toBe(100)
+  })
+
+  it('тягач без прицепа не грузится и на линии', () => {
+    // Остановка прямо велит взять зерно, и зерно в городе есть. Инструкция не
+    // отменяет физику: везти его не в чем.
+    const state = makeState(
+      [makeCity(TULA, 100_000)],
+      [makeIndustry('elevator', 'элеватор', TULA, { 'зерно': 100 })],
+      [makeVehicle(V1, TULA, { lineId: RING, stopIndex: 0, trailer: null })],
+      0,
+      [makeLine(RING, [makeStop(TULA, [], ['зерно']), makeStop(MOSCOW)], [V1])],
+    )
+
+    const after = runArrivals(state)
+
+    expect(after).toBe(state)
+    expect(truck(after).cargo).toBeNull()
+    expect(plant(after, 'elevator').stock['зерно']).toBe(100)
+  })
+
+  it('цистерна не берёт зерно, а зерновоз берёт', () => {
+    // Условие теста спрашивается у справочника, а не вписано сюда: поменяются
+    // требования груза — упадёт эта строка, а не поведение ниже.
+    expect(canCarry('цистерна', 'зерно')).toBe(false)
+    expect(canCarry('зерновоз', 'зерно')).toBe(true)
+
+    const build = (trailer: TrailerType) =>
+      makeState(
+        [makeCity(TULA, 100_000)],
+        [makeIndustry('elevator', 'элеватор', TULA, { 'зерно': 100 })],
+        [makeVehicle(V1, TULA, { trailer })],
+      )
+
+    expect(truck(runArrivals(build('цистерна'))).cargo).toBeNull()
+    expect(truck(runArrivals(build('зерновоз'))).cargo).toMatchObject({
+      type: 'зерно',
+      tons: ZIL_TONS,
+    })
+  })
+
+  it('зерновоз не берёт топливо, а цистерна берёт', () => {
+    expect(canCarry('зерновоз', 'топливо')).toBe(false)
+    expect(canCarry('цистерна', 'топливо')).toBe(true)
+
+    const build = (trailer: TrailerType) =>
+      makeState(
+        [makeCity(TULA, 100_000)],
+        [makeIndustry('refinery', 'НПЗ', TULA, { 'топливо': 100 })],
+        [makeVehicle(V1, TULA, { trailer })],
+      )
+
+    expect(truck(runArrivals(build('зерновоз'))).cargo).toBeNull()
+    expect(truck(runArrivals(build('цистерна'))).cargo).toMatchObject({
+      type: 'топливо',
+      tons: ZIL_TONS,
+    })
+  })
+
+  it('линия с грузом не под кузов даёт порожний пробег, а не падение', () => {
+    // Главный сценарий среза. Линия исправна, груз на месте, город ждёт — а
+    // машина катает круг вхолостую, потому что игрок повесил на неё не тот
+    // прицеп. Это обратная связь, а не ошибка: никаких исключений, только
+    // километры в отчёте.
+    expect(canCarry('цистерна', 'зерно')).toBe(false)
+    expect(canCarry('цистерна', 'мука')).toBe(false)
+
+    const after = runRing(ringState('цистерна'))
+    const v = truck(after)
+
+    expect(v.cargo).toBeNull()
+    expect(v.loadedKm).toBeCloseTo(0, 9)
+    expect(v.emptyKm).toBeCloseTo(2 * LEG_KM, 9)
+    expect(v.emptyKm / v.odometer).toBeCloseTo(1, 9)
+    // Ни одного оплаченного плеча: круг пройден целиком за свой счёт.
+    expect(money(after)).toBe(0)
+  })
+
+  it('на том же кольце подходящий кузов даёт нулевой порожний пробег', () => {
+    // Контрольный прогон: разница между этим тестом и предыдущим — ровно один
+    // прицеп, и стоит она всего топлива кольца и всей его выручки.
+    const after = runRing(ringState('тент'))
+    const v = truck(after)
+
+    expect(v.loadedKm).toBeCloseTo(2 * LEG_KM, 9)
+    expect(v.emptyKm).toBeCloseTo(0, 9)
+    expect(money(after)).toBeCloseTo(
+      deliveryRevenue('зерно', ZIL_TONS, LEG_KM) +
+        deliveryRevenue('мука', ZIL_TONS, LEG_KM),
+      9,
+    )
+  })
+
+  it('выгрузка кузовом не ограничена: гружёный доедет и сдаст', () => {
+    // Прицеп сменили на стоянке, сохранение старой версии, правка данных — в
+    // кузове оказался груз, который туда «не влезает». Запрети выгрузку — и
+    // партия заперта в машине навсегда, до списания по мёртвому грузу.
+    // Совместимость решает, что можно ВЗЯТЬ, и только это.
+    expect(canCarry('цистерна', 'зерно')).toBe(false)
+
+    const state = makeState(
+      [makeCity(TULA, 100_000)],
+      [makeIndustry('mill', 'мукомольный', TULA)],
+      [
+        makeVehicle(V1, TULA, {
+          trailer: 'цистерна',
+          cargo: { type: 'зерно', tons: ZIL_TONS, originId: MOSCOW },
+          odometer: LEG_KM,
+        }),
+      ],
+    )
+
+    const after = runArrivals(state)
+
+    expect(plant(after, 'mill').stock['зерно']).toBeCloseTo(ZIL_TONS, 9)
+    expect(truck(after).cargo).toBeNull()
+    expect(money(after)).toBeCloseTo(deliveryRevenue('зерно', ZIL_TONS, LEG_KM), 9)
   })
 })
 

@@ -64,6 +64,7 @@ function makeState(...industries: Industry[]): GameState {
         money: 0,
         controller: 'человек',
         lines: {},
+        drivers: {},
         dailyRevenue: 0,
         dailyCosts: 0,
         bankrupt: false,

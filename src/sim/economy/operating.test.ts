@@ -3,21 +3,28 @@ import {
   BANKRUPTCY_GRACE_DAYS,
   DRIVER_WAGE_PER_DAY,
   FUEL_PRICE_PER_LITER,
-  MAINTENANCE_PER_KM,
 } from '../../data/operating'
+import { costPerKm } from '../../data/vehicles'
+import { fuelFactor, wageFor } from '../logistics/driver'
 import { advanceVehicle, setRoute, speedKmh } from '../logistics/vehicle'
+import { maintenancePerKm } from '../logistics/wear'
 import {
   STARTER_CAPACITY_TONS,
+  STARTER_CLASS,
+  STARTER_CLASS_ID,
   STARTER_CRUISE_KMH,
   STARTER_FUEL_PER_100KM,
+  STARTER_TRAILER,
 } from '../state'
 import { TICKS_PER_DAY, TICKS_PER_HOUR } from '../types'
-import { cityId, companyId, edgeId, vehicleId } from '../types'
+import { cityId, companyId, driverId, edgeId, vehicleId } from '../types'
 import type {
   City,
   CityId,
   Company,
   CompanyId,
+  Driver,
+  DriverId,
   Edge,
   EdgeId,
   GameState,
@@ -57,6 +64,7 @@ const TULA = cityId('tula')
 const PLAYER: CompanyId = companyId('player')
 const RIVAL: CompanyId = companyId('rival')
 const V1: VehicleId = vehicleId('v1')
+const D1: DriverId = driverId('d1')
 
 /** Реальное плечо Орёл — Тула по М-2. */
 const LEG_KM = 183
@@ -123,6 +131,18 @@ function makeZil(at: CityId, patch: Partial<Vehicle> = {}): Vehicle {
     lineId: null,
     stopIndex: 0,
     blockedTicks: 0,
+    classId: STARTER_CLASS_ID,
+    trailer: STARTER_TRAILER,
+    // За рулём есть кто-то: машина без водителя не едет вовсе, и фикстура без
+    // него измеряла бы стоимость простоя вместо стоимости километра.
+    driverId: D1,
+    // Новая машина: множитель обслуживания за износ равен единице, и цена
+    // километра совпадает с паспортной ставкой класса. Тесты, проверяющие
+    // арифметику расходов, обязаны считать по чистой ставке — старение техники
+    // проверяется отдельно, в logistics/wear.
+    wear: 0,
+    kmSinceService: 0,
+    brokenDown: false,
     cruiseKmh: STARTER_CRUISE_KMH,
     fuelPer100Km: STARTER_FUEL_PER_100KM,
     odometer: 0,
@@ -134,6 +154,32 @@ function makeZil(at: CityId, patch: Partial<Vehicle> = {}): Vehicle {
   }
 }
 
+/**
+ * Водитель-НОВИЧОК: навык ноль, допусков нет.
+ *
+ * Ноль выбран не для простоты, а чтобы фикстура попадала ровно в те числа, по
+ * которым посчитан документ. Ставка новичка равна базовой из данных
+ * (wageFor(0, []) === DRIVER_WAGE_PER_DAY), а множитель расхода топлива у него
+ * единичный — то есть машина жжёт ровно паспортные литры. Возьми мы среднего
+ * водителя, и топливо, и зарплата разошлись бы с разбором в data/operating.ts,
+ * причём в разные стороны.
+ */
+function makeDriver(employerId: CompanyId, patch: Partial<Driver> = {}): Driver {
+  return {
+    id: D1,
+    name: 'Новичок',
+    employerId,
+    vehicleId: V1,
+    skill: 0,
+    licenses: [],
+    fatigue: 0,
+    hoursOnDuty: 0,
+    wagePerDay: wageFor(0, []),
+    loyalty: 0.5,
+    ...patch,
+  }
+}
+
 function makeCompany(id: CompanyId, patch: Partial<Company> = {}): Company {
   return {
     id,
@@ -141,6 +187,7 @@ function makeCompany(id: CompanyId, patch: Partial<Company> = {}): Company {
     money: RICH,
     controller: 'человек',
     lines: {},
+    drivers: { [D1]: makeDriver(id) },
     dailyRevenue: 0,
     dailyCosts: 0,
     bankrupt: false,
@@ -271,7 +318,7 @@ describe('пробег тика', () => {
     expect(roughDistance).toBeCloseTo(goodDistance / 2, 9)
     // И обе статьи считаются по одному пробегу.
     expect(goodDistance).toBeCloseTo(
-      fuelCost(onGood, KM_PER_TICK) + maintenanceCost(KM_PER_TICK),
+      fuelCost(onGood, KM_PER_TICK) + maintenanceCost(onGood, KM_PER_TICK),
       9,
     )
   })
@@ -342,7 +389,8 @@ describe('суточный итог', () => {
     // сумма. Через несколько суток окно обязано показать суточный итог, а не
     // сумму с начала прогона.
     const perTick = 500
-    let state = makeState([], [makeCompany(PLAYER, { money: 0 })])
+    // Без штата: проверяется окно выручки, а не расходы на зарплату.
+    let state = makeState([], [makeCompany(PLAYER, { money: 0, drivers: {} })])
 
     for (let i = 0; i < 20 * TICKS_PER_DAY; i++) {
       state = {
@@ -381,9 +429,14 @@ describe('суточный итог', () => {
 })
 
 describe('банкротство', () => {
-  /** Компания без парка: деньги не меняются, растёт только счётчик долга. */
+  /**
+   * Компания без парка И БЕЗ ШТАТА: деньги не меняются, растёт только счётчик
+   * долга. Штат убран намеренно — зарплата платится по людям, а не по машинам
+   * (см. payrollPerTick), и водитель в резерве продолжал бы тратить деньги,
+   * превращая проверку отсрочки в проверку зарплаты.
+   */
   function indebted(money: number): GameState {
-    return makeState([], [makeCompany(PLAYER, { money })])
+    return makeState([], [makeCompany(PLAYER, { money, drivers: {} })])
   }
 
   function run(state: GameState, ticks: number): GameState {
@@ -552,12 +605,21 @@ describe('смысл игры в деньгах', () => {
     expect(costs).toBeCloseTo(distanceCost(zil, km) + ticks * WAGE_PER_TICK, 6)
   })
 
-  it('цена километра совпадает с расчётом в data/operating.ts', () => {
+  it('цена километра совпадает с расчётом в справочнике техники', () => {
     const zil = makeZil(OREL)
-    const perKm =
-      (STARTER_FUEL_PER_100KM / 100) * FUEL_PRICE_PER_LITER + MAINTENANCE_PER_KM
 
-    expect(distanceCost(zil, LEG_KM)).toBeCloseTo(LEG_KM * perKm, 9)
+    // Ставка обслуживания переехала из плоской константы в класс машины, и
+    // сверяться теперь надо со справочником: именно там у каждого класса
+    // проверен главный инвариант. Прежняя MAINTENANCE_PER_KM осталась в данных
+    // как запасной вариант для машины неизвестного класса.
+    expect(distanceCost(zil, LEG_KM)).toBeCloseTo(
+      LEG_KM * costPerKm(STARTER_CLASS),
+      9,
+    )
+    expect(maintenancePerKm(zil)).toBe(STARTER_CLASS.maintenancePerKm)
+    // Паспортный расход у машины и в справочнике — одно и то же число.
+    expect(STARTER_FUEL_PER_100KM).toBe(STARTER_CLASS.fuelPer100Km)
+    expect(FUEL_PRICE_PER_LITER).toBeGreaterThan(0)
   })
 })
 
@@ -595,8 +657,154 @@ describe('чистота', () => {
     expect(Number.isFinite(player(after).money)).toBe(true)
     // Топливо не начислилось, но обслуживание и зарплата — да.
     expect(spent(before, after)).toBeCloseTo(
-      maintenanceCost(KM_PER_TICK) + WAGE_PER_TICK,
+      maintenanceCost(broken, KM_PER_TICK) + WAGE_PER_TICK,
       9,
+    )
+  })
+})
+
+// ─── Срез 4: у каждой статьи свой хозяин ───────────────────────────────────
+
+describe('зарплата берётся у людей, а не у машин', () => {
+  it('водитель в резерве получает зарплату без всякой машины', () => {
+    // Штат — это расход сам по себе. Считай мы зарплату по парку, человек без
+    // машины не встретился бы в обходе ни разу и работал бы даром.
+    const before = makeState([], [makeCompany(PLAYER)])
+    const after = runOperatingCosts(before)
+
+    expect(spent(before, after)).toBeCloseTo(WAGE_PER_TICK, 9)
+  })
+
+  it('машина без водителя не стоит ни рубля', () => {
+    // Ни зарплаты (платить некому), ни топлива (она не едет). Купленный и
+    // брошенный тягач — это упущенные деньги, а не текущие расходы.
+    const parked = makeZil(OREL, { driverId: null })
+    const before = makeState([parked], [makeCompany(PLAYER, { drivers: {} })])
+
+    expect(runOperatingCosts(before)).toBe(before)
+  })
+
+  it('ставка берётся личная, а не плоская', () => {
+    const ace = makeDriver(PLAYER, { skill: 1, wagePerDay: wageFor(1, []) })
+    const before = makeState(
+      [makeZil(OREL)],
+      [makeCompany(PLAYER, { drivers: { [D1]: ace } })],
+    )
+
+    // Опытный дороже новичка ровно на надбавку из формулы найма — и эта
+    // разница обязана доходить до счёта компании, иначе навык бесплатен.
+    expect(spent(before, runOperatingCosts(before))).toBeCloseTo(
+      ace.wagePerDay / TICKS_PER_DAY,
+      9,
+    )
+    expect(ace.wagePerDay).toBeGreaterThan(wageFor(0, []))
+  })
+
+  it('два человека стоят вдвое дороже одного', () => {
+    const second = driverId('d2')
+    const before = makeState(
+      [],
+      [
+        makeCompany(PLAYER, {
+          drivers: {
+            [D1]: makeDriver(PLAYER),
+            [second]: makeDriver(PLAYER, { id: second, vehicleId: null }),
+          },
+        }),
+      ],
+    )
+
+    expect(spent(before, runOperatingCosts(before))).toBeCloseTo(
+      2 * WAGE_PER_TICK,
+      9,
+    )
+  })
+})
+
+describe('топливо и обслуживание считаются по машине и по человеку', () => {
+  const KM = 1000
+
+  it('аккуратный водитель жжёт меньше на той же машине', () => {
+    const zil = makeZil(OREL)
+    const rookie = makeDriver(PLAYER, { skill: 0 })
+    const ace = makeDriver(PLAYER, { skill: 1 })
+
+    expect(fuelCost(zil, KM, ace)).toBeLessThan(fuelCost(zil, KM, rookie))
+    // Новичок жжёт ровно паспортные литры: паспорт в справочнике — это и есть
+    // расход того, кто ничего не умеет экономить.
+    expect(fuelCost(zil, KM, rookie)).toBeCloseTo(fuelCost(zil, KM), 9)
+    expect(fuelCost(zil, KM, ace)).toBeCloseTo(
+      fuelCost(zil, KM) * fuelFactor(ace),
+      9,
+    )
+  })
+
+  it('изношенная машина дороже в обслуживании, а топливо у неё то же', () => {
+    const fresh = makeZil(OREL)
+    const worn = makeZil(OREL, { wear: 1 })
+
+    // Износ — это ремонты и резина, а не расход двигателя: смешай их, и
+    // разделять пришлось бы вместе с балансом.
+    expect(maintenanceCost(worn, KM)).toBeGreaterThan(maintenanceCost(fresh, KM))
+    expect(maintenanceCost(worn, KM)).toBeCloseTo(
+      KM * maintenancePerKm(worn),
+      9,
+    )
+    expect(fuelCost(worn, KM)).toBeCloseTo(fuelCost(fresh, KM), 9)
+  })
+
+  it('обслуживание считается по классу машины, а не по общей ставке', () => {
+    const zil = makeZil(OREL)
+    const heavy = makeZil(OREL, { classId: 'tractor' })
+
+    // Расходы обязаны расти вместе с классом — на этом держится главный
+    // инвариант для тяжёлой техники (разбор в src/data/vehicles.ts).
+    expect(maintenanceCost(heavy, KM)).toBeGreaterThan(maintenanceCost(zil, KM))
+  })
+})
+
+describe('стоящая машина не жжёт солярку', () => {
+  const onRoad = (patch: Partial<Vehicle> = {}): Vehicle =>
+    makeZil(OREL, {
+      position: { kind: 'ребро', edgeId: M2, fromId: OREL, progress: 0.5 },
+      route: [TULA],
+      ...patch,
+    })
+
+  it('сломанная посреди ребра не платит за километры', () => {
+    // Самый тихий из возможных дефектов: машина стоит на обочине, а топливо
+    // списывается, потому что положение у неё «на ребре».
+    const broken = onRoad({ brokenDown: true })
+    const state = makeState([broken], [makeCompany(PLAYER)])
+
+    expect(tickKm(broken, state)).toBe(0)
+    expect(spent(state, runOperatingCosts(state))).toBeCloseTo(WAGE_PER_TICK, 9)
+  })
+
+  it('брошенная без водителя посреди ребра — тоже', () => {
+    const abandoned = onRoad({ driverId: null })
+    const state = makeState(
+      [abandoned],
+      [makeCompany(PLAYER, { drivers: {} })],
+    )
+
+    expect(tickKm(abandoned, state)).toBe(0)
+    expect(runOperatingCosts(state)).toBe(state)
+  })
+
+  it('уставший водитель проезжает меньше — и платит меньше', () => {
+    const vehicle = onRoad()
+    const fresh = makeState([vehicle], [makeCompany(PLAYER)])
+    const tired = makeState(
+      [vehicle],
+      [makeCompany(PLAYER, { drivers: { [D1]: makeDriver(PLAYER, { fatigue: 1 }) } })],
+    )
+
+    // Расходы на километр не изменились ни на копейку — изменилось число
+    // километров. Именно поэтому усталость не трогает главный инвариант.
+    expect(tickKm(vehicle, tired)).toBeLessThan(tickKm(vehicle, fresh))
+    expect(spent(tired, runOperatingCosts(tired))).toBeLessThan(
+      spent(fresh, runOperatingCosts(fresh)),
     )
   })
 })

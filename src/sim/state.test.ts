@@ -1,21 +1,27 @@
 import { describe, expect, it } from 'vitest'
 import { CITIES } from '../data/cities'
 import { INDUSTRIES } from '../data/industries'
-import {
-  DRIVER_WAGE_PER_DAY,
-  FUEL_PRICE_PER_LITER,
-  MAINTENANCE_PER_KM,
-  ZIL_PRICE,
-} from '../data/operating'
+import { DRIVER_WAGE_PER_DAY } from '../data/operating'
 import { RECIPES, RECIPE_BY_INDUSTRY } from '../data/recipes'
 import { EDGES } from '../data/roads'
+import { costPerKm, TRAILER_PRICE, VEHICLE_CLASSES } from '../data/vehicles'
 import { DELIVERY_REFERENCE_KM } from './economy/finance'
+import { wageFor } from './logistics/driver'
+import { cargoFor } from './logistics/trailer'
 import {
   createInitialState,
+  createVehicle,
   createZil,
+  PLAYER_ID,
+  RESPEC_RESERVE,
   START_MONEY,
   START_YEAR,
+  STARTER_CAPACITY_TONS,
+  STARTER_CLASS,
+  STARTER_CLASS_ID,
+  STARTER_DRIVER_SKILL,
   STARTER_FUEL_PER_100KM,
+  STARTER_TRAILER,
 } from './state'
 import { dateFromTick } from './time'
 import { cityId, companyId, vehicleId } from './types'
@@ -241,9 +247,57 @@ describe('createInitialState: стартовая машина', () => {
     expect(truck.cruiseKmh).toBeLessThanOrEqual(90)
   })
 
-  it('грузоподъёмность — паспортные 6 тонн ЗИЛ-130', () => {
+  it('все характеристики машины взяты из справочника техники', () => {
     const truck = Object.values(createInitialState(1).vehicles)[0]
-    expect(truck.capacity).toBe(6)
+
+    /*
+     * ГЛАВНАЯ ПРОВЕРКА СТАРТОВОЙ МАШИНЫ В СРЕЗЕ 4. Числа не выписаны здесь
+     * руками нарочно: справочник — единственное место, где класс проверен на
+     * главный инвариант игры, и стартовая машина обязана быть ровно тем, что в
+     * нём записано. Разъедься эти два описания, и партия начиналась бы техникой,
+     * которой в игре нет: инвариант считался бы для одной машины, а ездила бы
+     * другая, и ни один тест баланса этого бы не заметил.
+     */
+    expect(truck.classId).toBe(STARTER_CLASS_ID)
+    expect(truck.capacity).toBe(STARTER_CLASS.capacity)
+    expect(truck.cruiseKmh).toBe(STARTER_CLASS.cruiseKmh)
+    expect(truck.fuelPer100Km).toBe(STARTER_CLASS.fuelPer100Km)
+    expect(STARTER_CAPACITY_TONS).toBe(STARTER_CLASS.capacity)
+  })
+
+  it('машина новая: без износа, без просроченного ТО и не сломана', () => {
+    const truck = Object.values(createInitialState(1).vehicles)[0]
+
+    // Партия начинается с исправной техники. Ненулевой износ на старте означал
+    // бы наказание за то, чего игрок ещё не делал.
+    expect(truck.wear).toBe(0)
+    expect(truck.kmSinceService).toBe(0)
+    expect(truck.brokenDown).toBe(false)
+  })
+
+  it('на машине стоит тент — единственный прицеп, на котором есть игра', () => {
+    const truck = Object.values(createInitialState(1).vehicles)[0]
+    expect(truck.trailer).toBe(STARTER_TRAILER)
+    // Прицеп обязан подходить машине: полуприцеп на бортовой ЗИЛ не повесить.
+    expect(STARTER_CLASS.trailers).toContain(STARTER_TRAILER)
+
+    /*
+     * Смысл выбора проверяется, а не декларируется. Кольцо с двумя гружёными
+     * плечами требует ВЕЗТИ РАЗНОЕ в разные стороны, то есть прицеп обязан
+     * брать больше одного груза. Второй доступный ЗИЛу прицеп (зерновоз) возит
+     * ровно один — с ним обратное плечо порожнее всегда, и главная механика
+     * игры недостижима с первого дня.
+     */
+    expect(cargoFor(STARTER_TRAILER).length).toBeGreaterThan(1)
+
+    const alternatives = STARTER_CLASS.trailers.filter(
+      (trailer) => trailer !== STARTER_TRAILER,
+    )
+    for (const trailer of alternatives) {
+      expect(cargoFor(trailer).length, trailer).toBeLessThanOrEqual(
+        cargoFor(STARTER_TRAILER).length,
+      )
+    }
   })
 
   it('машина порожняя, счётчики пробега обнулены', () => {
@@ -281,11 +335,68 @@ describe('createInitialState: стартовая машина', () => {
   })
 })
 
+describe('createInitialState: стартовый водитель', () => {
+  it('водитель ровно один и он сидит за стартовой машиной', () => {
+    const state = createInitialState(1)
+    const player = state.companies[state.playerId]
+    const drivers = Object.values(player.drivers)
+    const truck = Object.values(state.vehicles)[0]
+
+    // Один, а не два: водитель — постоянный расход, и человек в резерве
+    // проедал бы капитал, ничего не давая.
+    expect(drivers).toHaveLength(1)
+
+    // Связь двусторонняя и на старте обязана быть сведена: машина без водителя
+    // не едет вовсе, а водитель без машины получает зарплату ни за что.
+    const driver = drivers[0]
+    expect(truck.driverId).toBe(driver.id)
+    expect(driver.vehicleId).toBe(truck.id)
+    expect(driver.employerId).toBe(player.id)
+    for (const [key, person] of Object.entries(player.drivers)) {
+      expect(person.id).toBe(key)
+    }
+  })
+
+  it('навык средний, допусков нет, отдохнул', () => {
+    const driver = Object.values(
+      createInitialState(1).companies[PLAYER_ID].drivers,
+    )[0]
+
+    // Ровно середина шкалы: на ней расход топлива равен паспортному, и весь
+    // баланс срезов 2–3, посчитанный по паспорту, переносится без поправок.
+    expect(driver.skill).toBe(STARTER_DRIVER_SKILL)
+    expect(driver.skill).toBe(0.5)
+
+    // Без допусков: из трёх цепочек мира открыта ровно одна, зерновая. Две
+    // другие видны на карте и не работают — это и есть первая цель партии.
+    expect(driver.licenses).toEqual([])
+
+    // Партия начинается утром, а не в конце смены.
+    expect(driver.fatigue).toBe(0)
+    expect(driver.hoursOnDuty).toBe(0)
+  })
+
+  it('ставка считается той же формулой, что и при найме', () => {
+    const driver = Object.values(
+      createInitialState(1).companies[PLAYER_ID].drivers,
+    )[0]
+
+    // Две зарплатные формулы в игре — верный способ получить своего водителя
+    // дешевле точно такого же нанятого, и первый же наём выглядел бы
+    // несправедливо дорогим.
+    expect(driver.wagePerDay).toBe(wageFor(driver.skill, driver.licenses))
+    // Базовая ставка из данных — это ставка НОВИЧКА: надбавка за навык есть у
+    // всех, включая своего.
+    expect(driver.wagePerDay).toBeGreaterThan(DRIVER_WAGE_PER_DAY)
+    expect(wageFor(0, [])).toBe(DRIVER_WAGE_PER_DAY)
+  })
+})
+
 describe('createZil: одна сборка машины на всю игру', () => {
   const OWNER = companyId('someone')
   const WHERE = cityId('tula')
 
-  it('купленная машина ничем не отличается от стартовой', () => {
+  it('купленная машина ничем не отличается от стартовой, кроме водителя', () => {
     const starter = Object.values(createInitialState(1).vehicles)[0]
     const bought = createZil(vehicleId('zil-2'), starter.ownerId, WHERE)
 
@@ -293,8 +404,42 @@ describe('createZil: одна сборка машины на всю игру', (
     // в двух местах однажды разойдутся в поле, которое ничего не роняет, —
     // например, в расходе топлива, и купленная машина станет выгоднее
     // стартовой без единой красной строчки в прогоне.
-    const shape = (v: typeof starter) => ({ ...v, id: '', position: null })
+    //
+    // Водитель в список сравнения не входит: за стартовую машину сажают сразу,
+    // за купленную — отдельным решением игрока.
+    const shape = (v: typeof starter) => ({
+      ...v,
+      id: '',
+      position: null,
+      driverId: null,
+    })
     expect(shape(bought)).toEqual(shape(starter))
+  })
+
+  it('createVehicle собирает любой класс справочника и только его', () => {
+    for (const vehicleClass of VEHICLE_CLASSES) {
+      const truck = createVehicle(
+        vehicleId(`v-${vehicleClass.id}`),
+        OWNER,
+        WHERE,
+        vehicleClass.id,
+      )
+
+      expect(truck.classId).toBe(vehicleClass.id)
+      expect(truck.capacity).toBe(vehicleClass.capacity)
+      expect(truck.cruiseKmh).toBe(vehicleClass.cruiseKmh)
+      expect(truck.fuelPer100Km).toBe(vehicleClass.fuelPer100Km)
+
+      // Купленный тягач приезжает голым: ни прицепа, ни водителя. Машина в
+      // этой игре собирается из трёх решений, покупка — только первое.
+      expect(truck.trailer).toBeNull()
+      expect(truck.driverId).toBeNull()
+    }
+
+    // Неизвестный класс падает громко. Молчаливое умолчание дало бы машину с
+    // нулевым расходом топлива — то есть машину, которая возит бесплатно, и
+    // такой дефект выглядит как «странный баланс», а не как ошибка.
+    expect(() => createVehicle(vehicleId('v-x'), OWNER, WHERE, 'нет')).toThrow()
   })
 
   it('машина рождается стоящей в указанном городе, порожней и без линии', () => {
@@ -323,21 +468,60 @@ describe('createZil: одна сборка машины на всю игру', (
 })
 
 describe('createInitialState: стартовый капитал', () => {
-  /** Переменные расходы машины на километр: топливо плюс обслуживание. */
-  const perKm =
-    (STARTER_FUEL_PER_100KM / 100) * FUEL_PRICE_PER_LITER + MAINTENANCE_PER_KM
+  /**
+   * Переменные расходы стартовой машины на километр: топливо плюс обслуживание.
+   * Спрашиваются у справочника (costPerKm), а не складываются здесь заново:
+   * ставка обслуживания переехала в класс, и вторая копия формулы разъехалась
+   * бы с ней при первой же перебалансировке.
+   */
+  const perKm = costPerKm(STARTER_CLASS)
 
-  it('второй машины на старте не купить', () => {
+  /** Самый дешёвый прицеп, какой вообще есть в игре. */
+  const CHEAPEST_TRAILER = Math.min(...Object.values(TRAILER_PRICE))
+
+  it('второй РАБОТАЮЩЕЙ машины на старте не купить', () => {
     const state = createInitialState(1)
     const money = state.companies[state.playerId].money
 
     expect(money).toBe(START_MONEY)
-    // Смысл суммы: первое решение в игре («расширяться или сначала научиться
-    // возить») обязан принимать игрок, а не стартовый баланс.
-    expect(money).toBeLessThan(ZIL_PRICE)
+
+    /*
+     * Правило среза 3 звучало «капитала меньше, чем стоит ЗИЛ». В срезе 4 оно
+     * изменилось по форме и уцелело по сути: тягач сам по себе груза не берёт и
+     * с места не трогается, поэтому мерой стала цена РАБОТАЮЩЕЙ машины —
+     * тягач плюс хоть какой-нибудь прицеп. Её капитал не покрывает, и первое
+     * решение игры («расширяться или сначала научиться возить») по-прежнему
+     * принимает игрок, а не стартовый баланс.
+     */
+    expect(money).toBeLessThan(STARTER_CLASS.price + CHEAPEST_TRAILER)
+
     // Но и не настолько мало, чтобы копить вслепую: вторая машина должна быть
     // видимой целью, а не мечтой.
-    expect(money).toBeGreaterThan(ZIL_PRICE / 2)
+    expect(money).toBeGreaterThan(STARTER_CLASS.price / 2)
+  })
+
+  it('хватает на смену специализации: прицеп можно купить сразу', () => {
+    const money = createInitialState(1).companies[PLAYER_ID].money
+
+    /*
+     * Вторая роль капитала, появившаяся в срезе 4. Игрок, начавший с тентом и
+     * решивший, что ошибся, обязан иметь возможность купить другой прицеп —
+     * иначе первое же решение партии необратимо, а необратимое решение,
+     * принятое до того, как игрок понял правила, это не решение, а ловушка.
+     */
+    for (const trailer of STARTER_CLASS.trailers) {
+      expect(money, trailer).toBeGreaterThanOrEqual(TRAILER_PRICE[trailer])
+    }
+
+    // И запас на прицеп — именно ЗАПАС, а не весь капитал: на работу тоже
+    // должно остаться.
+    // После смены специализации игрок обязан остаться на плаву, но роскоши
+    // на второй такой манёвр ему не положено: капитал зажат ценовым окном
+    // (см. START_MONEY), и требовать двойного запаса значило бы разрешить
+    // покупку второй машины на старте.
+    const left = money - RESPEC_RESERVE
+    expect(left).toBeGreaterThan(0)
+    expect(left / DRIVER_WAGE_PER_DAY).toBeGreaterThan(5)
   })
 
   it('денег хватает на несколько суток работы', () => {
@@ -358,11 +542,17 @@ describe('createInitialState: стартовый капитал', () => {
 
   it('простой тоже проедает капитал, но медленно', () => {
     const state = createInitialState(1)
-    const money = state.companies[state.playerId].money
+    const player = state.companies[state.playerId]
+    const money = player.money
 
-    // Машина в гараже стоит одну зарплату в сутки. Две недели — нижняя
+    // Машина в гараже стоит зарплату своего водителя в сутки — настоящую, со
+    // всеми надбавками, а не базовую ставку из данных. Две недели — нижняя
     // граница: игрок должен успеть разобраться в интерфейсе, ничего не возя.
-    const idleDays = money / DRIVER_WAGE_PER_DAY
+    const payroll = Object.values(player.drivers).reduce(
+      (sum, driver) => sum + driver.wagePerDay,
+      0,
+    )
+    const idleDays = money / payroll
     expect(idleDays).toBeGreaterThan(14)
     // И верхняя: пересидеть партию в гараже нельзя, месяцем простоя капитал
     // кончается.

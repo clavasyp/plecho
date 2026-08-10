@@ -1,17 +1,27 @@
 import { describe, expect, it } from 'vitest'
 import { CITIES_BY_ID } from '../../data/cities'
+import { DRIVER_WAGE_PER_DAY } from '../../data/operating'
 import { EDGES } from '../../data/roads'
-import { cityId, companyId, edgeId, vehicleId } from '../types'
+import {
+  STARTER_CAPACITY_TONS,
+  STARTER_CLASS_ID,
+  STARTER_DRIVER_SKILL,
+  STARTER_FUEL_PER_100KM,
+  STARTER_TRAILER,
+} from '../state'
+import { cityId, companyId, driverId, edgeId, vehicleId } from '../types'
 import type {
   City,
   CityId,
+  Driver,
   Edge,
   EdgeId,
   GameState,
   RoadClass,
   Vehicle,
 } from '../types'
-import { advanceVehicle, setRoute, speedKmh } from './vehicle'
+import { FATIGUE_SPEED_PENALTY, MAX_SHIFT_HOURS } from './driver'
+import { actualSpeedKmh, advanceVehicle, setRoute, speedKmh } from './vehicle'
 
 /**
  * Числа в этих тестах подобраны так, чтобы ответ считался в уме и проверялся
@@ -28,6 +38,7 @@ const YAROSLAVL = cityId('yaroslavl')
 
 const PLAYER = companyId('player')
 const V1 = vehicleId('v1')
+const D1 = driverId('d1')
 
 /** Длительность обычного тика в часах — 15 минут. */
 const TICK_HOURS = 0.25
@@ -50,7 +61,12 @@ function makeEdge(
   }
 }
 
-function makeVehicle(at: CityId, route: CityId[], cruiseKmh = 90): Vehicle {
+function makeVehicle(
+  at: CityId,
+  route: CityId[],
+  cruiseKmh = 90,
+  patch: Partial<Vehicle> = {},
+): Vehicle {
   return {
     id: V1,
     ownerId: PLAYER,
@@ -61,21 +77,51 @@ function makeVehicle(at: CityId, route: CityId[], cruiseKmh = 90): Vehicle {
     lineId: null,
     stopIndex: 0,
     blockedTicks: 0,
+    // Класс и прицеп берутся у стартовой машины: движение ни того, ни другого
+    // не читает, но нулевой расход или пустой класс в фикстуре — плохой
+    // образец, с которого их копируют в новые тесты.
+    classId: STARTER_CLASS_ID,
+    trailer: STARTER_TRAILER,
+    // За рулём есть кто-то. Это ТЕПЕРЬ ОБЯЗАТЕЛЬНО: машина без водителя не
+    // едет вовсе, и фикстура без него проверяла бы не движение, а простой.
+    driverId: D1,
+    wear: 0,
+    kmSinceService: 0,
+    brokenDown: false,
     cruiseKmh,
-    // Расход у стартового ЗИЛа. Движение денег не считает, но нулевой расход
-    // в фикстуре — плохой образец: с него его копируют в новые тесты.
-    fuelPer100Km: 30,
+    fuelPer100Km: STARTER_FUEL_PER_100KM,
     odometer: 0,
     // Груза в тестах движения нет: они про километры и время, а не про тонны.
-    // Грузоподъёмность взята у ЗИЛ-130 — стартовой машины партии.
-    capacity: 6,
+    capacity: STARTER_CAPACITY_TONS,
     cargo: null,
     loadedKm: 0,
     emptyKm: 0,
+    ...patch,
   }
 }
 
-function makeState(edges: readonly Edge[], vehicle: Vehicle): GameState {
+/** Отдохнувший водитель среднего навыка — тот же, с которого начинается партия. */
+function makeDriver(patch: Partial<Driver> = {}): Driver {
+  return {
+    id: D1,
+    name: 'Водитель',
+    employerId: PLAYER,
+    vehicleId: V1,
+    skill: STARTER_DRIVER_SKILL,
+    licenses: [],
+    fatigue: 0,
+    hoursOnDuty: 0,
+    wagePerDay: DRIVER_WAGE_PER_DAY,
+    loyalty: 0.5,
+    ...patch,
+  }
+}
+
+function makeState(
+  edges: readonly Edge[],
+  vehicle: Vehicle,
+  driver: Driver = makeDriver(),
+): GameState {
   return {
     rngState: 1,
     tick: 0,
@@ -106,6 +152,7 @@ function makeState(edges: readonly Edge[], vehicle: Vehicle): GameState {
         money: 0,
         controller: 'человек',
         lines: {},
+        drivers: { [driver.id]: driver },
         dailyRevenue: 0,
         dailyCosts: 0,
         bankrupt: false,
@@ -372,5 +419,104 @@ describe('setRoute', () => {
     const reassigned = setRoute(midway, [TULA, KALUGA])
 
     expect(reassigned.position).toEqual(midway.position)
+  })
+})
+
+// ─── Срез 4: за рулём человек, а машина ломается ───────────────────────────
+
+/*
+ * Три новых причины стоять и одна новая причина ехать медленнее. Всё это
+ * приходит в движение одним числом — vehicleSpeedFactor из logistics/driver.ts,
+ * — поэтому тесты проверяют не формулы (они проверены там же, у себя), а
+ * СТЫК: что движение это число спрашивает и что оно на него влияет.
+ */
+
+describe('машина не едет без человека и на сломанной технике', () => {
+  const ROAD = makeEdge(MOSCOW, TULA, 200)
+
+  it('без водителя стоит, даже получив маршрут', () => {
+    const vehicle = makeVehicle(MOSCOW, [TULA], 90, { driverId: null })
+    const state = makeState([ROAD], vehicle)
+
+    const after = run(vehicle, state, 10)
+
+    // Ровно та же ссылка: движение не тронуло машину вовсе. Это важнее
+    // равенства полей — по совпадению ссылок рендер отличает стоящих от едущих.
+    expect(after).toBe(vehicle)
+    expect(after.odometer).toBe(0)
+    // Маршрут сохранён: машина не «отменила рейс», она его ещё не начала.
+    expect(after.route).toEqual([TULA])
+  })
+
+  it('водитель, который числится, но которого нет в штате, машину не везёт', () => {
+    const vehicle = makeVehicle(MOSCOW, [TULA])
+    // Ссылка в никуда: человека уволили, а машину не освободили. Дыра в данных
+    // не должна давать бесплатный рейс.
+    const state = makeState([ROAD], vehicle, makeDriver({ id: driverId('нет') }))
+
+    expect(run(vehicle, state, 10).odometer).toBe(0)
+  })
+
+  it('сломанная стоит до ремонта', () => {
+    const vehicle = makeVehicle(MOSCOW, [TULA], 90, { brokenDown: true })
+    const state = makeState([ROAD], vehicle)
+
+    expect(run(vehicle, state, 10)).toBe(vehicle)
+  })
+
+  it('водитель на обязательном отдыхе машину не везёт', () => {
+    const vehicle = makeVehicle(MOSCOW, [TULA])
+    // Смена выбрана целиком — режим труда и отдыха отправляет человека спать.
+    const state = makeState(
+      [ROAD],
+      vehicle,
+      makeDriver({ hoursOnDuty: MAX_SHIFT_HOURS, fatigue: 1 }),
+    )
+
+    expect(run(vehicle, state, 10).odometer).toBe(0)
+  })
+})
+
+describe('усталость водителя режет скорость', () => {
+  const ROAD = makeEdge(MOSCOW, TULA, 400)
+
+  /**
+   * Ожидание выводится из константы штрафа, а не вписано числом. Правка
+   * FATIGUE_SPEED_PENALTY обязана менять этот тест сама — иначе он однажды
+   * начнёт проверять правило, которого в игре уже нет.
+   */
+  const TIRED_FACTOR = 1 - FATIGUE_SPEED_PENALTY
+
+  it('предельно уставший едет ровно в (1 − штраф) раз медленнее', () => {
+    const vehicle = makeVehicle(MOSCOW, [TULA], 90)
+    const fresh = makeState([ROAD], vehicle)
+    const tired = makeState([ROAD], vehicle, makeDriver({ fatigue: 1 }))
+
+    expect(actualSpeedKmh(tired, vehicle, ROAD)).toBeCloseTo(
+      actualSpeedKmh(fresh, vehicle, ROAD) * TIRED_FACTOR,
+      9,
+    )
+  })
+
+  it('за одно и то же время уставший проезжает меньше', () => {
+    const vehicle = makeVehicle(MOSCOW, [TULA], 90)
+    const fresh = makeState([ROAD], vehicle)
+    const tired = makeState([ROAD], vehicle, makeDriver({ fatigue: 1 }))
+
+    // Четыре тика — час хода. Ребро длиной 400 км за час не кончится ни у кого,
+    // поэтому сравниваются именно скорости, а не остатки пути.
+    const byFresh = run(vehicle, fresh, 4).odometer
+    const byTired = run(vehicle, tired, 4).odometer
+
+    expect(byTired).toBeCloseTo(byFresh * TIRED_FACTOR, 6)
+    expect(byTired).toBeLessThan(byFresh)
+  })
+
+  it('усталость не меняет маршрутную скорость, по которой строят путь', () => {
+    // speedKmh отвечает про МАШИНУ и человека не знает: иначе маршрут
+    // перестраивался бы по мере того, как водитель выдыхается. Разбор — в
+    // шапке vehicle.ts.
+    const vehicle = makeVehicle(MOSCOW, [TULA], 90)
+    expect(speedKmh(vehicle, ROAD)).toBe(90)
   })
 })

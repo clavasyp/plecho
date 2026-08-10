@@ -1,7 +1,17 @@
 import { describe, expect, it } from 'vitest'
-import { TICKS_PER_HOUR, cityId, companyId, edgeId, lineId, vehicleId } from '../types'
+import {
+  TICKS_PER_HOUR,
+  cityId,
+  companyId,
+  driverId,
+  edgeId,
+  lineId,
+  vehicleId,
+} from '../types'
 import type {
   City,
+  Driver,
+  DriverId,
   CityId,
   Company,
   CompanyId,
@@ -142,6 +152,14 @@ function makeVehicle(
     lineId: null,
     stopIndex: 0,
     blockedTicks: 0,
+    classId: 'zil-130',
+    trailer: 'тент',
+    // Водитель обязателен: без него машина не трогается, а здесь проверяется
+    // именно диспетчеризация. Отсутствие водителя — предмет driver.test.ts.
+    driverId: driverId(`drv-${id}`),
+    wear: 0,
+    kmSinceService: 0,
+    brokenDown: false,
     cruiseKmh: ZIL_KMH,
     fuelPer100Km: ZIL_FUEL,
     odometer: 0,
@@ -162,6 +180,7 @@ function makeCompany(lines: Line[]): Company {
     money: 6_000,
     controller: 'человек',
     lines: table,
+    drivers: {},
     dailyRevenue: 0,
     dailyCosts: 0,
     bankrupt: false,
@@ -179,12 +198,31 @@ function makeState(lines: Line[], vehicles: Vehicle[]): GameState {
   const fleet: Record<VehicleId, Vehicle> = {}
   for (const vehicle of vehicles) fleet[vehicle.id] = vehicle
 
+  // Отдохнувший водитель на каждую машину: тесты этого файла про кольцо и
+  // расстановку, а не про режим труда, и упереться в него они не должны.
+  const crew: Record<DriverId, Driver> = {}
+  for (const vehicle of vehicles) {
+    if (vehicle.driverId === null) continue
+    crew[vehicle.driverId] = {
+      id: vehicle.driverId,
+      name: 'Водитель',
+      employerId: PLAYER,
+      vehicleId: vehicle.id,
+      skill: 0.5,
+      licenses: ['ДОПОГ', 'длинномер'],
+      fatigue: 0,
+      hoursOnDuty: 0,
+      wagePerDay: 700,
+      loyalty: 0.5,
+    }
+  }
+
   return {
     rngState: 1,
     tick: 0,
     startYear: 1994,
     world: { cities, edges, industries: {} },
-    companies: { [PLAYER]: makeCompany(lines) },
+    companies: { [PLAYER]: { ...makeCompany(lines), drivers: crew } },
     playerId: PLAYER,
     vehicles: fleet,
   }

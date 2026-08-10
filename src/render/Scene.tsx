@@ -26,7 +26,7 @@
  * достаточно нормировать диагональ.
  */
 
-import { useCallback, useLayoutEffect, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import type { ComponentRef, JSX } from 'react'
 import * as THREE from 'three'
 import { useThree } from '@react-three/fiber'
@@ -40,6 +40,7 @@ import {
 } from '@react-three/postprocessing'
 import { BlendFunction, ToneMappingMode } from 'postprocessing'
 import { useGameStore } from '../app/store'
+import type { CityId } from '../sim/types'
 import { fogRange, lighting, palette, postFx } from './palette'
 import { Cities, cityPoint } from './CityMesh'
 import { CityPicker } from './CityPicker'
@@ -242,6 +243,61 @@ export function Scene(): JSX.Element {
     orbit.object.position.z += z - orbit.target.z
     orbit.target.set(x, 0, z)
   }, [framing])
+
+  /**
+   * Наводка камеры из консоли и из e2e — только в разработке.
+   *
+   * НУЖНА РОВНО ДЛЯ ОДНОГО: доказать снимком экрана, что машины на карте
+   * действительно РАЗЛИЧАЮТСЯ. На кадре по умолчанию вся карта округа влезает в
+   * экран, и сцеп в девять километров занимает там около десятка пикселей — на
+   * таком снимке не видно ни разницы классов, ни того, горит ли кабина, и
+   * сквозной тест выродился бы в «что-то нарисовалось». Кадрировать же камеру
+   * мышью из теста нельзя по той же причине, по которой из него не кликают по
+   * сцене (разбор — в шапке ui/selection.ts): колесо и перетаскивание считаются
+   * в экранных координатах, а они зависят от разрешения и от текущего зума.
+   *
+   * Зум задаётся КРАТНОСТЬЮ к вписанному кадру, а не абсолютным числом: сам
+   * вписанный кадр зависит от размера окна, и абсолютное значение означало бы
+   * разный охват на разных экранах. Пределы те же, что у колеса мыши, —
+   * инструмент отладки не должен показывать то, чего игрок увидеть не может.
+   *
+   * В продакшен-сборке ветка не выполняется: import.meta.env.DEV — константа
+   * этапа сборки.
+   */
+  useEffect(() => {
+    if (!import.meta.env.DEV) return
+
+    const dev = globalThis as unknown as { __plechoLook?: unknown }
+
+    dev.__plechoLook = (id: string, factor = 1): void => {
+      const orbit = controls.current
+      if (orbit === null) return
+
+      const city = useGameStore.getState().state.world.cities[id as CityId]
+      if (city === undefined) return
+
+      const point = cityPoint(city)
+      const camera = orbit.object as THREE.OrthographicCamera
+
+      orbit.target.set(point.x, 0, point.z)
+      camera.position.set(
+        point.x + CAMERA_DISTANCE * ISO,
+        CAMERA_DISTANCE * ISO,
+        point.z + CAMERA_DISTANCE * ISO,
+      )
+      camera.zoom = THREE.MathUtils.clamp(
+        view.zoom * factor,
+        view.minZoom,
+        view.maxZoom,
+      )
+      camera.updateProjectionMatrix()
+      orbit.update()
+    }
+
+    return () => {
+      delete dev.__plechoLook
+    }
+  }, [view])
 
   // Тени включаются на самом рендерере, а <Canvas> находится в чужом файле.
   // Операция идемпотентна: если shadows уже заданы на канвасе, это пустое

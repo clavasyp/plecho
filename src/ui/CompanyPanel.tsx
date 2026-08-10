@@ -8,8 +8,23 @@
  *   «Сколько парк едет пустым» — крупно: единственное число, по которому видно
  *     мастерство, а не удачу (docs/КОНЦЕПТ.md, раздел 4).
  *   «Какая линия виновата» — списком: порожняк и экономика каждого кольца.
- *   «Где сейчас каждая машина» — мелким списком: справка, в которую заглядывают
- *     глазами, а не следят за ней непрерывно.
+ *   «Сколько машин стоит и почему» — одной строкой и дверью в панель парка.
+ *
+ * ПАРК ПЕРЕЕХАЛ В СВОЮ ПАНЕЛЬ (ui/FleetPanel.tsx), и здесь от него осталась
+ * ровно одна строка. Причина не в тесноте. В срезе 4 у машины появились класс,
+ * прицеп, водитель и возраст, и список «где сейчас каждая машина» перестал
+ * отвечать на главный вопрос про парк — им стало «что с этой машиной делать».
+ * Ответ требует износа рядом со ставкой обслуживания, цен ТО и ремонта, списка
+ * прицепов с грузами и штата с допусками; в колонку шириной 268 пикселей это не
+ * складывается, а главное — не должно: панель компании это ПРИБОРНАЯ ДОСКА, на
+ * которую смотрят не отрываясь от карты, а парк — рабочий экран, за который
+ * садятся. Две копии одного списка в двух панелях разошлись бы при первой же
+ * правке, поэтому здесь остался итог, а не выжимка.
+ *
+ * Итог при этом не декоративный: он называет ОСТАНОВЛЕННЫЕ ДЕНЬГИ — сломанные
+ * машины и машины без водителя. Это те же деньги, что и убыток в суточном
+ * итоге, только ещё не потраченные, и увидеть их игрок должен здесь, не открывая
+ * ничего.
  *
  * ПОЧЕМУ СУТОЧНЫЙ ИТОГ СТОИТ ВТОРЫМ, СРАЗУ ПОД ДЕНЬГАМИ. Прибыль в тайкуне —
  * это ПОТОК, а не остаток на счету, и растущие деньги при убыточной сети —
@@ -42,19 +57,12 @@ import { useMemo, useState } from 'react'
 import type { CSSProperties, JSX } from 'react'
 
 import { useGameStore } from '../app/store'
-import { BANKRUPTCY_GRACE_DAYS, ZIL_PRICE } from '../data/operating'
+import { BANKRUPTCY_GRACE_DAYS } from '../data/operating'
 import { palette } from '../render/palette'
 import { buildGraph } from '../sim/world/graph'
-import type {
-  City,
-  CityId,
-  Edge,
-  EdgeId,
-  Line,
-  LineId,
-  Vehicle,
-  VehicleId,
-} from '../sim/types'
+import type { Driver, DriverId, Line, LineId } from '../sim/types'
+import { fleetRows, fleetSummary } from './fleetReadout'
+import { useFleetPanel } from './fleetSelection'
 import {
   emptyShare,
   fleetByLine,
@@ -98,12 +106,6 @@ const EMPTY_SHARE_BAD = 0.4
  */
 const INTEGER = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 0 })
 
-/** Тонны — всегда с одним знаком: «6,0 т» и «0,4 т» одной ширины. */
-function formatTons(tons: number): string {
-  if (!Number.isFinite(tons)) return '—'
-  return tons.toFixed(1).replace('.', ',')
-}
-
 /** Целые рубли и километры. Копейки в панели — шум: решения принимают не по ним. */
 function formatInteger(value: number): string {
   if (!Number.isFinite(value)) return '—'
@@ -141,115 +143,15 @@ function plural(count: number, forms: readonly [string, string, string]): string
 const VEHICLE_FORMS = ['машина', 'машины', 'машин'] as const
 const LINE_FORMS = ['линия', 'линии', 'линий'] as const
 const DAY_FORMS = ['сутки', 'суток', 'суток'] as const
+/* Сказуемые склоняются вместе с числом: «1 машина не возит», «2 машины не возят». */
+const CARRY_FORMS = ['не возит', 'не возят', 'не возят'] as const
+const NEED_FORMS = ['требует', 'требуют', 'требуют'] as const
 
-// ─── Разбор состояния в строки списка ──────────────────────────────────────
-
-/**
- * Одна строка парка — уже готовая к отрисовке.
- *
- * Состояние разбирается в текст отдельно от разметки: так видно, что панель
- * умеет показать, и так же легко проверить каждый случай (машина в узле, машина
- * на ребре, битая ссылка на город) без монтирования компонента.
- */
-type FleetRow = {
-  id: VehicleId
-  /** Что везёт. null — идёт порожней. */
-  cargo: { label: string; tons: string } | null
-  /** Где сейчас: «Москва → Тула» на ребре, «Тула» в узле. */
-  leg: string
-  /** Доля пройденного пути по текущему ребру. null — машина стоит в узле. */
-  progress: string | null
-  /** Конечный город маршрута. null — маршрута нет или он и так виден в leg. */
-  destination: string | null
-  /** Стоит в узле без задания — то есть не зарабатывает вообще ничего. */
-  idle: boolean
-}
-
-/**
- * Название города по идентификатору.
- *
- * Битая ссылка отдаёт сам идентификатор, а не «???»: если в состоянии окажется
- * город, которого нет в мире, в панели должно быть видно ИМЕННО ЭТО — строка
- * «moscow-2» сразу называет виновника, а прочерк отправляет искать вслепую.
- */
-function cityName(id: CityId, cities: Record<CityId, City>): string {
-  return cities[id]?.name ?? id
-}
-
-function buildRow(
-  vehicle: Vehicle,
-  cities: Record<CityId, City>,
-  edges: Record<EdgeId, Edge>,
-): FleetRow {
-  const cargo =
-    vehicle.cargo === null
-      ? null
-      : {
-          label: vehicle.cargo.type,
-          tons: formatTons(vehicle.cargo.tons),
-        }
-
-  const route = vehicle.route
-  const finalStop = route.length > 0 ? route[route.length - 1] : null
-
-  if (vehicle.position.kind === 'узел') {
-    const here = vehicle.position.nodeId
-    return {
-      id: vehicle.id,
-      cargo,
-      leg: cityName(here, cities),
-      progress: null,
-      // Конечная совпала с местом стоянки — маршрут доеден, показывать нечего.
-      destination:
-        finalStop !== null && finalStop !== here
-          ? cityName(finalStop, cities)
-          : null,
-      idle: route.length === 0,
-    }
-  }
-
-  const edge: Edge | undefined = edges[vehicle.position.edgeId]
-  const fromId = vehicle.position.fromId
-
-  // Ребро исчезло из мира или машина стоит не на своём ребре — то же правило,
-  // что и в рендере (VehicleMesh): врать наугад хуже, чем честно показать, что
-  // положение не разобрано.
-  if (edge === undefined || (fromId !== edge.from && fromId !== edge.to)) {
-    return {
-      id: vehicle.id,
-      cargo,
-      leg: 'в пути',
-      progress: null,
-      destination: finalStop !== null ? cityName(finalStop, cities) : null,
-      idle: false,
-    }
-  }
-
-  const toId = fromId === edge.from ? edge.to : edge.from
-  const raw = vehicle.position.progress
-  const clamped = !Number.isFinite(raw) ? 0 : raw < 0 ? 0 : raw > 1 ? 1 : raw
-
-  return {
-    id: vehicle.id,
-    cargo,
-    leg: `${cityName(fromId, cities)} → ${cityName(toId, cities)}`,
-    /*
-     * Процент берётся из состояния как есть, без интерполяции по кадрам, в
-     * отличие от положения машины на карте. Причина в разнице носителей: скачок
-     * метки на экране глаз ловит как рывок, а скачок числа с 40% на 46% — это
-     * просто новое показание прибора. Заводить ради него вторую копию логики
-     * интерполяции (и вторую возможность разойтись с рендером) незачем.
-     */
-    progress: `${Math.round(clamped * 100)}%`,
-    // Ближайший конец плеча уже написан в leg — повторять его справа стрелкой
-    // значит занять место ничем.
-    destination:
-      finalStop !== null && finalStop !== toId
-        ? cityName(finalStop, cities)
-        : null,
-    idle: false,
-  }
-}
+// ─── Разбор состояния ──────────────────────────────────────────────────────
+//
+// Разбор парка в строки переехал в ui/fleetReadout.ts вместе с самим списком
+// машин: панель компании берёт оттуда только сводку (fleetSummary), а панель
+// парка — те же строки целиком. Двух разборов одного парка быть не должно.
 
 /**
  * Цвет числа по зоне.
@@ -436,18 +338,6 @@ const alarmStyle: CSSProperties = {
   color: palette.accent,
 }
 
-const listStyle: CSSProperties = {
-  display: 'flex',
-  flexDirection: 'column',
-  /*
-   * Список ограничен по высоте и прокручивается. Парк в конце партии — это
-   * десятки машин, и без потолка панель уехала бы за нижний край экрана,
-   * утащив за собой самое важное: деньги и метрику, которые стоят сверху.
-   */
-  maxHeight: 220,
-  overflowY: 'auto',
-}
-
 /** Список линий короче списка машин: линий у игрока единицы, машин — десятки. */
 const lineListStyle: CSSProperties = {
   display: 'flex',
@@ -492,15 +382,17 @@ function lineRowStyle(selected: boolean, hovered: boolean): CSSProperties {
 }
 
 /**
- * Кнопка покупки.
+ * Кнопка, открывающая панель парка.
  *
- * Цена написана НА КНОПКЕ, а не спрятана в подсказку: решение «покупать ли
- * вторую машину» — главное решение первого часа игры, и принимать его вслепую
- * игрок не должен. Недоступная кнопка не исчезает и не блокируется намертво: она
- * гаснет до textDim и продолжает показывать цену, потому что цель, которой не
- * видно, копить невозможно.
+ * Полная ширина и своя строка — потому что это единственная дверь к четырём
+ * решениям среза (покупка, прицеп, водитель, списание), и искать её в списке
+ * игрок не должен. Справа на ней стоит СОСТОЯНИЕ парка, а не только его размер:
+ * кнопка «парк · 1 стоит» сообщает беду, не открывая ничего.
+ *
+ * Акцент кнопка берёт ровно тогда, когда в парке есть остановленные деньги.
+ * Гореть постоянно она не должна — это обычная дверь, а не тревога.
  */
-function buyButtonStyle(enabled: boolean, hovered: boolean): CSSProperties {
+function fleetButtonStyle(alarm: boolean, hovered: boolean): CSSProperties {
   return {
     width: '100%',
     height: 26,
@@ -512,24 +404,16 @@ function buyButtonStyle(enabled: boolean, hovered: boolean): CSSProperties {
     boxSizing: 'border-box',
 
     background: 'transparent',
-    border: `1px solid ${enabled && hovered ? palette.accent : palette.panelBorder}`,
+    border: `1px solid ${
+      alarm ? palette.accent : hovered ? palette.text : palette.panelBorder
+    }`,
     borderRadius: 4,
-    color: enabled
-      ? hovered
-        ? palette.accent
-        : palette.text
-      : palette.textDim,
+    color: alarm ? palette.accent : hovered ? palette.text : palette.textDim,
 
     font: `11px/1 ${MONO}`,
-    cursor: enabled ? 'pointer' : 'default',
+    cursor: 'pointer',
     transition: 'color 120ms, border-color 120ms',
   }
-}
-
-const rowStyle: CSSProperties = {
-  padding: '6px 0',
-  borderTop: `1px solid ${palette.panelBorder}`,
-  lineHeight: 1.25,
 }
 
 const rowTopStyle: CSSProperties = {
@@ -547,33 +431,6 @@ const rowBottomStyle: CSSProperties = {
   color: palette.textDim,
 }
 
-const vehicleIdStyle: CSSProperties = {
-  fontFamily: MONO,
-  fontSize: 10,
-  color: palette.textDim,
-}
-
-/**
- * Метка груза — тот же язык, что и на карте.
- *
- * Гружёный прицеп в сцене тёплый, порожний холодный (см. VehicleMesh). Квадрат
- * в списке повторяет ровно это правило, поэтому строку панели и метку на карте
- * не нужно связывать в уме: заливка есть — груз есть.
- */
-function markerStyle(loaded: boolean): CSSProperties {
-  return {
-    width: 6,
-    height: 6,
-    borderRadius: 1,
-    flex: '0 0 auto',
-    // Смещение к базовой линии текста: квадрат должен стоять на строке, а не
-    // висеть по её верхнему краю.
-    transform: 'translateY(-1px)',
-    background: loaded ? palette.accentDim : 'transparent',
-    border: `1px solid ${loaded ? palette.accentDim : palette.textDim}`,
-  }
-}
-
 // ─── Компонент ─────────────────────────────────────────────────────────────
 
 /**
@@ -584,6 +441,7 @@ function markerStyle(loaded: boolean): CSSProperties {
  * панель на каждом тике — вместе с поиском путей по всем линиям.
  */
 const NO_LINES: Record<LineId, Line> = {}
+const NO_DRIVERS: Record<DriverId, Driver> = {}
 
 /** Подсказка к строке линии — вся арифметика потолка в одном месте. */
 function planTitle(name: string, plan: LinePlan): string {
@@ -643,11 +501,18 @@ export function CompanyPanel(): JSX.Element {
   const lines = useGameStore(
     (store) => store.state.companies[store.state.playerId]?.lines ?? NO_LINES,
   )
-  const buyVehicle = useGameStore((store) => store.buyVehicle)
 
   const vehicles = useGameStore((store) => store.state.vehicles)
   const cities = useGameStore((store) => store.state.world.cities)
   const edges = useGameStore((store) => store.state.world.edges)
+  /*
+   * Штат нужен панели ради одной строки: сводка парка называет машины БЕЗ
+   * ВОДИТЕЛЯ, а имя человека за рулём лежит у него, не у машины. Подписка
+   * стабильна по ссылке между тиками, пока никто не устал и не подрос в навыке.
+   */
+  const drivers = useGameStore(
+    (store) => store.state.companies[store.state.playerId]?.drivers ?? NO_DRIVERS,
+  )
 
   /*
    * Выбранная линия живёт в отдельном store (ui/lineSelection.ts): это «на что
@@ -659,7 +524,22 @@ export function CompanyPanel(): JSX.Element {
   const selectLine = useLineSelection((store) => store.selectLine)
 
   const [hoveredLine, setHoveredLine] = useState<LineId | null>(null)
-  const [hoveredBuy, setHoveredBuy] = useState(false)
+  const [hoveredFleet, setHoveredFleet] = useState(false)
+
+  /*
+   * Парк ОТКРЫВАЕТСЯ ОТСЮДА, НО НЕ РИСУЕТСЯ ЗДЕСЬ. Сама панель смонтирована в
+   * App.tsx и сворачивается в собственную кнопку; общий у них один флаг в
+   * ui/fleetSelection.ts. Нарисуй панель компании парк у себя — и в игре
+   * оказались бы две панели, каждая со своим мнением о том, открыта ли она;
+   * выглядят они одинаково, так что игрок узнал бы об этом, закрыв одну и
+   * увидев под ней вторую.
+   *
+   * Кнопка ниже поэтому ПЕРЕКЛЮЧАТЕЛЬ, а не «открыть»: панель закрывает собой
+   * середину экрана, эта кнопка остаётся видна в левом нижнем углу, и нажатие
+   * на неё при открытом парке обязано что-то значить.
+   */
+  const fleetOpen = useFleetPanel((store) => store.open)
+  const toggleFleet = useFleetPanel((store) => store.togglePanel)
 
   /*
    * Парк игрока, а не все машины мира. Конкурент в срезе 5 будет владеть своими
@@ -671,9 +551,15 @@ export function CompanyPanel(): JSX.Element {
     [vehicles, playerId],
   )
 
-  const rows = useMemo(
-    () => fleet.map((vehicle) => buildRow(vehicle, cities, edges)),
-    [fleet, cities, edges],
+  /*
+   * Сводка парка. Строки собирает тот же модуль, что и панель парка, а не своя
+   * копия разбора: панель компании из них берёт только счётчики бед, но брать
+   * их обязана из одного места с той панелью, которую откроет игрок. Две
+   * сводки по одному парку однажды разошлись бы, и доверия не было бы ни одной.
+   */
+  const fleetState = useMemo(
+    () => fleetSummary(fleetRows(fleet, { cities, edges, lines, drivers })),
+    [fleet, cities, edges, lines, drivers],
   )
 
   /*
@@ -749,7 +635,14 @@ export function CompanyPanel(): JSX.Element {
       ? `в минусе: банкротство через ${graceLeft} ${plural(graceLeft, DAY_FORMS)}`
       : null
 
-  const canBuy = !bankrupt && money >= ZIL_PRICE
+  /*
+   * Остановленные деньги: машины, которые физически не могут работать. Сломанная
+   * стоит до ремонта, машина без водителя не тронется с места — и обе получают
+   * зарплату (водитель в резерве оплачивается полностью, см. payrollPerTick).
+   * Сумма двух счётчиков, а не число «больных» машин: без прицепа и с
+   * просроченным ТО техника всё-таки ездит.
+   */
+  const stalled = fleetState.broken + fleetState.driverless
 
   return (
     <div style={panelStyle}>
@@ -1003,101 +896,71 @@ export function CompanyPanel(): JSX.Element {
         <div style={{ ...shareRowStyle, marginBottom: 2 }}>
           <span style={captionStyle}>парк</span>
           <span style={{ ...unitStyle, fontFamily: MONO }}>
-            {rows.length} {plural(rows.length, VEHICLE_FORMS)}
+            {fleetState.count} {plural(fleetState.count, VEHICLE_FORMS)}
           </span>
         </div>
 
         {/*
-          Кнопка стоит НАД списком, а не под ним: список прокручивается и в конце
-          партии длиннее экрана, и кнопка, привязанная к его низу, уехала бы из
-          виду ровно тогда, когда парк пора расширять.
+          ОДНА СТРОКА ВМЕСТО СПИСКА, и она про деньги, а не про машины. «Две
+          машины стоят» — это зарплата, которая идёт, и выручка, которой нет;
+          понять это можно, не открывая ничего. Всё остальное про парк —
+          износ, прицепы, водители, покупка — живёт в панели парка, потому что
+          требует места и внимания, которых у приборной доски нет.
         */}
-        <button
-          type="button"
-          onClick={buyVehicle}
-          disabled={!canBuy}
-          onMouseEnter={() => setHoveredBuy(true)}
-          onMouseLeave={() => setHoveredBuy(false)}
-          style={buyButtonStyle(canBuy, hoveredBuy)}
-          title={
-            bankrupt
-              ? 'Компания разорена: покупать нечего и не на что'
-              : canBuy
-                ? `Купить ЗИЛ за ${formatInteger(ZIL_PRICE)} руб`
-                : `Не хватает ${formatInteger(ZIL_PRICE - money)} руб. Покупка в кредит появится позже`
-          }
-        >
-          <span>купить ЗИЛ</span>
-          <span>{formatInteger(ZIL_PRICE)} руб</span>
-        </button>
-
-        {rows.length === 0 ? (
+        {fleetState.count === 0 ? (
           <div style={{ ...unitStyle, paddingTop: 6 }}>машин нет</div>
         ) : (
-          <div style={listStyle}>
-            {rows.map((row) => (
-              <div key={row.id} style={rowStyle}>
-                <div style={rowTopStyle}>
-                  <span style={vehicleIdStyle}>{row.id}</span>
-                  <span style={markerStyle(row.cargo !== null)} />
-                  <span
-                    style={{
-                      fontSize: 12,
-                      color: row.cargo === null ? palette.textDim : palette.text,
-                      // Длинное название груза не должно выдавливать тоннаж за
-                      // край панели.
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                    }}
-                  >
-                    {row.cargo === null ? 'порожняя' : row.cargo.label}
-                  </span>
-                  {row.cargo !== null && (
-                    <span
-                      style={{
-                        marginLeft: 'auto',
-                        fontFamily: MONO,
-                        fontSize: 12,
-                        color: palette.text,
-                      }}
-                    >
-                      {row.cargo.tons} т
-                    </span>
-                  )}
-                </div>
-
-                <div style={rowBottomStyle}>
-                  <span
-                    style={{
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                    }}
-                  >
-                    {row.leg}
-                    {row.progress !== null && (
-                      <span style={{ fontFamily: MONO }}> · {row.progress}</span>
-                    )}
-                  </span>
-                  {/*
-                    Справа — намерение машины: куда она в итоге едет. «Без
-                    задания» стоит на том же месте не случайно: стоящая машина
-                    не зарабатывает ничего, и это ровно тот же по важности факт,
-                    что и её конечная точка.
-                  */}
-                  <span style={{ flex: '0 0 auto' }}>
-                    {row.idle
-                      ? 'без задания'
-                      : row.destination !== null
-                        ? `→ ${row.destination}`
-                        : ''}
-                  </span>
-                </div>
-              </div>
-            ))}
+          <div
+            style={{
+              ...shareRowStyle,
+              paddingTop: 6,
+              fontSize: 11,
+              color: stalled > 0 ? palette.accent : palette.textDim,
+            }}
+          >
+            <span>
+              {stalled > 0
+                ? `${stalled} ${plural(stalled, VEHICLE_FORMS)} ${plural(
+                    stalled,
+                    CARRY_FORMS,
+                  )}`
+                : 'все машины при деле'}
+            </span>
+            {/*
+              Просроченное ТО — не остановленные деньги, а растущий счёт, и
+              потому стоит справа приглушённым: это напоминание, а не тревога.
+            */}
+            {fleetState.serviceDue > 0 && (
+              <span style={{ ...unitStyle, color: palette.accentDim }}>
+                {fleetState.serviceDue} на ТО
+              </span>
+            )}
           </div>
         )}
+
+        <button
+          type="button"
+          onClick={toggleFleet}
+          onMouseEnter={() => setHoveredFleet(true)}
+          onMouseLeave={() => setHoveredFleet(false)}
+          style={fleetButtonStyle(stalled > 0, hoveredFleet)}
+          aria-expanded={fleetOpen}
+          title={
+            stalled > 0
+              ? 'Открыть парк: есть машины, которые стоят и не зарабатывают'
+              : 'Открыть парк: покупка машин и прицепов, водители, ТО и ремонт'
+          }
+        >
+          <span>{fleetOpen ? 'закрыть парк' : 'открыть парк'}</span>
+          <span>
+            {fleetState.troubled > 0
+              ? `${fleetState.troubled} ${plural(
+                  fleetState.troubled,
+                  NEED_FORMS,
+                )} внимания`
+              : `${fleetState.count} ${plural(fleetState.count, VEHICLE_FORMS)}`}
+          </span>
+        </button>
       </div>
     </div>
   )

@@ -1,8 +1,23 @@
 import { beforeEach, describe, expect, it } from 'vitest'
-import { ZIL_PRICE } from '../data/operating'
-import { createInitialState, HOME_CITY, STARTER_VEHICLE_ID } from '../sim/state'
+import { TRAILER_PRICE, VEHICLE_CLASS_BY_ID } from '../data/vehicles'
+import {
+  createInitialState,
+  HOME_CITY,
+  STARTER_CLASS,
+  STARTER_CLASS_ID,
+  STARTER_DRIVER_ID,
+  STARTER_TRAILER,
+  STARTER_VEHICLE_ID,
+} from '../sim/state'
 import { cityId } from '../sim/types'
-import type { CityId, GameState, Stop, VehicleId } from '../sim/types'
+import type {
+  CityId,
+  DriverId,
+  GameState,
+  Stop,
+  Vehicle,
+  VehicleId,
+} from '../sim/types'
 import { useGameStore, WORLD_SEED } from './store'
 
 /**
@@ -35,6 +50,35 @@ const store = () => useGameStore.getState()
 const game = (): GameState => store().state
 const player = () => game().companies[game().playerId]
 const truck = (id: VehicleId = STARTER_VEHICLE_ID) => game().vehicles[id]
+const drivers = () => player().drivers
+
+/** Цена стартового класса — та, что и списывается при его покупке. */
+const ZIL_PRICE = STARTER_CLASS.price
+
+/** Идентификатор единственной купленной машины. */
+function boughtId(): VehicleId {
+  const ids = (Object.keys(game().vehicles) as VehicleId[]).filter(
+    (id) => id !== STARTER_VEHICLE_ID,
+  )
+  expect(ids).toHaveLength(1)
+  return ids[0]
+}
+
+/** Выдать компании игрока ровно столько денег, сколько нужно тесту. */
+function setPlayerMoney(money: number): void {
+  useGameStore.setState((current) => ({
+    state: {
+      ...current.state,
+      companies: {
+        ...current.state.companies,
+        [current.state.playerId]: {
+          ...current.state.companies[current.state.playerId],
+          money,
+        },
+      },
+    },
+  }))
+}
 
 function stop(nodeId: CityId, unload: Stop['unload'], load: Stop['load']): Stop {
   return { nodeId, unload, load }
@@ -227,11 +271,14 @@ describe('buyVehicle', () => {
 
   it('на старте денег не хватает и ничего не происходит', () => {
     // Смысл стартового капитала (см. START_MONEY в sim/state.ts): первое
-    // решение в игре принимает игрок, а не баланс.
-    expect(player().money).toBeLessThan(ZIL_PRICE)
+    // решение в игре принимает игрок, а не баланс. Мерой стала цена РАБОТАЮЩЕЙ
+    // машины — тягач плюс прицеп, — потому что голый тягач груза не берёт.
+    const working = ZIL_PRICE + Math.min(...Object.values(TRAILER_PRICE))
+    expect(player().money).toBeLessThan(working)
 
+    // Денег не хватает даже на голый тягач самого дорогого класса.
     const before = game()
-    store().buyVehicle()
+    store().buyVehicle('tractor')
 
     expect(game()).toBe(before)
     expect(Object.keys(game().vehicles)).toHaveLength(1)
@@ -240,14 +287,11 @@ describe('buyVehicle', () => {
   it('списывает цену и ставит новую машину в домашнем городе', () => {
     setMoney(ZIL_PRICE * 2)
 
-    store().buyVehicle()
+    store().buyVehicle(STARTER_CLASS_ID)
 
     expect(player().money).toBe(ZIL_PRICE)
 
-    const ids = Object.keys(game().vehicles) as VehicleId[]
-    expect(ids).toHaveLength(2)
-
-    const bought = game().vehicles[ids.find((id) => id !== STARTER_VEHICLE_ID)!]
+    const bought = game().vehicles[boughtId()]
     expect(bought.position).toEqual({ kind: 'узел', nodeId: HOME_CITY })
     expect(bought.ownerId).toBe(game().playerId)
     expect(bought.lineId).toBeNull()
@@ -256,36 +300,280 @@ describe('buyVehicle', () => {
     // Купленная машина обязана быть той же, что стартовая: разойдись сборка —
     // и второй ЗИЛ поехал бы, например, с нулевым расходом топлива, то есть
     // даром. Такой дефект ничего не роняет, он просто ломает баланс.
+    expect(bought.classId).toBe(truck().classId)
     expect(bought.fuelPer100Km).toBe(truck().fuelPer100Km)
     expect(bought.capacity).toBe(truck().capacity)
     expect(bought.cruiseKmh).toBe(truck().cruiseKmh)
   })
 
+  it('приезжает ГОЛЫЙ тягач: без прицепа и без водителя', () => {
+    setMoney(ZIL_PRICE * 2)
+    store().buyVehicle(STARTER_CLASS_ID)
+
+    const bought = game().vehicles[boughtId()]
+    // Машина в этой игре собирается из трёх решений, покупка — только первое.
+    // Купивший один тягач видит, что тот не берёт груз и не трогается с места.
+    expect(bought.trailer).toBeNull()
+    expect(bought.driverId).toBeNull()
+    expect(bought.wear).toBe(0)
+    expect(bought.brokenDown).toBe(false)
+  })
+
   it('ровно на цену — покупка проходит и оставляет ноль', () => {
     setMoney(ZIL_PRICE)
-    store().buyVehicle()
+    store().buyVehicle(STARTER_CLASS_ID)
     expect(player().money).toBe(0)
     expect(Object.keys(game().vehicles)).toHaveLength(2)
   })
 
   it('рубля не хватает — покупки нет', () => {
     setMoney(ZIL_PRICE - 1)
-    store().buyVehicle()
+    store().buyVehicle(STARTER_CLASS_ID)
     // Покупка в кредит — механика более позднего среза, а не «ну ладно, уйдём
     // в минус».
     expect(player().money).toBe(ZIL_PRICE - 1)
     expect(Object.keys(game().vehicles)).toHaveLength(1)
   })
 
+  it('цена берётся у класса, а не общая на весь парк', () => {
+    const heavy = VEHICLE_CLASS_BY_ID['kamaz-5320']
+    setMoney(heavy.price)
+
+    // Дешёвого класса хватило бы, дорогого — впритык. Общая цена сделала бы
+    // выбор класса бессмысленным: брали бы всегда самый большой.
+    store().buyVehicle(heavy.id)
+    expect(player().money).toBe(0)
+    expect(game().vehicles[boughtId()].classId).toBe(heavy.id)
+    expect(heavy.price).not.toBe(ZIL_PRICE)
+  })
+
+  it('технику из будущего не продают', () => {
+    const future = VEHICLE_CLASS_BY_ID['tractor']
+    setMoney(future.price * 2)
+
+    // Партия начинается в 1994-м, магистральный тягач появляется в 2000-м.
+    // Без этой проверки эпоха в справочнике была бы украшением.
+    expect(future.availableFrom).toBeGreaterThan(1994)
+    const before = game()
+    store().buyVehicle(future.id)
+    expect(game()).toBe(before)
+  })
+
+  it('неизвестный класс ничего не делает и не роняет стор', () => {
+    setMoney(ZIL_PRICE * 5)
+    const before = game()
+    store().buyVehicle('нет-такого')
+    expect(game()).toBe(before)
+  })
+
   it('каждая следующая машина получает свой идентификатор', () => {
     setMoney(ZIL_PRICE * 5)
-    store().buyVehicle()
-    store().buyVehicle()
-    store().buyVehicle()
+    store().buyVehicle(STARTER_CLASS_ID)
+    store().buyVehicle(STARTER_CLASS_ID)
+    store().buyVehicle(STARTER_CLASS_ID)
 
     const ids = Object.keys(game().vehicles)
     expect(new Set(ids).size).toBe(ids.length)
     expect(ids).toHaveLength(4)
+  })
+})
+
+// ─── Прицепы ───────────────────────────────────────────────────────────────
+
+describe('buyTrailer', () => {
+  /** Второй прицеп, подходящий стартовому классу, — цель смены специализации. */
+  const OTHER = STARTER_CLASS.trailers.find((t) => t !== STARTER_TRAILER)!
+
+  it('списывает цену прицепа и меняет специализацию машины', () => {
+    const before = player().money
+    store().buyTrailer(STARTER_VEHICLE_ID, OTHER)
+
+    expect(truck().trailer).toBe(OTHER)
+    expect(player().money).toBe(before - TRAILER_PRICE[OTHER])
+  })
+
+  it('стартового капитала хватает на смену специализации', () => {
+    // Ради этого запаса капитал и пересматривался в срезе 4: первое решение
+    // партии не должно быть необратимым.
+    expect(player().money).toBeGreaterThanOrEqual(TRAILER_PRICE[OTHER])
+  })
+
+  it('тот же прицеп второй раз не покупается', () => {
+    const before = game()
+    store().buyTrailer(STARTER_VEHICLE_ID, STARTER_TRAILER)
+    // Двойное нажатие кнопки не должно стоить вторых денег.
+    expect(game()).toBe(before)
+  })
+
+  it('несовместимый с классом прицеп не ставится', () => {
+    const before = game()
+    // Полуприцеп-цистерну к бортовому ЗИЛу не прицепить, сколько бы ни платил.
+    expect(STARTER_CLASS.trailers).not.toContain('реф')
+    store().buyTrailer(STARTER_VEHICLE_ID, 'реф')
+    expect(game()).toBe(before)
+  })
+
+  it('без денег прицепа нет', () => {
+    setPlayerMoney(TRAILER_PRICE[OTHER] - 1)
+    store().buyTrailer(STARTER_VEHICLE_ID, OTHER)
+
+    expect(truck().trailer).toBe(STARTER_TRAILER)
+    expect(player().money).toBe(TRAILER_PRICE[OTHER] - 1)
+  })
+
+  it('несуществующую машину не переоборудовать', () => {
+    const before = game()
+    store().buyTrailer('нет-такой' as VehicleId, OTHER)
+    expect(game()).toBe(before)
+  })
+})
+
+// ─── Водители ──────────────────────────────────────────────────────────────
+
+describe('hireDriver и fireDriver', () => {
+  it('нанятый приходит в резерв, а не сразу за руль', () => {
+    store().hireDriver()
+
+    const roster = Object.values(drivers())
+    expect(roster).toHaveLength(2)
+
+    const hired = roster.find((d) => d.id !== STARTER_DRIVER_ID)!
+    // Назначение на машину — отдельное решение игрока, ровно как назначение
+    // машины на линию при покупке.
+    expect(hired.vehicleId).toBeNull()
+    expect(hired.employerId).toBe(game().playerId)
+    expect(hired.wagePerDay).toBeGreaterThan(0)
+    // И он не выгнал с места того, кто уже сидит за рулём.
+    expect(truck().driverId).toBe(STARTER_DRIVER_ID)
+  })
+
+  it('увольнение освобождает машину, а не удаляет её', () => {
+    store().fireDriver(STARTER_DRIVER_ID)
+
+    expect(drivers()[STARTER_DRIVER_ID]).toBeUndefined()
+    // Машина осталась в парке и встала без водителя: настоящая цена
+    // увольнения не в пособии, а в остановленном кольце.
+    expect(truck()).toBeDefined()
+    expect(truck().driverId).toBeNull()
+  })
+
+  it('уволить несуществующего — ничего не происходит', () => {
+    const before = game()
+    store().fireDriver('нет-такого' as DriverId)
+    expect(game()).toBe(before)
+  })
+})
+
+describe('assignDriver', () => {
+  function hire(): DriverId {
+    store().hireDriver()
+    const hired = Object.values(drivers()).find(
+      (d) => d.id !== STARTER_DRIVER_ID,
+    )!
+    return hired.id
+  }
+
+  function buy(): VehicleId {
+    setPlayerMoney(STARTER_CLASS.price * 3)
+    store().buyVehicle(STARTER_CLASS_ID)
+    return boughtId()
+  }
+
+  it('связь двусторонняя: машина помнит водителя, водитель — машину', () => {
+    const hired = hire()
+    const second = buy()
+
+    store().assignDriver(hired, second)
+
+    expect(game().vehicles[second].driverId).toBe(hired)
+    expect(drivers()[hired].vehicleId).toBe(second)
+  })
+
+  it('в резерв: обе стороны связи снимаются', () => {
+    store().assignDriver(STARTER_DRIVER_ID, null)
+
+    expect(truck().driverId).toBeNull()
+    expect(drivers()[STARTER_DRIVER_ID].vehicleId).toBeNull()
+  })
+
+  it('пересадка освобождает и прежнюю машину, и прежнего водителя', () => {
+    const hired = hire()
+    const second = buy()
+
+    // Новичок садится за вторую машину, потом переходит на первую, где уже
+    // сидит стартовый водитель.
+    store().assignDriver(hired, second)
+    store().assignDriver(hired, STARTER_VEHICLE_ID)
+
+    // Прежняя машина новичка освободилась.
+    expect(game().vehicles[second].driverId).toBeNull()
+    // Согнанный водитель ушёл в резерв, а не остался «за той же машиной».
+    expect(drivers()[STARTER_DRIVER_ID].vehicleId).toBeNull()
+    // И за рулём ровно один человек.
+    expect(truck().driverId).toBe(hired)
+    expect(drivers()[hired].vehicleId).toBe(STARTER_VEHICLE_ID)
+  })
+
+  it('несуществующих водителя и машину не назначить', () => {
+    const before = game()
+    store().assignDriver('нет-такого' as DriverId, STARTER_VEHICLE_ID)
+    expect(game()).toBe(before)
+
+    store().assignDriver(STARTER_DRIVER_ID, 'нет-такой' as VehicleId)
+    expect(game()).toBe(before)
+  })
+})
+
+// ─── Обслуживание и ремонт ─────────────────────────────────────────────────
+
+describe('serviceVehicle и repairVehicle', () => {
+  function patchTruck(patch: Partial<Vehicle>): void {
+    useGameStore.setState((current) => ({
+      state: {
+        ...current.state,
+        vehicles: {
+          ...current.state.vehicles,
+          [STARTER_VEHICLE_ID]: {
+            ...current.state.vehicles[STARTER_VEHICLE_ID],
+            ...patch,
+          },
+        },
+      },
+    }))
+  }
+
+  it('ТО обнуляет счётчик пробега за деньги', () => {
+    patchTruck({ kmSinceService: 12_000 })
+    const before = player().money
+
+    store().serviceVehicle(STARTER_VEHICLE_ID)
+
+    expect(truck().kmSinceService).toBe(0)
+    expect(player().money).toBeLessThan(before)
+    // Ресурс при этом не возвращается: ТО — регламент, а не капремонт.
+    expect(truck().wear).toBe(0)
+  })
+
+  it('ТО на нулевом счётчике бесплатно', () => {
+    const before = game()
+    store().serviceVehicle(STARTER_VEHICLE_ID)
+    expect(game()).toBe(before)
+  })
+
+  it('ремонт снимает поломку за деньги', () => {
+    patchTruck({ brokenDown: true })
+    const before = player().money
+
+    store().repairVehicle(STARTER_VEHICLE_ID)
+
+    expect(truck().brokenDown).toBe(false)
+    expect(player().money).toBeLessThan(before)
+  })
+
+  it('чинить исправную — не платная услуга', () => {
+    const before = game()
+    store().repairVehicle(STARTER_VEHICLE_ID)
+    expect(game()).toBe(before)
   })
 })
 

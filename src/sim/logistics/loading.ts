@@ -23,6 +23,20 @@
  *   среза 2, а нужный режим — разовыми рейсами игрок пробует плечо до того,
  *   как строить под него сеть, и перегоняет машину на новую линию.
  *
+ * КУЗОВ ОГРАНИЧИВАЕТ ОБА РЕЖИМА. Машина грузится только тем, что влезает в её
+ * прицеп (совместимость — logistics/trailer.ts), а тягач без прицепа не берёт
+ * ничего. Это не третий режим, а фильтр поверх обоих: сначала решается, ЧТО
+ * грузить — по инструкции остановки или автоматикой, — и только потом груз
+ * сверяется с кузовом. Порядок именно такой, потому что подмена на «тот груз,
+ * что подойдёт» стёрла бы разницу между специализированным парком и случайным:
+ * игрок, повесивший цистерну и оставивший в линии зерно, обязан увидеть
+ * порожний пробег, а не тихо поехать с зерном.
+ *
+ * ВЫГРУЗКА КУЗОВОМ НЕ ОГРАНИЧЕНА, и это не забывчивость. Груз уже в машине;
+ * запрет выгрузить его «неподходящим» кузовом означал бы, что партия заперта в
+ * прицепе навсегда — машина возила бы её кругами до списания по мёртвому
+ * грузу. Совместимость решает, что МОЖНО ВЗЯТЬ, и только это.
+ *
  * ВЫГРУЗКА СТРОГО РАНЬШЕ ПОГРУЗКИ в обоих режимах. Причина не в аккуратности, а
  * в конкретном дефекте: машина, привёзшая зерно на мукомольный, стоит в городе,
  * где на складе теперь лежит её же зерно. Погрузка, идущая первой, увидела бы
@@ -68,6 +82,7 @@ import type { RoadGraph } from '../world/graph'
 import { buildGraph } from '../world/graph'
 import { creditRevenue } from '../economy/operating'
 import { shortestKm } from '../world/pathfind'
+import { canCarry } from './trailer'
 import type {
   CargoType,
   City,
@@ -80,6 +95,7 @@ import type {
   Line,
   Stop,
   Tons,
+  TrailerType,
   Vehicle,
   VehicleId,
 } from '../types'
@@ -327,18 +343,26 @@ type Pickup = { industryId: IndustryId; cargo: CargoType; tons: Tons }
  *
  * `wanted === null` означает «что угодно, что готово к вывозу» — режим разовых
  * рейсов.
+ *
+ * СВЕРКА С КУЗОВОМ ЖИВЁТ ЗДЕСЬ, в единственной точке, через которую проходят
+ * оба режима. Разложи её по веткам вызывающего — и однажды линия начала бы
+ * возить в цистерне зерно, потому что проверку добавили только в автоматику.
+ * Тягач без прицепа отсекается тем же вызовом: canCarry(null, …) — всегда
+ * «нет», отдельного условия для этого не требуется.
  */
 function pickupFrom(
   industry: Industry,
   nodeId: CityId,
   capacity: Tons,
   wanted: CargoType | null,
+  trailer: TrailerType | null,
 ): Pickup | null {
   if (industry.cityId !== nodeId) return null
 
   const recipe = RECIPE_BY_INDUSTRY[industry.type]
   if (recipe === undefined) return null
   if (wanted !== null && recipe.output !== wanted) return null
+  if (!canCarry(trailer, recipe.output)) return null
 
   const available = industry.stock[recipe.output] ?? 0
   const tons = Math.min(capacity, available)
@@ -361,16 +385,24 @@ function pickupFrom(
  *
  * Кузов один и груз в нём один: набрать по паре тонн разного нельзя. Смешанные
  * партии — это уже сборный груз, у него своя экономика, и её пока нет.
+ *
+ * НЕПОДХОДЯЩИЙ ПОД КУЗОВ ГРУЗ ПРОСТО ПРОПУСКАЕТСЯ, как и отсутствующий в
+ * городе. Для списка остановки это значит, что машина с цистерной, которой
+ * велено «топливо, если нет — зерно», возьмёт топливо и никогда зерно: список
+ * остаётся приоритетом игрока, а кузов — физикой. Обе причины уйти порожней
+ * выглядят для игрока одинаково (пустой кузов в отчёте), и это правильно —
+ * различать их должен он сам, глядя на линию и на машину.
  */
 function findPickup(
   industries: Record<IndustryId, Industry>,
   nodeId: CityId,
   capacity: Tons,
   wanted: readonly CargoType[] | null,
+  trailer: TrailerType | null,
 ): Pickup | null {
   if (wanted === null) {
     for (const industry of Object.values(industries)) {
-      const pickup = pickupFrom(industry, nodeId, capacity, null)
+      const pickup = pickupFrom(industry, nodeId, capacity, null, trailer)
       if (pickup !== null) return pickup
     }
     return null
@@ -378,7 +410,7 @@ function findPickup(
 
   for (const cargo of wanted) {
     for (const industry of Object.values(industries)) {
-      const pickup = pickupFrom(industry, nodeId, capacity, cargo)
+      const pickup = pickupFrom(industry, nodeId, capacity, cargo, trailer)
       if (pickup !== null) return pickup
     }
   }
@@ -412,7 +444,8 @@ function stockWith(
  *      без линии, если в городе есть кому его принять), и получает деньги за
  *      тонны и километры от места погрузки.
  *   2. Пустая берёт то, что велено взять здесь (или, без линии, первое, что
- *      готово к вывозу).
+ *      готово к вывозу), — но только если это влезает в её кузов. Тягач без
+ *      прицепа не берёт ничего и уходит порожним.
  *
  * Взять обратно собственный груз машина при этом не может: грузится только
  * ГОТОВАЯ ПРОДУКЦИЯ предприятия, а привезённое сырьё продукцией не является ни
@@ -535,6 +568,7 @@ export function runArrivals(state: GameState): GameState {
           nodeId,
           capacity,
           stop === null ? null : stop.load,
+          vehicle.trailer,
         )
 
         if (pickup !== null) {

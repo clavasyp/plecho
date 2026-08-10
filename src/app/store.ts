@@ -14,20 +14,29 @@
  */
 
 import { create } from 'zustand'
-import { ZIL_PRICE } from '../data/operating'
+import { TRAILER_PRICE, VEHICLE_CLASS_BY_ID } from '../data/vehicles'
+import { hireDriver as simHireDriver } from '../sim/logistics/driver'
 import { setRoute } from '../sim/logistics/vehicle'
-import { createInitialState, createZil, HOME_CITY } from '../sim/state'
+import {
+  repairVehicle as simRepairVehicle,
+  serviceVehicle as simServiceVehicle,
+} from '../sim/logistics/wear'
+import { createInitialState, createVehicle, HOME_CITY } from '../sim/state'
 import { tick } from '../sim/tick'
+import { dateFromTick } from '../sim/time'
 import { lineId as toLineId, vehicleId as toVehicleId } from '../sim/types'
 import type {
   CityId,
   Company,
+  Driver,
+  DriverId,
   EdgeId,
   GameSpeed,
   GameState,
   Line,
   LineId,
   Stop,
+  TrailerType,
   Vehicle,
   VehicleId,
 } from '../sim/types'
@@ -86,8 +95,49 @@ export type GameStore = {
   /** Поставить машину на линию или снять с неё (lineId = null). */
   assignVehicle: (vehicleId: VehicleId, lineId: LineId | null) => void
 
-  /** Купить ЗИЛ в домашнем городе. Не хватает денег — ничего не происходит. */
-  buyVehicle: () => void
+  /**
+   * Купить машину указанного класса в домашнем городе.
+   *
+   * Приезжает ГОЛЫЙ ТЯГАЧ: без прицепа и без водителя. Это не экономия на
+   * реализации, а суть среза — машина в этой игре собирается из трёх решений, и
+   * покупка только первое из них. Купивший один тягач видит, что тот не может
+   * ни взять груз, ни тронуться с места, и узнаёт правило игры за один клик, а
+   * не из справки.
+   *
+   * Не хватает денег или класс ещё не выпускается — ничего не происходит.
+   */
+  buyVehicle: (classId: string) => void
+
+  /**
+   * Поставить машине прицеп. Старый списывается без возврата денег.
+   *
+   * Прицеп, который классу не подходит, не ставится: полуприцеп-цистерну на
+   * бортовой ЗИЛ не повесить, и подобрать «ближайший подходящий» за игрока
+   * нельзя — он выбирает специализацию машины, а не просит помочь.
+   */
+  buyTrailer: (vehicleId: VehicleId, trailer: TrailerType) => void
+
+  /** Посадить водителя за машину или отправить в резерв (vehicleId = null). */
+  assignDriver: (driverId: DriverId, vehicleId: VehicleId | null) => void
+
+  /** Нанять водителя. Он приходит в резерв, за руль его сажают отдельно. */
+  hireDriver: () => void
+
+  /** Уволить водителя. Его машина остаётся в парке и встаёт без водителя. */
+  fireDriver: (driverId: DriverId) => void
+
+  /** Провести плановое ТО за деньги: обнулить счётчик пробега до обслуживания. */
+  serviceVehicle: (vehicleId: VehicleId) => void
+
+  /**
+   * Отремонтировать сломанную машину за деньги.
+   *
+   * В контракте среза этого действия нет, и оно всё равно здесь: без него
+   * сломавшаяся машина стоит до конца партии, продолжая проедать зарплату
+   * водителя. Кнопка, которой нет, — это не «меньше интерфейса», а тупик, из
+   * которого игрок не выходит.
+   */
+  repairVehicle: (vehicleId: VehicleId) => void
 }
 
 const initialState = createInitialState(WORLD_SEED)
@@ -270,28 +320,204 @@ export const useGameStore = create<GameStore>((set, get) => ({
       )
     }),
 
-  buyVehicle: () =>
+  buyVehicle: (classId) =>
     set((store) => {
       const state = store.state
       const company = state.companies[state.playerId]
+
+      const vehicleClass = VEHICLE_CLASS_BY_ID[classId]
+      // Неизвестный класс — промах интерфейса, а не игровая ситуация. Молча,
+      // потому что ронять стор на кривом аргументе значит терять всю партию из-за
+      // одной кнопки.
+      if (vehicleClass === undefined) return store
+
+      // Техника из будущего не продаётся. Год берётся из тика, а не хранится:
+      // календарь в игре ровно один (sim/time.ts), и второй экземпляр даты
+      // разъехался бы с ним при первой же правке.
+      const year = dateFromTick(state.tick, state.startYear).year
+      if (year < vehicleClass.availableFrom) return store
 
       // Покупка в кредит — механика среза 6, а не «ну ладно, уйдём в минус».
       // Молчаливый отказ здесь правильнее исключения: кнопка в интерфейсе
       // недоступна ровно по этому же условию, и до сюда доходит только гонка
       // между кликом и уходящими на топливо деньгами.
-      if (company.money < ZIL_PRICE) return store
+      if (company.money < vehicleClass.price) return store
 
-      const id = nextVehicleId(state.vehicles)
-      const truck = createZil(id, company.id, HOME_CITY)
+      const id = nextVehicleId(state.vehicles, vehicleClass.id)
+      const truck = createVehicle(id, company.id, HOME_CITY, vehicleClass.id)
 
       return withPlayer(
         {
           ...store,
           state: { ...state, vehicles: { ...state.vehicles, [id]: truck } },
         },
-        (target) => ({ ...target, money: target.money - ZIL_PRICE }),
+        (target) => ({ ...target, money: target.money - vehicleClass.price }),
       )
     }),
+
+  buyTrailer: (vehicleId, trailer) =>
+    set((store) => {
+      const state = store.state
+      const vehicle = state.vehicles[vehicleId]
+      if (vehicle === undefined || vehicle.ownerId !== state.playerId) {
+        return store
+      }
+
+      // Тот же прицеп уже стоит — работы нет, и денег брать не за что. Двойное
+      // нажатие кнопки не должно стоить вторых одиннадцати тысяч.
+      if (vehicle.trailer === trailer) return store
+
+      const vehicleClass = VEHICLE_CLASS_BY_ID[vehicle.classId]
+      if (vehicleClass === undefined) return store
+      // Совместимость решает СПРАВОЧНИК ТЕХНИКИ, а не список грузов: прицеп
+      // цепляют к машине, а не к грузу, и бортовой ЗИЛ полуприцеп не потянет,
+      // что бы в него ни грузили.
+      if (!vehicleClass.trailers.includes(trailer)) return store
+
+      const price = TRAILER_PRICE[trailer]
+      if (price === undefined) return store
+
+      const company = state.companies[state.playerId]
+      if (company.money < price) return store
+
+      /*
+       * СТАРЫЙ ПРИЦЕП НЕ ПРОДАЁТСЯ И ДЕНЕГ НЕ ВОЗВРАЩАЕТ. Возврат хотя бы части
+       * цены выглядел бы щедрее, но обесценил бы само решение: смена
+       * специализации должна стоить, иначе выгодно менять кузов под каждый рейс
+       * и держать один тягач вместо специализированного парка. Именно на этот
+       * расход и заложен запас в стартовом капитале (RESPEC_RESERVE в
+       * sim/state.ts) — один раз передумать игра разрешает даром, привычку
+       * передумывать не поощряет.
+       */
+      return withPlayer(
+        {
+          ...store,
+          state: {
+            ...state,
+            vehicles: {
+              ...state.vehicles,
+              [vehicleId]: { ...vehicle, trailer },
+            },
+          },
+        },
+        (target) => ({ ...target, money: target.money - price }),
+      )
+    }),
+
+  assignDriver: (driverId, vehicleId) =>
+    set((store) => {
+      const state = store.state
+      const company = state.companies[state.playerId]
+
+      const driver = company.drivers?.[driverId]
+      if (driver === undefined) return store
+
+      let target: Vehicle | null = null
+      if (vehicleId !== null) {
+        const found = state.vehicles[vehicleId]
+        // Чужую машину своим человеком не укомплектовать: это не наём, а
+        // рассинхрон данных.
+        if (found === undefined || found.ownerId !== state.playerId) return store
+        target = found
+      }
+      if (driver.vehicleId === vehicleId) return store
+
+      /*
+       * Связь двусторонняя, как и у машины с линией: машина помнит, кто за
+       * рулём, водитель — за какой машиной закреплён. Фаза движения спрашивает
+       * первое, панель парка — второе, и обход всего штата ради второго ответа
+       * на каждый кадр того не стоит. Раз копий две, обновлять их обязано одно
+       * место, и это оно.
+       *
+       * Освобождать приходится ОБЕ стороны и обе прежние связи: машина, на
+       * которую садится водитель, могла быть занята другим человеком, а сам он
+       * мог сидеть за другой машиной. Пропусти любую из двух — и получишь
+       * водителя-призрака, которого панель показывает за рулём машины, где уже
+       * сидит второй.
+       */
+      const drivers: Record<DriverId, Driver> = { ...company.drivers }
+      const vehicles: Record<VehicleId, Vehicle> = { ...state.vehicles }
+
+      // Машина, с которой водитель уходит.
+      const previous = driver.vehicleId
+      if (previous !== null && vehicles[previous] !== undefined) {
+        vehicles[previous] = { ...vehicles[previous], driverId: null }
+      }
+
+      // Человек, который сидел за целевой машиной.
+      if (target !== null && target.driverId !== null) {
+        const displaced = drivers[target.driverId]
+        if (displaced !== undefined) {
+          drivers[displaced.id] = { ...displaced, vehicleId: null }
+        }
+      }
+
+      drivers[driverId] = { ...driver, vehicleId }
+      if (target !== null) {
+        vehicles[target.id] = { ...vehicles[target.id], driverId }
+      }
+
+      return withPlayer({ ...store, state: { ...state, vehicles } }, (owner) => ({
+        ...owner,
+        drivers,
+      }))
+    }),
+
+  hireDriver: () =>
+    set((store) => {
+      const state = store.state
+
+      /*
+       * СИД — НОМЕР ТИКА, и это требование самого найма (см. hireDriver в
+       * sim/logistics/driver.ts): кандидат выводится отдельным потоком ГПСЧ, а
+       * не общим rngState, чтобы лишний клик по кнопке не сдвигал всю
+       * дальнейшую историю партии — поломки, события, погоду. Постоянный сид
+       * означал бы, что при очередном номере найма компании всегда достаётся
+       * один и тот же человек; номер тика меняется сам собой и хранится в
+       * сохранении, поэтому партия воспроизводится вместе с наймами.
+       */
+      const next = simHireDriver(state, state.playerId, state.tick)
+      return next === state ? store : { ...store, state: next }
+    }),
+
+  fireDriver: (driverId) =>
+    set((store) => {
+      const state = store.state
+      const company = state.companies[state.playerId]
+
+      const driver = company.drivers?.[driverId]
+      if (driver === undefined) return store
+
+      /*
+       * Увольнение БЕСПЛАТНО, и это не поблажка. Настоящая цена решения не в
+       * выходном пособии, а в том, что машина под уволенным встаёт: она не
+       * поедет, пока за руль не сядет другой (см. vehicleSpeedFactor в
+       * driver.ts). Выгнать хорошего водителя, чтобы сэкономить на зарплате, —
+       * значит остановить кольцо, и это игрок почувствует к вечеру того же дня.
+       */
+      const drivers: Record<DriverId, Driver> = { ...company.drivers }
+      delete drivers[driverId]
+
+      const seat = driver.vehicleId
+      const vehicles =
+        seat !== null && state.vehicles[seat] !== undefined
+          ? {
+              ...state.vehicles,
+              [seat]: { ...state.vehicles[seat], driverId: null },
+            }
+          : state.vehicles
+
+      return withPlayer({ ...store, state: { ...state, vehicles } }, (owner) => ({
+        ...owner,
+        drivers,
+      }))
+    }),
+
+  serviceVehicle: (vehicleId) =>
+    set((store) => applyToOwnVehicle(store, vehicleId, simServiceVehicle)),
+
+  repairVehicle: (vehicleId) =>
+    set((store) => applyToOwnVehicle(store, vehicleId, simRepairVehicle)),
 
   advance: (ticks) =>
     set((store) => {
@@ -343,6 +569,34 @@ function withPlayer(
       companies: { ...state.companies, [state.playerId]: patch(company) },
     },
   }
+}
+
+/**
+ * Позвать команду симуляции для СВОЕЙ машины и завернуть результат в стор.
+ *
+ * Обёртка нужна ради одного правила, повторять которое в каждой команде дорого:
+ * из интерфейса игрок распоряжается только своим парком. Проверка владельца
+ * стоит здесь, а не в самой симуляции, потому что в симуляции этих команд может
+ * законно требовать и конкурент — ремонтировать свои машины ему никто не
+ * запрещает.
+ *
+ * Команды износа (ТО и ремонт) написаны в sim/logistics/wear.ts и деньги
+ * списывают сами: цена работ считается от класса и износа машины, и повторять
+ * этот расчёт в сторе значило бы завести вторую копию прейскуранта.
+ */
+function applyToOwnVehicle(
+  store: GameStore,
+  vehicleId: VehicleId,
+  command: (state: GameState, id: VehicleId) => GameState,
+): GameStore {
+  const state = store.state
+  const vehicle = state.vehicles[vehicleId]
+  if (vehicle === undefined || vehicle.ownerId !== state.playerId) return store
+
+  const next = command(state, vehicleId)
+  // Команда вернула то же состояние (работы не требуется) — не будим
+  // подписчиков впустую.
+  return next === state ? store : { ...store, state: next }
 }
 
 /** Парк, прогнанный через преобразование. Неизменённые машины — по ссылке. */
@@ -401,16 +655,26 @@ function nextLineId(lines: Record<LineId, Line>): LineId {
 }
 
 /**
- * Идентификатор новой машины.
+ * Идентификатор новой машины: класс и номер, «kamaz-5320-1».
  *
- * Продолжает нумерацию стартового «zil-1» (см. STARTER_VEHICLE_ID в
- * sim/state.ts). Числовых идентификаторов не заводим сознательно: порядок
- * обхода машин значим в фазе прибытия, а ключи, похожие на целые числа,
- * движок поднимает наверх и сортирует численно — разбор в шапке
- * sim/logistics/loading.ts.
+ * Класс в идентификаторе появился вместе с парком из разных машин: в отладке и
+ * в сохранении сразу видно, что за техника, не заглядывая в поле classId. У
+ * каждого класса своя нумерация — она короче и не прыгает от того, что между
+ * двумя ЗИЛами купили тягач.
+ *
+ * Числовых идентификаторов не заводим сознательно: порядок обхода машин значим
+ * в фазе прибытия, а ключи, похожие на целые числа, движок поднимает наверх и
+ * сортирует численно — разбор в шапке sim/logistics/loading.ts. По той же
+ * причине стартовый «zil-1» (STARTER_VEHICLE_ID в sim/state.ts) с этой схемой
+ * не конфликтует: префиксы «zil-» и «zil-130-» разные, и суффикс «130-1» не
+ * разбирается в число, то есть в чужую нумерацию не попадает.
  */
-function nextVehicleId(vehicles: Record<VehicleId, Vehicle>): VehicleId {
-  return toVehicleId(`zil-${nextNumber(Object.keys(vehicles), 'zil-')}`)
+function nextVehicleId(
+  vehicles: Record<VehicleId, Vehicle>,
+  classId: string,
+): VehicleId {
+  const prefix = `${classId}-`
+  return toVehicleId(`${prefix}${nextNumber(Object.keys(vehicles), prefix)}`)
 }
 
 /** Дальний конец ребра относительно того, откуда выехали. */
