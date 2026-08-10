@@ -114,7 +114,16 @@ export type GameStore = {
    * своим, и игрок увидел бы, что кнопка «отправить» просто не работает, без
    * малейшего намёка почему. Снимите машину с линии, и она снова слушается.
    */
-  dispatchTo: (destination: CityId) => void
+  /**
+   * Отправить машину игрока в город разовым рейсом.
+   *
+   * `vehicleId` необязателен: без него берётся первая свободная машина парка.
+   * Появился он не для удобства, а потому что «машина игрока» перестала быть
+   * однозначной — парк вырос, и выбор первой попавшейся оказался тихой
+   * ошибкой: сквозной тест гонял по разовым рейсам ту самую машину, которая
+   * работала на линии, и мерил в итоге не то, что думал.
+   */
+  dispatchTo: (destination: CityId, vehicleId?: VehicleId) => void
 
   /**
    * Завести линию. Возвращает идентификатор — по нему на неё ставят машины.
@@ -256,7 +265,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
    * него линию, и переносить его в общий набор значило бы дать модели способ
    * гонять машины мимо всякой сети.
    */
-  dispatchTo: (destination) =>
+  dispatchTo: (destination, vehicleId) =>
     set((store) => {
       const state = store.state
       /*
@@ -270,13 +279,20 @@ export const useGameStore = create<GameStore>((set, get) => ({
        * Такая машина в поиске просто пропускается, а не блокирует команду
        * целиком: свободная машина в парке, если она есть, поедет.
        */
-      const vehicle = Object.values(state.vehicles).find(
-        (v) =>
-          v.ownerId === state.playerId &&
-          v.lineId === null &&
-          v.serviceTicksLeft === 0 &&
-          v.queuedTicks === 0,
-      )
+      const free = (v: Vehicle) =>
+        v.ownerId === state.playerId &&
+        v.lineId === null &&
+        v.serviceTicksLeft === 0 &&
+        v.queuedTicks === 0
+
+      // Указали машину — едет она и только она. Не указали — первая свободная.
+      const vehicle =
+        vehicleId === undefined
+          ? Object.values(state.vehicles).find(free)
+          : (() => {
+              const named = state.vehicles[vehicleId]
+              return named !== undefined && free(named) ? named : undefined
+            })()
       if (vehicle === undefined) return store
 
       // Откуда считать путь: из города, если машина стоит, и из того города,
