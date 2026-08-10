@@ -1,8 +1,16 @@
 import { describe, expect, it } from 'vitest'
+import { STARTER_CLASS } from '../state'
+
+/** Тариф стартового класса: тесты писались под ЗИЛ, и он им и остаётся. */
+const TARIFF = STARTER_CLASS.tariffPerTonKm
+const HANDLING = STARTER_CLASS.handlingPerTon
+import { BUILDING_SPEC } from '../../data/infrastructure'
+import { TRANSSHIPMENT_SHARE } from '../economy/buildings'
 import { deliveryRevenue } from '../economy/finance'
 import { CONSUMPTION_PER_1K, RECIPE_BY_INDUSTRY } from '../../data/recipes'
 import { STOCK_DAYS, stockCapacity } from '../economy/production'
 import {
+  buildingId,
   cityId,
   companyId,
   edgeId,
@@ -11,6 +19,9 @@ import {
   vehicleId,
 } from '../types'
 import type {
+  Building,
+  BuildingId,
+  BuildingType,
   CargoType,
   City,
   CityId,
@@ -184,6 +195,13 @@ function makeVehicle(
     lineId: null,
     stopIndex: 0,
     blockedTicks: 0,
+    // ОБА СЧЁТЧИКА НУЛЕВЫЕ, И ЭТО ЗНАЧИМАЯ ЧАСТЬ ФИКСТУРЫ. Фаза прибытия
+    // перекладывает тонны только у машины, которая отстояла своё под погрузкой
+    // и не сидит в очереди (readyForWork в loading.ts). Ноль означает «пост
+    // отработал», то есть обычный рабочий случай; занятость и очередь ставятся
+    // явно в разделе про стык с фазой обслуживания.
+    serviceTicksLeft: 0,
+    queuedTicks: 0,
     classId: ZIL_CLASS,
     trailer: DEFAULT_TRAILER,
     // Водитель, износ и поломка фазу прибытия не касаются: без водителя машина
@@ -218,12 +236,35 @@ function makeLine(id: LineId, stops: Stop[], vehicles: VehicleId[] = []): Line {
   return { id, name: id, stops, assignedVehicles: vehicles }
 }
 
+/**
+ * Постройка игрока. Посты и вместимость берутся у справочника по типу — так же,
+ * как их копирует в постройку buildBuilding, и правка BUILDING_SPEC обязана
+ * менять тесты сама.
+ */
+function makeBuilding(
+  type: BuildingType,
+  city: CityId,
+  stock: Partial<Record<CargoType, Tons>> = {},
+): Building {
+  const spec = BUILDING_SPEC[type]
+  return {
+    id: buildingId(`${type}-${city}`),
+    type,
+    ownerId: PLAYER,
+    cityId: city,
+    posts: spec.posts,
+    storage: spec.storage,
+    stock,
+  }
+}
+
 function makeState(
   cities: City[],
   industries: Industry[],
   vehicles: Vehicle[],
   money = 0,
   lines: Line[] = [],
+  buildings: Building[] = [],
 ): GameState {
   const player: Company = {
     id: PLAYER,
@@ -238,6 +279,11 @@ function makeState(
     // машина без водителя не едет, но стоящая под погрузкой грузится — это
     // работа склада, а не рейс.
     drivers: {},
+    // Пусто по умолчанию: в городе у компании ровно базовый пост и ни тонны
+    // своего хранения. Склад появляется только там, где тест его ставит.
+    buildings: Object.fromEntries(
+      buildings.map((b) => [b.id, b]),
+    ) as Record<BuildingId, Building>,
     dailyRevenue: 0,
     dailyCosts: 0,
     bankrupt: false,
@@ -377,7 +423,7 @@ describe('runArrivals: разгрузка', () => {
     expect(plant(after, 'mill').stock['зерно']).toBeCloseTo(ZIL_TONS, 9)
     expect(truck(after).cargo).toBeNull()
     // 6 т зерна на 185 км — около 5 157 руб при нынешних ставках.
-    expect(money(after)).toBeCloseTo(deliveryRevenue('зерно', ZIL_TONS, LEG_KM), 9)
+    expect(money(after)).toBeCloseTo(deliveryRevenue('зерно', ZIL_TONS, LEG_KM, TARIFF, HANDLING), 9)
     expect(money(after)).toBeGreaterThan(0)
   })
 
@@ -397,7 +443,7 @@ describe('runArrivals: разгрузка', () => {
 
     expect(after.world.cities[MOSCOW].stock['мука']).toBeCloseTo(ZIL_TONS, 9)
     expect(truck(after).cargo).toBeNull()
-    expect(money(after)).toBeCloseTo(deliveryRevenue('мука', ZIL_TONS, LEG_KM), 9)
+    expect(money(after)).toBeCloseTo(deliveryRevenue('мука', ZIL_TONS, LEG_KM, TARIFF, HANDLING), 9)
   })
 
   it('машина с грузом, который здесь никому не нужен, стоит гружёной', () => {
@@ -473,7 +519,7 @@ describe('runArrivals: разгрузка', () => {
     expect(plant(after, 'mill').stock['зерно']).toBeCloseTo(grainRoom, 9)
     expect(truck(after).cargo).toMatchObject({ type: 'зерно', tons: fits })
     // Платят ровно за доставленное, а не за то, что было в кузове.
-    expect(money(after)).toBeCloseTo(deliveryRevenue('зерно', fits, LEG_KM), 9)
+    expect(money(after)).toBeCloseTo(deliveryRevenue('зерно', fits, LEG_KM, TARIFF, HANDLING), 9)
   })
 
   it('нет получателя вовсе — деньги не начисляются', () => {
@@ -601,7 +647,7 @@ describe('runArrivals: разгрузка раньше погрузки', () => 
     expect(plant(after, 'mill').stock['мука']).toBeCloseTo(50 - ZIL_TONS, 9)
     expect(truck(after).cargo).toMatchObject({ type: 'мука', tons: ZIL_TONS })
     // Плечо оплачено один раз — за привезённое зерно.
-    expect(money(after)).toBeCloseTo(deliveryRevenue('зерно', ZIL_TONS, LEG_KM), 9)
+    expect(money(after)).toBeCloseTo(deliveryRevenue('зерно', ZIL_TONS, LEG_KM, TARIFF, HANDLING), 9)
   })
 
   it('гружёная машина не догружается поверх своего груза', () => {
@@ -658,7 +704,7 @@ describe('runArrivals: километры и метрика пробега', () 
     )
 
     expect(money(runArrivals(honest))).toBeCloseTo(
-      deliveryRevenue('мука', ZIL_TONS, LEG_KM),
+      deliveryRevenue('мука', ZIL_TONS, LEG_KM, TARIFF, HANDLING),
       9,
     )
     expect(money(runArrivals(looping))).toBeCloseTo(money(runArrivals(honest)), 9)
@@ -786,7 +832,7 @@ describe('runArrivals: машина на линии', () => {
 
     expect(plant(after, 'mill').stock['зерно']).toBeCloseTo(ZIL_TONS, 9)
     expect(truck(after).cargo).toBeNull()
-    expect(money(after)).toBeCloseTo(deliveryRevenue('зерно', ZIL_TONS, LEG_KM), 9)
+    expect(money(after)).toBeCloseTo(deliveryRevenue('зерно', ZIL_TONS, LEG_KM, TARIFF, HANDLING), 9)
   })
 
   it('не выгружает того, чего в инструкции нет, даже если груз здесь ждут', () => {
@@ -1033,8 +1079,8 @@ describe('runArrivals: машина на линии', () => {
 
     // Оплачены оба плеча, а не одно.
     expect(money(home)).toBeCloseTo(
-      deliveryRevenue('зерно', ZIL_TONS, LEG_KM) +
-        deliveryRevenue('мука', ZIL_TONS, LEG_KM),
+      deliveryRevenue('зерно', ZIL_TONS, LEG_KM, TARIFF, HANDLING) +
+        deliveryRevenue('мука', ZIL_TONS, LEG_KM, TARIFF, HANDLING),
       9,
     )
   })
@@ -1062,7 +1108,7 @@ describe('runArrivals: машина на линии', () => {
 
     // Оплачено одно плечо из двух.
     expect(money(home)).toBeCloseTo(
-      deliveryRevenue('зерно', ZIL_TONS, LEG_KM),
+      deliveryRevenue('зерно', ZIL_TONS, LEG_KM, TARIFF, HANDLING),
       9,
     )
   })
@@ -1230,8 +1276,8 @@ describe('runArrivals: погрузка считается с кузовом', (
     expect(v.loadedKm).toBeCloseTo(2 * LEG_KM, 9)
     expect(v.emptyKm).toBeCloseTo(0, 9)
     expect(money(after)).toBeCloseTo(
-      deliveryRevenue('зерно', ZIL_TONS, LEG_KM) +
-        deliveryRevenue('мука', ZIL_TONS, LEG_KM),
+      deliveryRevenue('зерно', ZIL_TONS, LEG_KM, TARIFF, HANDLING) +
+        deliveryRevenue('мука', ZIL_TONS, LEG_KM, TARIFF, HANDLING),
       9,
     )
   })
@@ -1259,7 +1305,7 @@ describe('runArrivals: погрузка считается с кузовом', (
 
     expect(plant(after, 'mill').stock['зерно']).toBeCloseTo(ZIL_TONS, 9)
     expect(truck(after).cargo).toBeNull()
-    expect(money(after)).toBeCloseTo(deliveryRevenue('зерно', ZIL_TONS, LEG_KM), 9)
+    expect(money(after)).toBeCloseTo(deliveryRevenue('зерно', ZIL_TONS, LEG_KM, TARIFF, HANDLING), 9)
   })
 })
 
@@ -1362,5 +1408,463 @@ describe('runArrivals: детерминизм и чистота', () => {
     expect(JSON.stringify(state)).toBe(snapshot)
     expect(after).not.toBe(state)
     expect(money(after)).toBeGreaterThan(1000)
+  })
+})
+
+// ─── Стык с фазой обслуживания ─────────────────────────────────────────────
+
+/**
+ * САМОЕ ХРУПКОЕ МЕСТО СРЕЗА 5, и ломается оно молча в обе стороны.
+ *
+ * Фаза обслуживания (logistics/service.ts) решает, КОГДА машина освободится, а
+ * этот файл — ЧТО она погрузит. Условие «можно работать» записано в обоих, и
+ * условие это составное: оба счётчика обязаны быть нулевыми. Ослабь его до
+ * одного serviceTicksLeft — и машина, стоящая в очереди, начнёт грузиться
+ * мгновенно, то есть очередь превратится в свою противоположность, а весь срез
+ * отменит сам себя, не уронив ни одного теста экономики. Ужесточи — и машина
+ * будет стоять вечно.
+ *
+ * Саму фазу сюда не зовём: тест про перевалку тонн, и он не должен краснеть
+ * оттого, что в соседнем модуле поменяли оценку тоннажа. Счётчики выставляются
+ * руками ровно в те состояния, которые та фаза создаёт.
+ */
+describe('runArrivals: пост и очередь', () => {
+  /** Город с элеватором и полным складом зерна — было бы что грузить. */
+  function atElevator(patch: Partial<Vehicle>): GameState {
+    return makeState(
+      [makeCity(TULA, 100_000)],
+      [makeIndustry('elevator', 'элеватор', TULA, { 'зерно': 100 })],
+      [makeVehicle(V1, TULA, patch)],
+    )
+  }
+
+  it('машина под погрузкой не грузится: тонны переходят в последний тик', () => {
+    const state = atElevator({ serviceTicksLeft: 3 })
+
+    const after = runArrivals(state)
+
+    // Состояние даже не пересобиралось: работы в этом тике не было вовсе.
+    expect(after).toBe(state)
+    expect(truck(after).cargo).toBeNull()
+    expect(plant(after, 'elevator').stock['зерно']).toBe(100)
+  })
+
+  it('машина в очереди не грузится, хотя её счётчик обслуживания нулевой', () => {
+    const state = atElevator({ serviceTicksLeft: 0, queuedTicks: 2 })
+
+    const after = runArrivals(state)
+
+    // Ровно тот случай, ради которого условие составное. Поста ей не досталось,
+    // обслуживание не начиналось — и грузить нечего, сколько бы зерна ни лежало.
+    expect(after).toBe(state)
+    expect(truck(after).cargo).toBeNull()
+  })
+
+  it('отстоявшая своё машина грузится тем же тиком', () => {
+    const state = atElevator({ serviceTicksLeft: 0, queuedTicks: 0 })
+
+    const after = runArrivals(state)
+
+    // Простой обязан кончаться работой, а не ещё одним тиком ожидания: иначе
+    // каждая погрузка стоила бы лишние пятнадцать минут неизвестно за что.
+    expect(truck(after).cargo).toMatchObject({ type: 'зерно', tons: ZIL_TONS })
+  })
+
+  it('машина под погрузкой не разгружается тоже', () => {
+    const state = makeState(
+      [makeCity(TULA, 100_000)],
+      [makeIndustry('mill', 'мукомольный', TULA)],
+      [
+        makeVehicle(V1, TULA, {
+          serviceTicksLeft: 2,
+          cargo: { type: 'зерно', tons: ZIL_TONS, originId: MOSCOW },
+          odometer: LEG_KM,
+        }),
+      ],
+    )
+
+    const after = runArrivals(state)
+
+    // Выгрузка идёт через ту же рампу и занимает тот же пост. Разреши её
+    // раньше срока — и половина простоя исчезла бы у любой линии, где машина и
+    // сдаёт, и берёт: то есть у главной фигуры игры, кольца с двумя гружёными
+    // плечами.
+    expect(plant(after, 'mill').stock['зерно'] ?? 0).toBe(0)
+    expect(truck(after).cargo).not.toBeNull()
+    expect(money(after)).toBe(0)
+  })
+})
+
+// ─── Склад игрока ──────────────────────────────────────────────────────────
+
+describe('runArrivals: свой склад как приёмник', () => {
+  const DEPOT = buildingId(`склад-${TULA}`)
+
+  it('принимает груз, которого в городе больше некому отдать', () => {
+    // В Туле нет ни одного потребителя зерна: город его не ест, завода нет.
+    // Без склада машина уехала бы гружёной и возила бы партию по кругу.
+    const state = makeState(
+      [makeCity(TULA, 100_000)],
+      [],
+      [
+        makeVehicle(V1, TULA, {
+          cargo: { type: 'зерно', tons: ZIL_TONS, originId: MOSCOW },
+          odometer: LEG_KM,
+        }),
+      ],
+      0,
+      [],
+      [makeBuilding('склад', TULA)],
+    )
+
+    const after = runArrivals(state)
+
+    expect(after.companies[PLAYER].buildings[DEPOT].stock['зерно']).toBeCloseTo(
+      ZIL_TONS,
+      9,
+    )
+    expect(truck(after).cargo).toBeNull()
+  })
+
+  it('перевалка оплачивается ПОЛОВИНОЙ тарифа, а не полным', () => {
+    const state = makeState(
+      [makeCity(TULA, 100_000)],
+      [],
+      [
+        makeVehicle(V1, TULA, {
+          cargo: { type: 'зерно', tons: ZIL_TONS, originId: MOSCOW },
+          odometer: LEG_KM,
+        }),
+      ],
+      0,
+      [],
+      [makeBuilding('склад', TULA)],
+    )
+
+    const after = runArrivals(state)
+
+    /*
+     * ЭТО НЕ ОКРУГЛЕНИЕ БАЛАНСА, А ЗАЩИТА ГЛАВНОГО ИНВАРИАНТА. Груз со склада
+     * можно забрать обратно, значит два склада в разных городах — это кольцо из
+     * двух ГРУЖЁНЫХ плеч, которое ничего никому не доставляет. При полной оплате
+     * инвариант («кольцо с двумя гружёными плечами прибыльно») сделал бы из него
+     * вечный двигатель. Половина ровно уравнивает выручку такого кольца с левой
+     * частью инварианта, то есть с заведомо убыточной. Вывод — у
+     * TRANSSHIPMENT_SHARE в economy/buildings.ts.
+     */
+    expect(money(after)).toBeCloseTo(
+      deliveryRevenue('зерно', ZIL_TONS, LEG_KM, TARIFF, HANDLING) * TRANSSHIPMENT_SHARE,
+      9,
+    )
+    expect(money(after)).toBeLessThan(deliveryRevenue('зерно', ZIL_TONS, LEG_KM, TARIFF, HANDLING))
+  })
+
+  it('предприятие имеет приоритет над складом', () => {
+    const state = makeState(
+      [makeCity(TULA, 100_000)],
+      [makeIndustry('mill', 'мукомольный', TULA)],
+      [
+        makeVehicle(V1, TULA, {
+          cargo: { type: 'зерно', tons: ZIL_TONS, originId: MOSCOW },
+          odometer: LEG_KM,
+        }),
+      ],
+      0,
+      [],
+      [makeBuilding('склад', TULA)],
+    )
+
+    const after = runArrivals(state)
+
+    // Завод ПОТРЕБЛЯЕТ: не отдай ему зерно сейчас — он встанет и сообщит об
+    // этом игроку простоем. Склад не портится ничем и ждёт сколько угодно.
+    // Поставь его вперёд — и завод голодал бы при полном ангаре через дорогу.
+    expect(plant(after, 'mill').stock['зерно']).toBeCloseTo(ZIL_TONS, 9)
+    expect(after.companies[PLAYER].buildings[DEPOT].stock).toEqual({})
+    // И платят по полному тарифу: это настоящая доставка, а не перевалка.
+    expect(money(after)).toBeCloseTo(deliveryRevenue('зерно', ZIL_TONS, LEG_KM, TARIFF, HANDLING), 9)
+  })
+
+  it('город имеет приоритет над складом', () => {
+    const state = makeState(
+      [makeCity(MOSCOW, FLOUR_CITY_POP)],
+      [],
+      [
+        makeVehicle(V1, MOSCOW, {
+          cargo: { type: 'мука', tons: ZIL_TONS, originId: TULA },
+          odometer: LEG_KM,
+        }),
+      ],
+      0,
+      [],
+      [makeBuilding('склад', MOSCOW)],
+    )
+
+    const after = runArrivals(state)
+
+    expect(after.world.cities[MOSCOW].stock['мука']).toBeCloseTo(ZIL_TONS, 9)
+    expect(
+      after.companies[PLAYER].buildings[buildingId(`склад-${MOSCOW}`)].stock,
+    ).toEqual({})
+  })
+
+  it('терминал не принимает ничего: он даёт посты, а не место', () => {
+    expect(BUILDING_SPEC['терминал'].storage).toBe(0)
+
+    const state = makeState(
+      [makeCity(TULA, 100_000)],
+      [],
+      [
+        makeVehicle(V1, TULA, {
+          cargo: { type: 'зерно', tons: ZIL_TONS, originId: MOSCOW },
+          odometer: LEG_KM,
+        }),
+      ],
+      0,
+      [],
+      [makeBuilding('терминал', TULA)],
+    )
+
+    const after = runArrivals(state)
+
+    // Груз остался в кузове, а машина начала считать тики с непринятой партией:
+    // терминал ей не получатель, и получателя в городе нет вовсе.
+    expect(truck(after).cargo).toMatchObject({ type: 'зерно', tons: ZIL_TONS })
+    expect(after.companies[PLAYER].buildings[buildingId(`терминал-${TULA}`)].stock)
+      .toEqual({})
+    expect(money(after)).toBe(0)
+  })
+
+  it('вместимость общая на все грузы: забитый мукой склад не примет зерно', () => {
+    const full = BUILDING_SPEC['склад'].storage
+    const state = makeState(
+      [makeCity(TULA, 100_000)],
+      [],
+      [
+        makeVehicle(V1, TULA, {
+          cargo: { type: 'зерно', tons: ZIL_TONS, originId: MOSCOW },
+          odometer: LEG_KM,
+        }),
+      ],
+      0,
+      [],
+      [makeBuilding('склад', TULA, { 'мука': full })],
+    )
+
+    const after = runArrivals(state)
+
+    // Из этого и растёт настоящее решение: подо что игрок держит хранилище.
+    // Раздельные лимиты превратили бы одну постройку в шесть независимых.
+    expect(truck(after).cargo).not.toBeNull()
+    expect(after.companies[PLAYER].buildings[DEPOT].stock['зерно'] ?? 0).toBe(0)
+  })
+
+  it('влезает не всё — остаток едет дальше', () => {
+    const room = 2
+    const state = makeState(
+      [makeCity(TULA, 100_000)],
+      [],
+      [
+        makeVehicle(V1, TULA, {
+          cargo: { type: 'зерно', tons: ZIL_TONS, originId: MOSCOW },
+          odometer: LEG_KM,
+        }),
+      ],
+      0,
+      [],
+      [
+        makeBuilding('склад', TULA, {
+          'мука': BUILDING_SPEC['склад'].storage - room,
+        }),
+      ],
+    )
+
+    const after = runArrivals(state)
+
+    expect(after.companies[PLAYER].buildings[DEPOT].stock['зерно']).toBeCloseTo(
+      room,
+      9,
+    )
+    expect(truck(after).cargo).toMatchObject({ tons: ZIL_TONS - room })
+    // Платят ровно за принятое, а не за привезённое.
+    expect(money(after)).toBeCloseTo(
+      deliveryRevenue('зерно', room, LEG_KM, TARIFF, HANDLING) * TRANSSHIPMENT_SHARE,
+      9,
+    )
+  })
+
+  it('чужой склад машине недоступен', () => {
+    const rival: CompanyId = companyId('rival')
+    const base = makeState(
+      [makeCity(TULA, 100_000)],
+      [],
+      [
+        makeVehicle(V1, TULA, {
+          cargo: { type: 'зерно', tons: ZIL_TONS, originId: MOSCOW },
+          odometer: LEG_KM,
+        }),
+      ],
+      0,
+      [],
+      [makeBuilding('склад', TULA)],
+    )
+
+    // Тот же склад, но принадлежит конкуренту.
+    const player = base.companies[PLAYER]
+    const state: GameState = {
+      ...base,
+      companies: {
+        [PLAYER]: { ...player, buildings: {} },
+        [rival]: { ...player, id: rival, buildings: player.buildings },
+      } as Record<CompanyId, Company>,
+    }
+
+    const after = runArrivals(state)
+
+    // Иначе конкуренту можно было бы забить хранилище ненужным ему грузом —
+    // причём за его же счёт содержания.
+    expect(truck(after).cargo).toMatchObject({ type: 'зерно', tons: ZIL_TONS })
+    expect(after.companies[rival].buildings[DEPOT].stock).toEqual({})
+    expect(money(after)).toBe(0)
+  })
+
+  it('груз, взятый в этом же городе, на свой склад сдать можно и бесплатно', () => {
+    const state = makeState(
+      [makeCity(TULA, 100_000)],
+      [],
+      [
+        makeVehicle(V1, TULA, {
+          cargo: { type: 'зерно', tons: ZIL_TONS, originId: TULA },
+        }),
+      ],
+      0,
+      [],
+      [makeBuilding('склад', TULA)],
+    )
+
+    const after = runArrivals(state)
+
+    /*
+     * Заводу и городу отдать взятое здесь же нельзя — это был бы тихий способ
+     * снабжать свой город даром. Складу можно: перевозки не было, плечо нулевое,
+     * значит и денег ноль. Смысл операции другой — снять продукцию с
+     * задыхающегося завода, пока игрок собирает под цепочку парк.
+     */
+    expect(after.companies[PLAYER].buildings[DEPOT].stock['зерно']).toBeCloseTo(
+      ZIL_TONS,
+      9,
+    )
+    expect(money(after)).toBe(0)
+  })
+})
+
+describe('runArrivals: свой склад как источник', () => {
+  const DEPOT = buildingId(`склад-${TULA}`)
+
+  it('порожняя машина забирает груз со склада', () => {
+    const state = makeState(
+      [makeCity(TULA, 100_000)],
+      [],
+      [makeVehicle(V1, TULA)],
+      0,
+      [],
+      [makeBuilding('склад', TULA, { 'зерно': 100 })],
+    )
+
+    const after = runArrivals(state)
+
+    expect(truck(after).cargo).toMatchObject({
+      type: 'зерно',
+      tons: ZIL_TONS,
+      originId: TULA,
+    })
+    expect(after.companies[PLAYER].buildings[DEPOT].stock['зерно']).toBeCloseTo(
+      100 - ZIL_TONS,
+      9,
+    )
+  })
+
+  it('предприятие разбирают раньше склада', () => {
+    const state = makeState(
+      [makeCity(TULA, 100_000)],
+      [makeIndustry('elevator', 'элеватор', TULA, { 'зерно': 100 })],
+      [makeVehicle(V1, TULA)],
+      0,
+      [],
+      [makeBuilding('склад', TULA, { 'зерно': 100 })],
+    )
+
+    const after = runArrivals(state)
+
+    // Порядок обратный тому, что у приёмки, и по той же причине: невывезенный
+    // завод ЗАДЫХАЕТСЯ — склад забивается, выпуск падает, простой копится, — а
+    // свой ангар ждёт сколько угодно. Обратный порядок дал бы линию, которая
+    // перекладывает тонны из ангара в ангар мимо стоящего рядом завода.
+    expect(plant(after, 'elevator').stock['зерно']).toBeCloseTo(100 - ZIL_TONS, 9)
+    expect(after.companies[PLAYER].buildings[DEPOT].stock['зерно']).toBe(100)
+  })
+
+  it('кузов решает и здесь: цистерна муку из ангара не увезёт', () => {
+    const state = makeState(
+      [makeCity(TULA, 100_000)],
+      [],
+      [makeVehicle(V1, TULA, { trailer: 'цистерна' })],
+      0,
+      [],
+      [makeBuilding('склад', TULA, { 'мука': 100 })],
+    )
+
+    const after = runArrivals(state)
+
+    expect(canCarry('цистерна', 'мука')).toBe(false)
+    expect(after).toBe(state)
+  })
+
+  it('не забирает обратно то, что только что положил', () => {
+    const state = makeState(
+      [makeCity(TULA, 100_000)],
+      [],
+      [
+        makeVehicle(V1, TULA, {
+          cargo: { type: 'зерно', tons: ZIL_TONS, originId: MOSCOW },
+          odometer: LEG_KM,
+        }),
+      ],
+      0,
+      [],
+      [makeBuilding('склад', TULA)],
+    )
+
+    const after = runArrivals(state)
+
+    /*
+     * Иначе разгрузка и погрузка на складе схлопываются: машина ссыпала шесть
+     * тонн в ангар и тут же забрала их обратно. Пользы ноль, зато cargo.originId
+     * переехал в этот город, и тарифное плечо следующей доставки молча
+     * укоротилось — игрок потерял деньги там, где ничего не делал.
+     */
+    expect(truck(after).cargo).toBeNull()
+    expect(after.companies[PLAYER].buildings[DEPOT].stock['зерно']).toBeCloseTo(
+      ZIL_TONS,
+      9,
+    )
+  })
+
+  it('линия берёт со склада только названный груз', () => {
+    const state = makeState(
+      [makeCity(TULA, 100_000)],
+      [],
+      [makeVehicle(V1, TULA, { lineId: RING, stopIndex: 0 })],
+      0,
+      [makeLine(RING, [makeStop(TULA, [], ['мука']), makeStop(MOSCOW)], [V1])],
+      [makeBuilding('склад', TULA, { 'зерно': 100 })],
+    )
+
+    const after = runArrivals(state)
+
+    // Список остановки — это инструкция, а не пожелание. Своё хранилище не
+    // повод подсунуть машине не тот груз.
+    expect(truck(after).cargo).toBeNull()
+    expect(after.companies[PLAYER].buildings[DEPOT].stock['зерно']).toBe(100)
   })
 })

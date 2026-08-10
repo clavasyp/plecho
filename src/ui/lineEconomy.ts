@@ -43,6 +43,7 @@ import { MIN_LINE_STOPS } from '../sim/logistics/line'
 import {
   HOME_CITY,
   STARTER_CRUISE_KMH,
+  STARTER_CLASS,
   createZil,
 } from '../sim/state'
 import type {
@@ -72,6 +73,9 @@ const HOURS_PER_DAY = 24
  * ЗИЛов, разницы нет вовсе; разные по расходу машины появятся в срезе 5, и тогда
  * же здесь появится выбор, чью экономику показывать.
  */
+/** Класс опорной машины: тариф живёт у него, а не у самой машины. */
+const REFERENCE_CLASS = STARTER_CLASS
+
 const REFERENCE_VEHICLE: Vehicle = createZil(
   vehicleId('план'),
   companyId('план'),
@@ -208,6 +212,11 @@ export function planLoop(graph: RoadGraph, line: Line): LinePlan {
               // Тариф платят за КРАТЧАЙШЕЕ расстояние от погрузки до выгрузки,
               // а не за пробег: разбор в шапке loading.ts.
               shortestKm(graph, cargo.originId, stop.nodeId),
+              // Ставка класса машины, а не глобальная: прикидка в редакторе
+              // обязана считать по той же формуле, что и сама игра, иначе
+              // подсказка врёт ровно там, где на неё смотрят.
+              REFERENCE_CLASS.tariffPerTonKm,
+              REFERENCE_CLASS.handlingPerTon,
             )
           }
           cargo = null

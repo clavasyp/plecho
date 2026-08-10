@@ -77,6 +77,10 @@ function makeVehicle(
     lineId: null,
     stopIndex: 0,
     blockedTicks: 0,
+    // Счётчики обслуживания: машина свободна, поста под ней нет и в очереди
+    // она не стоит. Оба поля обязательны с среза 5 (Vehicle в sim/types.ts).
+    serviceTicksLeft: 0,
+    queuedTicks: 0,
     // Класс и прицеп берутся у стартовой машины: движение ни того, ни другого
     // не читает, но нулевой расход или пустой класс в фикстуре — плохой
     // образец, с которого их копируют в новые тесты.
@@ -153,6 +157,8 @@ function makeState(
         controller: 'человек',
         lines: {},
         drivers: { [driver.id]: driver },
+        // Ни одной постройки: поле обязательно с среза 5 (Company в sim/types.ts).
+        buildings: {},
         dailyRevenue: 0,
         dailyCosts: 0,
         bankrupt: false,

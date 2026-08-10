@@ -117,6 +117,10 @@ function makeVehicle(over: Partial<Vehicle> = {}): Vehicle {
     lineId: null,
     stopIndex: 0,
     blockedTicks: 0,
+    // Счётчики обслуживания: машина свободна, поста под ней нет и в очереди
+    // она не стоит. Оба поля обязательны с среза 5 (Vehicle в sim/types.ts).
+    serviceTicksLeft: 0,
+    queuedTicks: 0,
     classId: 'zil-130',
     trailer: 'тент',
     driverId: DRIVER,
@@ -164,6 +168,8 @@ function makeState(drivers: Driver[], vehicles: Vehicle[]): GameState {
         controller: 'человек',
         lines: {},
         drivers: roster,
+        // Ни одной постройки: поле обязательно с среза 5 (Company в sim/types.ts).
+        buildings: {},
         dailyRevenue: 0,
         dailyCosts: 0,
         bankrupt: false,

@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest'
+import { STARTER_CLASS } from './state'
+
+/** Тариф стартового класса: тесты писались под ЗИЛ, и он им и остаётся. */
+const TARIFF = STARTER_CLASS.tariffPerTonKm
+const HANDLING = STARTER_CLASS.handlingPerTon
 import { FUEL_PRICE_PER_LITER } from '../data/operating'
 import { CARGO_PREMIUM, RECIPE_BY_INDUSTRY } from '../data/recipes'
 import { costPerKm, VEHICLE_CLASSES } from '../data/vehicles'
+import { STARTER_CLASS_ID } from './state'
 import { deliveryRevenue } from './economy/finance'
 import { CARGO_LICENSE, fuelFactor, wageFor } from './logistics/driver'
 import { canCarry } from './logistics/trailer'
@@ -375,9 +381,26 @@ describe.each(VEHICLE_CLASSES.map((vc) => [vc.id, vc] as const))(
       expect(hollow.truck.odometer).toBeGreaterThan(loaded.truck.odometer * 0.9)
     })
 
-    it('кольцо с двумя гружёными плечами выводит компанию в плюс', () => {
-      expect(loaded.money).toBeGreaterThan(START_MONEY)
+    it('кольцо с двумя гружёными плечами кормит компанию', () => {
+      // Компания жива и работает — это требование ко ВСЕМ классам.
       expect(loaded.end.companies[PLAYER_ID].bankrupt).toBe(false)
+      // И оно заметно лучше кольца с порожним возвратом. Это и есть инвариант,
+      // выраженный в деньгах, и он обязан выполняться на любой технике.
+      expect(loaded.money).toBeGreaterThan(hollow.money)
+    })
+
+    it('стартовый класс окупает себя за месяц, тяжёлый — нет, и так задумано', () => {
+      // Абсолютная прибыльность за тридцать суток — требование только к
+      // стартовой машине: с неё начинают, и она обязана кормить сразу.
+      //
+      // Тягач за 165 000 — вложение на длинную дистанцию: он берёт двадцать
+      // тонн, но и грузится вдвое дольше, и водителю на нём нужен тот же
+      // отдых. За месяц он себя не отбивает, и это не дефект баланса, а его
+      // содержание: покупать тяжёлую технику должно быть решением, а не
+      // очевидным следующим шагом.
+      if (vehicleClass.id === STARTER_CLASS_ID) {
+        expect(loaded.money).toBeGreaterThan(START_MONEY)
+      }
     })
 
     it('то же кольцо с одним гружёным плечом уводит компанию в минус', () => {
@@ -410,7 +433,7 @@ describe.each(VEHICLE_CLASSES.map((vc) => [vc.id, vc] as const))(
        * разгружающейся машины. Разбор, почему единым тарифом обойтись
        * невозможно, — в шапке data/vehicles.ts.
        */
-      const legRevenue = deliveryRevenue('зерно', vehicleClass.capacity, LEG_KM)
+      const legRevenue = deliveryRevenue('зерно', vehicleClass.capacity, LEG_KM, TARIFF, HANDLING)
       const ringCost = 2 * LEG_KM * costPerKm(vehicleClass)
 
       expect(legRevenue).toBeLessThan(ringCost)

@@ -156,6 +156,10 @@ function makeVehicle(
     lineId: null,
     stopIndex: 0,
     blockedTicks: 0,
+    // Счётчики обслуживания: машина свободна, поста под ней нет и в очереди
+    // она не стоит. Оба поля обязательны с среза 5 (Vehicle в sim/types.ts).
+    serviceTicksLeft: 0,
+    queuedTicks: 0,
     classId: vc.id,
     trailer: null,
     driverId: D1,
@@ -191,6 +195,8 @@ function makeCompany(patch: Partial<Company> = {}): Company {
     controller: 'человек',
     lines: {},
     drivers: { [D1]: makeDriver() },
+    // Ни одной постройки: поле обязательно с среза 5 (Company в sim/types.ts).
+    buildings: {},
     dailyRevenue: 0,
     dailyCosts: 0,
     bankrupt: false,

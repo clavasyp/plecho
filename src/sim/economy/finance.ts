@@ -11,7 +11,6 @@
  */
 
 import { CARGO_PREMIUM } from '../../data/recipes'
-import { HANDLING_PER_TON, TARIFF_PER_TON_KM } from '../../data/operating'
 import type { CargoType, Tons } from '../types'
 
 /**
@@ -105,24 +104,42 @@ export const DELIVERY_DISTANCE_SHARE = 1 - DELIVERY_FIXED_SHARE
  * NaN, попавший в баланс компании, отравляет его навсегда и молча: все
  * последующие сравнения с ним ложны, и банкротство никогда не наступит.
  */
+/**
+ * Выручка за доставленную партию.
+ *
+ * ТАРИФ БЕРЁТСЯ У КЛАССА МАШИНЫ, и это не формальность. Ставка за
+ * тонно-километр падает с размером партии (объёмная скидка), и ровно на этом
+ * держится главный инвариант игры на тяжёлой технике: без скидки двадцать
+ * тонн зарабатывали бы столько, что порожний возврат перестал бы пугать.
+ *
+ * Раньше здесь стояли ГЛОБАЛЬНЫЕ константы, а поля класса не читал никто —
+ * весь расчёт по классам в src/data/vehicles.ts оказался декоративным.
+ * Замеры ревизии на кратчайшем ребре карты (110 км): тягач с зерном давал
+ * 8 660 руб за плечо против 7 766 руб расходов кольца, то есть инвариант был
+ * нарушен, а тесты этого не видели — они считали по тем же глобальным числам.
+ *
+ * Поэтому тариф и плата за погрузку теперь ВХОДЯТ В СИГНАТУРУ: забыть их
+ * нельзя, компилятор не даст.
+ */
 export function deliveryRevenue(
   cargo: CargoType,
   tons: Tons,
   km: number,
+  tariffPerTonKm: number,
+  handlingPerTon: number,
 ): number {
   const premium = CARGO_PREMIUM[cargo]
 
   if (
     !Number.isFinite(premium) ||
     !Number.isFinite(tons) ||
-    !Number.isFinite(km)
+    !Number.isFinite(km) ||
+    !Number.isFinite(tariffPerTonKm) ||
+    !Number.isFinite(handlingPerTon)
   ) {
     return 0
   }
   if (tons <= 0 || km <= 0) return 0
 
-  // Тонно-километр плюс погрузка, всё умножено на надбавку за сложность груза.
-  // Разбор границ, при которых из этой формулы следует главный инвариант
-  // баланса, — в шапке src/data/operating.ts.
-  return tons * (HANDLING_PER_TON + TARIFF_PER_TON_KM * km) * premium
+  return tons * (handlingPerTon + tariffPerTonKm * km) * premium
 }

@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import { CITIES } from '../data/cities'
 import { INDUSTRIES } from '../data/industries'
+import { BASE_POSTS } from '../data/infrastructure'
 import { DRIVER_WAGE_PER_DAY } from '../data/operating'
+import { postsAt } from './logistics/service'
 import { RECIPES, RECIPE_BY_INDUSTRY } from '../data/recipes'
 import { EDGES } from '../data/roads'
 import { costPerKm, TRAILER_PRICE, VEHICLE_CLASSES } from '../data/vehicles'
@@ -12,6 +14,7 @@ import {
   createInitialState,
   createVehicle,
   createZil,
+  HOME_CITY,
   PLAYER_ID,
   RESPEC_RESERVE,
   START_MONEY,
@@ -94,13 +97,23 @@ describe('createInitialState', () => {
     expect(player.money).toBe(START_MONEY)
   })
 
-  it('компания начинает без линий, без итогов и не банкротом', () => {
+  it('компания начинает без линий, без построек, без итогов и не банкротом', () => {
     const state = createInitialState(1)
     const player = state.companies[state.playerId]
 
     // Первую сеть проектирует игрок. Готовое кольцо на старте отобрало бы у
     // него ровно то решение, ради которого срез 3 и сделан.
     expect(player.lines).toEqual({})
+
+    /*
+     * НИ ОДНОЙ ПОСТРОЙКИ, и это условие, на котором держится весь срез 5. Пустой
+     * список означает ровно BASE_POSTS постов в каждом городе — один, — то есть
+     * вторая машина на том же заводе встаёт в очередь немедленно. Подарённый
+     * терминал отложил бы это открытие до той поры, когда у игрока двадцать
+     * машин и разбираться уже поздно.
+     */
+    expect(player.buildings).toEqual({})
+    expect(postsAt(state, HOME_CITY, state.playerId)).toBe(BASE_POSTS)
 
     // Суточный итог ещё не подводился — первые сутки не прошли. Ноль здесь
     // означает «данных нет», а не «сработали в ноль».
@@ -320,6 +333,21 @@ describe('createInitialState: стартовая машина', () => {
     expect(truck.stopIndex).toBe(0)
   })
 
+  it('машина свободна: ни поста под ней, ни очереди перед ней', () => {
+    const truck = Object.values(createInitialState(1).vehicles)[0]
+
+    /*
+     * ОБА НУЛЯ ЗНАЧИМЫ, И ПО-РАЗНОМУ. serviceTicksLeft читается всей игрой как
+     * «машина свободна»: ненулевое значение остановило бы и диспетчеризацию
+     * (line.ts), и погрузку (loading.ts), то есть партия начиналась бы с
+     * грузовика, который несколько часов стоит под чужой погрузкой и не
+     * подаёт признаков жизни. queuedTicks — это главное число панели узких мест,
+     * и ненулевое на старте показало бы игроку пробку, которой он не создавал.
+     */
+    expect(truck.serviceTicksLeft).toBe(0)
+    expect(truck.queuedTicks).toBe(0)
+  })
+
   it('расход топлива — паспортные тридцать литров ЗИЛ-130', () => {
     const truck = Object.values(createInitialState(1).vehicles)[0]
 
@@ -434,6 +462,10 @@ describe('createZil: одна сборка машины на всю игру', (
       // этой игре собирается из трёх решений, покупка — только первое.
       expect(truck.trailer).toBeNull()
       expect(truck.driverId).toBeNull()
+
+      // И свободным: купленная машина не наследует ничьей очереди.
+      expect(truck.serviceTicksLeft).toBe(0)
+      expect(truck.queuedTicks).toBe(0)
     }
 
     // Неизвестный класс падает громко. Молчаливое умолчание дало бы машину с

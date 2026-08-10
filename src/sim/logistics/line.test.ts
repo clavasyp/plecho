@@ -152,6 +152,11 @@ function makeVehicle(
     lineId: null,
     stopIndex: 0,
     blockedTicks: 0,
+    // Свободна: под погрузкой машина никуда не едет, и тесты диспетчеризации
+    // проверяли бы неподвижный парк. Простой под погрузкой — отдельный раздел
+    // ниже, он ставит счётчик явно.
+    serviceTicksLeft: 0,
+    queuedTicks: 0,
     classId: 'zil-130',
     trailer: 'тент',
     // Водитель обязателен: без него машина не трогается, а здесь проверяется
@@ -181,6 +186,9 @@ function makeCompany(lines: Line[]): Company {
     controller: 'человек',
     lines: table,
     drivers: {},
+    // Ни одной постройки: в этом городе у компании ровно базовый пост, и
+    // диспетчеризацию это не касается вовсе — постами занята фаза обслуживания.
+    buildings: {},
     dailyRevenue: 0,
     dailyCosts: 0,
     bankrupt: false,
@@ -345,10 +353,14 @@ describe('advanceLineVehicles', () => {
     }
   })
 
-  it('машина стоит на остановке ровно один тик — время под погрузкой', () => {
+  it('свободная машина уходит с остановки со следующим же тиком', () => {
     // Инвариант, на который опирается фаза прибытия: пока машина стоит,
     // stopIndex указывает на ЭТУ остановку, и грузиться она будет по её
     // инструкции. Сдвиг индекса происходит в момент отправления.
+    //
+    // «Свободная» — то есть с нулевыми счётчиками обслуживания. Настоящий
+    // простой под погрузкой задаёт фаза обслуживания, и ей посвящён отдельный
+    // раздел ниже; здесь проверяется, что БЕЗ неё диспетчер не тянет ни тика.
     let state = shuttleState()
     const line = state.companies[PLAYER].lines[RING]
 
@@ -361,6 +373,96 @@ describe('advanceLineVehicles', () => {
     // Диспетчер отправил её дальше: индекс уже на следующей остановке.
     expect(state.vehicles[V1].stopIndex).toBe(nextStop(line, 0))
     expect(nodeOf(state, V1)).toBeNull()
+  })
+
+  /*
+   * ─── СТЫК С ФАЗОЙ ОБСЛУЖИВАНИЯ ──────────────────────────────────────────
+   *
+   * Фаза обслуживания (logistics/service.ts) сюда не зовётся: тест про
+   * ДИСПЕТЧЕРА, и он не должен краснеть оттого, что в соседнем модуле поменяли
+   * оценку тоннажа. Счётчики выставляются руками ровно в те состояния, которые
+   * та фаза создаёт, — «стоит под погрузкой» и «ждёт очереди», — и проверяется
+   * единственное, за что диспетчер тут отвечает: он такую машину не трогает.
+   */
+
+  it('машина под погрузкой стоит и не уезжает', () => {
+    const line = makeLine(RING, [stop(MOSCOW), stop(TULA)], [V1])
+    // Три тика под погрузкой — столько держит пост шеститонная партия.
+    const busy = makeVehicle(V1, MOSCOW, { lineId: RING, serviceTicksLeft: 3 })
+    const state = makeState([line], [busy])
+
+    const after = run(state, 3)
+
+    // Никуда не уехала, маршрута не получила, цель не переехала на следующую
+    // остановку. Увези её диспетчер сейчас — тонны так и остались бы на складе,
+    // а погрузка снова стала бы мгновенной ровно для того, кто едет по линии.
+    expect(nodeOf(after, V1)).toBe(MOSCOW)
+    expect(after.vehicles[V1].route).toEqual([])
+    expect(after.vehicles[V1].stopIndex).toBe(0)
+    expect(after.vehicles[V1].odometer).toBe(0)
+  })
+
+  it('машина в очереди тоже стоит, хотя пост ей не достался', () => {
+    const line = makeLine(RING, [stop(MOSCOW), stop(TULA)], [V1])
+    // Обслуживание не начиналось: serviceTicksLeft честный ноль, растёт только
+    // ожидание. Это состояние второй машины у завода с единственным постом.
+    const waiting = makeVehicle(V1, MOSCOW, { lineId: RING, queuedTicks: 2 })
+    const state = makeState([line], [waiting])
+
+    const after = run(state, 3)
+
+    /*
+     * САМАЯ ЛЁГКАЯ ОШИБКА ЭТОГО СРЕЗА — проверить только serviceTicksLeft. У
+     * ждущей машины он ноль, и диспетчер увёз бы её со своей же остановки
+     * порожняком: очередь превратилась бы в разрешение проехать мимо завода, то
+     * есть в свою противоположность. Никакой тест экономики этого бы не поймал —
+     * линия просто возила бы меньше, чем должна.
+     */
+    expect(nodeOf(after, V1)).toBe(MOSCOW)
+    expect(after.vehicles[V1].route).toEqual([])
+    expect(after.vehicles[V1].odometer).toBe(0)
+  })
+
+  it('отстоявшая своё машина уезжает, ничего не потеряв', () => {
+    const line = makeLine(RING, [stop(MOSCOW), stop(TULA)], [V1])
+    // Обслуживание закончено: оба счётчика обнулены — так фаза обслуживания и
+    // отпускает машину.
+    const freed = makeVehicle(V1, MOSCOW, {
+      lineId: RING,
+      serviceTicksLeft: 0,
+      queuedTicks: 0,
+    })
+    const state = makeState([line], [freed])
+
+    const after = step(state)
+
+    // Простой не должен превращаться в вечный: как только счётчики обнулены,
+    // машина обязана поехать тем же тиком, а не «отдохнуть ещё немного».
+    expect(after.vehicles[V1].stopIndex).toBe(nextStop(line, 0))
+    expect(after.vehicles[V1].odometer).toBeGreaterThan(0)
+  })
+
+  it('стоящая под погрузкой машина не пропадает с кольца для соседей', () => {
+    /*
+     * Её координата считается как у всех, и выдержка интервала продолжает от
+     * неё отталкиваться. Иначе занятый пост стал бы для остальных невидимым, и
+     * весь парк линии съезжался бы к нему — то самое сбивание в колонну, ради
+     * которого выдержка интервала и написана, только теперь ещё и с очередью.
+     */
+    const line = makeLine(RING, [stop(MOSCOW), stop(TULA), stop(KALUGA)], [
+      V1,
+      V2,
+    ])
+    const busy = makeVehicle(V1, MOSCOW, { lineId: RING, serviceTicksLeft: 8 })
+    const behind = makeVehicle(V2, MOSCOW, { lineId: RING })
+    const state = makeState([line], [busy, behind])
+
+    const after = step(state)
+
+    // Первая стоит под погрузкой, вторая стоит с ней в одной точке кольца:
+    // интервал до передней нулевой, значит выезд запрещён обеим.
+    expect(after.vehicles[V1].odometer).toBe(0)
+    expect(after.vehicles[V2].odometer).toBe(0)
   })
 
   it('stopIndex закольцовывается', () => {

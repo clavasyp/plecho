@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest'
+import { BASE_POSTS, BUILDING_SPEC } from '../data/infrastructure'
 import { TRAILER_PRICE, VEHICLE_CLASS_BY_ID } from '../data/vehicles'
+import { postsAt } from '../sim/logistics/service'
 import {
   createInitialState,
   HOME_CITY,
@@ -9,8 +11,9 @@ import {
   STARTER_TRAILER,
   STARTER_VEHICLE_ID,
 } from '../sim/state'
-import { cityId } from '../sim/types'
+import { cityId, companyId } from '../sim/types'
 import type {
+  BuildingId,
   CityId,
   DriverId,
   GameState,
@@ -587,6 +590,37 @@ describe('dispatchTo', () => {
     expect(truck().route[truck().route.length - 1]).toBe(TULA)
   })
 
+  it('машину под погрузкой и в очереди не отправляет', () => {
+    for (const patch of [{ serviceTicksLeft: 3 }, { queuedTicks: 2 }]) {
+      const fresh = createInitialState(WORLD_SEED)
+      useGameStore.setState({
+        state: {
+          ...fresh,
+          vehicles: {
+            ...fresh.vehicles,
+            [STARTER_VEHICLE_ID]: {
+              ...fresh.vehicles[STARTER_VEHICLE_ID],
+              ...patch,
+            },
+          },
+        },
+        prev: fresh,
+      })
+
+      const before = game()
+      store().dispatchTo(TULA)
+
+      /*
+       * Иначе кнопка «отправить» становится способом ОБОЙТИ пропускную
+       * способность: нажал — и машина уехала порожней прямо из-под рампы, не
+       * отстояв своё и никого не пропустив вперёд. Весь срез 5 отменялся бы
+       * одним кликом, и заметить это было бы нечем: машина ведь поехала.
+       */
+      expect(game()).toBe(before)
+      expect(truck().route).toEqual([])
+    }
+  })
+
   it('машину на линии не трогает', () => {
     const id = store().createLine('Кольцо', RING)
     store().assignVehicle(STARTER_VEHICLE_ID, id)
@@ -644,3 +678,168 @@ function deepFreeze<T>(value: T): T {
   }
   return Object.freeze(value)
 }
+
+// ─── Инфраструктура ────────────────────────────────────────────────────────
+
+describe('build и demolish', () => {
+  const TERMINAL = BUILDING_SPEC['терминал']
+
+  /** Постройки игрока — по ним видно и наличие, и владельца. */
+  const yards = () => player().buildings
+
+  it('на старте построек нет и в городе ровно базовый пост', () => {
+    // Условие, на котором держится весь срез: вторая машина на том же заводе
+    // встаёт в очередь СРАЗУ, а не после пятой.
+    expect(yards()).toEqual({})
+    expect(postsAt(game(), MOSCOW, game().playerId)).toBe(BASE_POSTS)
+  })
+
+  it('списывает цену и ставит постройку в указанном городе', () => {
+    setPlayerMoney(TERMINAL.price * 2)
+
+    store().build(TULA, 'терминал')
+
+    const built = Object.values(yards())
+    expect(built).toHaveLength(1)
+    expect(built[0].type).toBe('терминал')
+    expect(built[0].cityId).toBe(TULA)
+    expect(built[0].ownerId).toBe(game().playerId)
+    // Пустой: всё, что окажется на складе, привезёт машина игрока.
+    expect(built[0].stock).toEqual({})
+    expect(player().money).toBe(TERMINAL.price)
+  })
+
+  it('терминал добавляет посты, и только в своём городе', () => {
+    setPlayerMoney(TERMINAL.price)
+    store().build(TULA, 'терминал')
+
+    // РАДИ ЭТОГО ЧИСЛА КНОПКА И СУЩЕСТВУЕТ. Очередь у завода расшивается не
+    // покупкой машины, а постами: их стало на TERMINAL.posts больше.
+    expect(postsAt(game(), TULA, game().playerId)).toBe(
+      BASE_POSTS + TERMINAL.posts,
+    )
+    // Соседний город при этом не изменился: постройка стоит в конкретном узле,
+    // а не «у компании вообще».
+    expect(postsAt(game(), MOSCOW, game().playerId)).toBe(BASE_POSTS)
+  })
+
+  it('денег не хватает — ничего не происходит', () => {
+    setPlayerMoney(TERMINAL.price - 1)
+    const before = game()
+
+    store().build(TULA, 'терминал')
+
+    // Покупка в кредит — механика более позднего среза, а не «ну ладно, уйдём
+    // в минус»: содержание постройки пришлось бы платить с отрицательного счёта.
+    expect(game()).toBe(before)
+    expect(yards()).toEqual({})
+  })
+
+  it('вторая постройка того же типа в том же городе не ставится', () => {
+    setPlayerMoney(TERMINAL.price * 3)
+    store().build(TULA, 'терминал')
+
+    const afterFirst = game()
+    store().build(TULA, 'терминал')
+
+    /*
+     * Потолок пропускной способности узла обязан быть КОНЕЧНЫМ. Разреши второй
+     * терминал — и посты снова покупаются деньгами линейно, ровно как раньше
+     * покупался десятый грузовик, а срез затевался затем, чтобы у сети появился
+     * предел. Упершись в него, игрок обязан менять СЕТЬ, а не докупать бетон.
+     */
+    expect(game()).toBe(afterFirst)
+    expect(Object.keys(yards())).toHaveLength(1)
+    expect(player().money).toBe(TERMINAL.price * 2)
+  })
+
+  it('разные типы в одном городе разрешены', () => {
+    setPlayerMoney(TERMINAL.price + BUILDING_SPEC['склад'].price)
+    store().build(TULA, 'терминал')
+    store().build(TULA, 'склад')
+
+    // Терминал плюс склад — осмысленная ступень к хабу: дешевле, слабее и
+    // доступно раньше.
+    expect(Object.keys(yards())).toHaveLength(2)
+    expect(postsAt(game(), TULA, game().playerId)).toBe(
+      BASE_POSTS + TERMINAL.posts + BUILDING_SPEC['склад'].posts,
+    )
+  })
+
+  it('в несуществующем городе не строится', () => {
+    setPlayerMoney(TERMINAL.price * 2)
+    const before = game()
+
+    store().build('нет-такого' as CityId, 'терминал')
+
+    // Иначе содержание списывалось бы за узел, которого нет на карте.
+    expect(game()).toBe(before)
+  })
+
+  it('снос убирает постройку и не возвращает денег', () => {
+    setPlayerMoney(TERMINAL.price)
+    store().build(TULA, 'терминал')
+    const id = Object.keys(yards())[0] as BuildingId
+
+    store().demolish(id)
+
+    expect(yards()[id]).toBeUndefined()
+    // Возврат хотя бы части цены превратил бы постройку в бесплатную примерку:
+    // поставил, посмотрел на очередь, снёс. Смысл сноса — перестать платить
+    // содержание, и этого достаточно.
+    expect(player().money).toBe(0)
+    expect(postsAt(game(), TULA, game().playerId)).toBe(BASE_POSTS)
+  })
+
+  it('снести несуществующую — ничего не происходит', () => {
+    const before = game()
+    store().demolish('нет-такой' as BuildingId)
+    expect(game()).toBe(before)
+  })
+
+  it('чужую постройку игрок не сносит', () => {
+    setPlayerMoney(TERMINAL.price)
+    store().build(TULA, 'терминал')
+    const id = Object.keys(yards())[0] as BuildingId
+
+    // Переписываем постройку конкуренту, оставив идентификатор прежним.
+    const rival = companyId('rival')
+    useGameStore.setState((current) => {
+      const owner = current.state.companies[current.state.playerId]
+      const moved = owner.buildings[id]
+      return {
+        state: {
+          ...current.state,
+          companies: {
+            ...current.state.companies,
+            [current.state.playerId]: { ...owner, buildings: {} },
+            [rival]: { ...owner, id: rival, buildings: { [id]: moved } },
+          },
+        },
+      }
+    })
+
+    const before = game()
+    store().demolish(id)
+
+    // Симуляция снесла бы и её — этой команды законно требует и конкурент, —
+    // поэтому фильтр владельца стоит в сторе.
+    expect(game()).toBe(before)
+    expect(game().companies[rival].buildings[id]).toBeDefined()
+  })
+
+  it('строительство не мутирует прежний снимок', () => {
+    setPlayerMoney(TERMINAL.price * 2)
+    const before = game()
+    const snapshot = JSON.stringify(before)
+
+    store().build(TULA, 'терминал')
+    const id = Object.keys(yards())[0] as BuildingId
+    store().demolish(id)
+
+    // Снимок, который держит рендер для интерполяции, обязан пережить правку:
+    // иначе «предыдущий кадр» поедет вместе с текущим.
+    expect(JSON.stringify(before)).toBe(snapshot)
+    expect(game()).not.toBe(before)
+  })
+})

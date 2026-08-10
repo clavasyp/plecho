@@ -15,6 +15,10 @@
 
 import { create } from 'zustand'
 import { TRAILER_PRICE, VEHICLE_CLASS_BY_ID } from '../data/vehicles'
+import {
+  buildBuilding as simBuildBuilding,
+  demolishBuilding as simDemolishBuilding,
+} from '../sim/economy/buildings'
 import { hireDriver as simHireDriver } from '../sim/logistics/driver'
 import { setRoute } from '../sim/logistics/vehicle'
 import {
@@ -26,6 +30,8 @@ import { tick } from '../sim/tick'
 import { dateFromTick } from '../sim/time'
 import { lineId as toLineId, vehicleId as toVehicleId } from '../sim/types'
 import type {
+  BuildingId,
+  BuildingType,
   CityId,
   Company,
   Driver,
@@ -126,6 +132,30 @@ export type GameStore = {
   /** Уволить водителя. Его машина остаётся в парке и встаёт без водителя. */
   fireDriver: (driverId: DriverId) => void
 
+  /**
+   * Построить терминал, склад или хаб в городе.
+   *
+   * ЕДИНСТВЕННОЕ ДЕЙСТВИЕ СРЕЗА 5, И ОНО ЖЕ ПЕРВЫЙ В ИГРЕ РАСХОД, КОТОРЫЙ НЕ
+   * КОНЧАЕТСЯ. Машину можно продать, водителя уволить, а постройка платит
+   * содержание каждые сутки до самого сноса. Поэтому её и стоит строить только
+   * туда, где машины реально стоят в очереди: терминал в тихом городе тихо
+   * съедает прибыль, и это не наказание, а суть решения.
+   *
+   * Нет денег, город неизвестен, такая постройка уже стоит — ничего не
+   * происходит. Молчаливый отказ здесь по тому же доводу, что и у покупки
+   * машины: кнопка в интерфейсе недоступна по тем же условиям, и до сюда
+   * доходит только гонка между кликом и уходящими на топливо деньгами.
+   */
+  build: (cityId: CityId, type: BuildingType) => void
+
+  /**
+   * Снести постройку. Груз, лежащий на её складе, пропадает.
+   *
+   * Своя, а не любая: чужие терминалы игроку не подчиняются. Проверка владельца
+   * стоит здесь, а не в симуляции, — там снос законно требуется и конкуренту.
+   */
+  demolish: (buildingId: BuildingId) => void
+
   /** Провести плановое ТО за деньги: обнулить счётчик пробега до обслуживания. */
   serviceVehicle: (vehicleId: VehicleId) => void
 
@@ -153,8 +183,23 @@ export const useGameStore = create<GameStore>((set, get) => ({
   dispatchTo: (destination) =>
     set((store) => {
       const state = store.state
+      /*
+       * Машина под погрузкой и машина в очереди на пост не отправляются никуда,
+       * и это то же правило, по которому их не трогает диспетчеризация линий
+       * (logistics/line.ts). Без него кнопка «отправить» становится способом
+       * ОБОЙТИ пропускную способность: нажал — и машина уехала порожней прямо
+       * из-под рампы, не отстояв своё и никого не пропустив вперёд. Срез 5
+       * отменялся бы одним кликом.
+       *
+       * Такая машина в поиске просто пропускается, а не блокирует команду
+       * целиком: свободная машина в парке, если она есть, поедет.
+       */
       const vehicle = Object.values(state.vehicles).find(
-        (v) => v.ownerId === state.playerId && v.lineId === null,
+        (v) =>
+          v.ownerId === state.playerId &&
+          v.lineId === null &&
+          v.serviceTicksLeft === 0 &&
+          v.queuedTicks === 0,
       )
       if (vehicle === undefined) return store
 
@@ -511,6 +556,34 @@ export const useGameStore = create<GameStore>((set, get) => ({
         ...owner,
         drivers,
       }))
+    }),
+
+  build: (cityId, type) =>
+    set((store) => {
+      const state = store.state
+      /*
+       * Цена, лимит «одна постройка каждого типа на город» и списание денег
+       * живут в sim/economy/buildings.ts и повторять их здесь нельзя: вторая
+       * копия прейскуранта разошлась бы с первой ровно так же, как когда-то
+       * разъехались две формулы скорости. Стор отвечает за одно — что строит
+       * ИГРОК и за свой счёт.
+       */
+      const next = simBuildBuilding(state, state.playerId, cityId, type)
+      // Сделка не состоялась (нет денег, место занято, города нет) — не будим
+      // подписчиков впустую.
+      return next === state ? store : { ...store, state: next }
+    }),
+
+  demolish: (buildingId) =>
+    set((store) => {
+      const state = store.state
+      const player = state.companies[state.playerId]
+      // Постройка не своя или её нет вовсе. Симуляция снесла бы и чужую — ей
+      // этой команды законно требует и конкурент, — поэтому фильтр стоит тут.
+      if (player?.buildings?.[buildingId] === undefined) return store
+
+      const next = simDemolishBuilding(state, buildingId)
+      return next === state ? store : { ...store, state: next }
     }),
 
   serviceVehicle: (vehicleId) =>

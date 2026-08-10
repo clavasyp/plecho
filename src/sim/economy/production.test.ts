@@ -65,6 +65,8 @@ function makeState(...industries: Industry[]): GameState {
         controller: 'человек',
         lines: {},
         drivers: {},
+        // Ни одной постройки: поле обязательно с среза 5 (Company в sim/types.ts).
+        buildings: {},
         dailyRevenue: 0,
         dailyCosts: 0,
         bankrupt: false,

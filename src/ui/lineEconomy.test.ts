@@ -11,6 +11,11 @@
  */
 
 import { describe, expect, it } from 'vitest'
+import { STARTER_CLASS } from '../sim/state'
+
+/** Тариф стартового класса: тесты писались под ЗИЛ, и он им и остаётся. */
+const TARIFF = STARTER_CLASS.tariffPerTonKm
+const HANDLING = STARTER_CLASS.handlingPerTon
 
 import { EDGES_BY_ID } from '../data/roads'
 import { DRIVER_WAGE_PER_DAY } from '../data/operating'
@@ -128,7 +133,7 @@ describe('planLoop', () => {
 
     // Выручка ровно за одно гружёное плечо при полном кузове.
     expect(plan.revenue).toBeCloseTo(
-      deliveryRevenue('мука', STARTER_CAPACITY_TONS, MOSCOW_TULA_KM),
+      deliveryRevenue('мука', STARTER_CAPACITY_TONS, MOSCOW_TULA_KM, TARIFF, HANDLING),
       6,
     )
     expect(plan.costs).toBeCloseTo(loopCosts(MOSCOW_TULA_KM * 2), 6)
@@ -156,7 +161,7 @@ describe('planLoop', () => {
     expect(bothWays.emptyShare).toBeCloseTo(0, 6)
 
     expect(bothWays.profit - oneWay.profit).toBeCloseTo(
-      deliveryRevenue('зерно', STARTER_CAPACITY_TONS, MOSCOW_TULA_KM),
+      deliveryRevenue('зерно', STARTER_CAPACITY_TONS, MOSCOW_TULA_KM, TARIFF, HANDLING),
       6,
     )
   })
@@ -180,7 +185,7 @@ describe('planLoop', () => {
     )
 
     expect(plan.revenue).toBeCloseTo(
-      deliveryRevenue('зерно', STARTER_CAPACITY_TONS, MOSCOW_TULA_KM),
+      deliveryRevenue('зерно', STARTER_CAPACITY_TONS, MOSCOW_TULA_KM, TARIFF, HANDLING),
       6,
     )
     expect(plan.emptyKm).toBeCloseTo(MOSCOW_TULA_KM, 6)

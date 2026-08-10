@@ -131,6 +131,10 @@ function makeZil(at: CityId, patch: Partial<Vehicle> = {}): Vehicle {
     lineId: null,
     stopIndex: 0,
     blockedTicks: 0,
+    // Счётчики обслуживания: машина свободна, поста под ней нет и в очереди
+    // она не стоит. Оба поля обязательны с среза 5 (Vehicle в sim/types.ts).
+    serviceTicksLeft: 0,
+    queuedTicks: 0,
     classId: STARTER_CLASS_ID,
     trailer: STARTER_TRAILER,
     // За рулём есть кто-то: машина без водителя не едет вовсе, и фикстура без
@@ -188,6 +192,8 @@ function makeCompany(id: CompanyId, patch: Partial<Company> = {}): Company {
     controller: 'человек',
     lines: {},
     drivers: { [D1]: makeDriver(id) },
+    // Ни одной постройки: поле обязательно с среза 5 (Company в sim/types.ts).
+    buildings: {},
     dailyRevenue: 0,
     dailyCosts: 0,
     bankrupt: false,
@@ -274,6 +280,10 @@ function driveLeg(state: GameState, to: CityId): { state: GameState; ticks: numb
 
   return { state: next, ticks }
 }
+
+/** Тариф стартового класса: тесты писались под ЗИЛ, и он им и остаётся. */
+const TARIFF = STARTER_CLASS.tariffPerTonKm
+const HANDLING = STARTER_CLASS.handlingPerTon
 
 describe('пробег тика', () => {
   it('машина на ребре платит за километры этого тика, а не за одометр', () => {
@@ -568,7 +578,7 @@ describe('смысл игры в деньгах', () => {
       ticks: there.ticks + back.ticks,
       km: truck(back.state).odometer,
       // Ставка за зерно на этом плече — столько приносит ГРУЖЁНОЕ плечо.
-      legRevenue: deliveryRevenue('зерно', STARTER_CAPACITY_TONS, LEG_KM),
+      legRevenue: deliveryRevenue('зерно', STARTER_CAPACITY_TONS, LEG_KM, TARIFF, HANDLING),
     }
   }
 

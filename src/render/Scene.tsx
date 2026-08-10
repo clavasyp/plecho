@@ -42,6 +42,7 @@ import { BlendFunction, ToneMappingMode } from 'postprocessing'
 import { useGameStore } from '../app/store'
 import type { CityId } from '../sim/types'
 import { fogRange, lighting, palette, postFx } from './palette'
+import { Buildings, ServicePosts } from './BuildingMesh'
 import { Cities, cityPoint } from './CityMesh'
 import { CityPicker } from './CityPicker'
 import { Industries } from './IndustryMesh'
@@ -415,6 +416,25 @@ export function Scene(): JSX.Element {
       <Lines />
       <Cities />
       <Industries />
+
+      {/*
+        Инфраструктура среза 5. Стоит между промышленностью и машинами намеренно
+        и по двум разным причинам.
+
+        ПОСТРОЙКИ ИГРОКА — после промышленности, потому что это тот же слой мира,
+        застройка у дороги, и порядок здесь ни на что не влияет, кроме порядка
+        чтения файла: сначала то, что мир поставил сам, потом то, что построил
+        игрок.
+
+        РАМПЫ И ОЧЕРЕДЬ — перед машинами, и вот это уже существенно. Хвост из
+        ждущих машин у рампы отвечает на вопрос «почему сеть стоит», а
+        светящаяся кабина на дороге — на вопрос «что едет»; второе обязано
+        рисоваться поверх первого, потому что едущая машина — главный объект
+        карты, и никакая диагностика не должна её закрывать.
+      */}
+      <Buildings />
+      <ServicePosts />
+
       <Vehicles />
       <CityPicker />
 
