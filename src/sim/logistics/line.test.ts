@@ -189,6 +189,12 @@ function makeCompany(lines: Line[]): Company {
     // Ни одной постройки: в этом городе у компании ровно базовый пост, и
     // диспетчеризацию это не касается вовсе — постами занята фаза обслуживания.
     buildings: {},
+    // Поля среза 6 (характер, очередь команд, лента рассуждений)
+    // достраиваются пустыми: этой фазе они не нужны, но без них
+    // фикстура не собирается (Company в sim/types.ts).
+    personality: null,
+    pendingCommands: [],
+    thinking: [],
     dailyRevenue: 0,
     dailyCosts: 0,
     bankrupt: false,

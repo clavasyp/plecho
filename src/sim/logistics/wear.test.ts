@@ -197,6 +197,12 @@ function makeCompany(patch: Partial<Company> = {}): Company {
     drivers: { [D1]: makeDriver() },
     // Ни одной постройки: поле обязательно с среза 5 (Company в sim/types.ts).
     buildings: {},
+    // Поля среза 6 (характер, очередь команд, лента рассуждений)
+    // достраиваются пустыми: этой фазе они не нужны, но без них
+    // фикстура не собирается (Company в sim/types.ts).
+    personality: null,
+    pendingCommands: [],
+    thinking: [],
     dailyRevenue: 0,
     dailyCosts: 0,
     bankrupt: false,

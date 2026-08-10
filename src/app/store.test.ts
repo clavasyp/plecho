@@ -3,6 +3,7 @@ import { BASE_POSTS, BUILDING_SPEC } from '../data/infrastructure'
 import { TRAILER_PRICE, VEHICLE_CLASS_BY_ID } from '../data/vehicles'
 import { postsAt } from '../sim/logistics/service'
 import {
+  COMPETITORS,
   createInitialState,
   HOME_CITY,
   STARTER_CLASS,
@@ -11,10 +12,11 @@ import {
   STARTER_TRAILER,
   STARTER_VEHICLE_ID,
 } from '../sim/state'
-import { cityId, companyId } from '../sim/types'
+import { TICKS_PER_DAY, cityId, companyId } from '../sim/types'
 import type {
   BuildingId,
   CityId,
+  Command,
   DriverId,
   GameState,
   Stop,
@@ -58,11 +60,23 @@ const drivers = () => player().drivers
 /** Цена стартового класса — та, что и списывается при его покупке. */
 const ZIL_PRICE = STARTER_CLASS.price
 
+/**
+ * Парк ИГРОКА, а не весь мир.
+ *
+ * С среза 6 в состоянии живут ещё три конкурента, и у каждого свой грузовик у
+ * ворот (COMPETITORS в sim/state.ts). Считать «сколько машин в игре» после этого
+ * бессмысленно: проверки стора говорят о том, что купил или потерял ИГРОК, а
+ * чужой парк к этому отношения не имеет.
+ */
+function fleet(): VehicleId[] {
+  return (Object.keys(game().vehicles) as VehicleId[]).filter(
+    (id) => game().vehicles[id].ownerId === game().playerId,
+  )
+}
+
 /** Идентификатор единственной купленной машины. */
 function boughtId(): VehicleId {
-  const ids = (Object.keys(game().vehicles) as VehicleId[]).filter(
-    (id) => id !== STARTER_VEHICLE_ID,
-  )
+  const ids = fleet().filter((id) => id !== STARTER_VEHICLE_ID)
   expect(ids).toHaveLength(1)
   return ids[0]
 }
@@ -284,7 +298,7 @@ describe('buyVehicle', () => {
     store().buyVehicle('tractor')
 
     expect(game()).toBe(before)
-    expect(Object.keys(game().vehicles)).toHaveLength(1)
+    expect(fleet()).toHaveLength(1)
   })
 
   it('списывает цену и ставит новую машину в домашнем городе', () => {
@@ -326,7 +340,7 @@ describe('buyVehicle', () => {
     setMoney(ZIL_PRICE)
     store().buyVehicle(STARTER_CLASS_ID)
     expect(player().money).toBe(0)
-    expect(Object.keys(game().vehicles)).toHaveLength(2)
+    expect(fleet()).toHaveLength(2)
   })
 
   it('рубля не хватает — покупки нет', () => {
@@ -335,7 +349,7 @@ describe('buyVehicle', () => {
     // Покупка в кредит — механика более позднего среза, а не «ну ладно, уйдём
     // в минус».
     expect(player().money).toBe(ZIL_PRICE - 1)
-    expect(Object.keys(game().vehicles)).toHaveLength(1)
+    expect(fleet()).toHaveLength(1)
   })
 
   it('цена берётся у класса, а не общая на весь парк', () => {
@@ -375,7 +389,7 @@ describe('buyVehicle', () => {
     store().buyVehicle(STARTER_CLASS_ID)
     store().buyVehicle(STARTER_CLASS_ID)
 
-    const ids = Object.keys(game().vehicles)
+    const ids = fleet()
     expect(new Set(ids).size).toBe(ids.length)
     expect(ids).toHaveLength(4)
   })
@@ -841,5 +855,120 @@ describe('build и demolish', () => {
     // иначе «предыдущий кадр» поедет вместе с текущим.
     expect(JSON.stringify(before)).toBe(snapshot)
     expect(game()).not.toBe(before)
+  })
+})
+
+// ─── Асинхронный адаптер ───────────────────────────────────────────────────
+
+describe('deliverPlan и setController: дверь из сети в состояние', () => {
+  /*
+   * ТОЧКА, РАДИ КОТОРОЙ ВЕСЬ СРЕЗ И ЗАТЕВАЛСЯ. Ответ языковой модели приходит
+   * асинхронно и не попадает в тик: он ложится в СОСТОЯНИЕ — в очередь команд
+   * компании, — а разбирает его первая фаза ближайшего тика как обычные данные.
+   * Проверяется здесь именно граница: что кладётся, кому и что при этом
+   * отвергается. Сами команды проверяет sim/ai/commands.ts, их эту дверь не
+   * касается.
+   */
+  const RIVAL = COMPETITORS[0].id
+  const rival = () => game().companies[RIVAL]
+
+  const plan = (commands: Command[], thought: string, fromModel = true) => ({
+    commands,
+    thought,
+    fromModel,
+  })
+
+  it('кладёт команды в очередь и мысль в ленту одним действием', () => {
+    store().deliverPlan(RIVAL, plan([{ kind: 'нанять-водителя' }], 'Беру человека.'))
+
+    expect(rival().pendingCommands).toEqual([{ kind: 'нанять-водителя' }])
+
+    const feed = rival().thinking
+    expect(feed).toHaveLength(1)
+    expect(feed[0].text).toBe('Беру человека.')
+    // Происхождение обязано быть честным: тихая подмена модели скриптом
+    // обесценила бы ленту рассуждений целиком.
+    expect(feed[0].fromModel).toBe(true)
+    expect(feed[0].tick).toBe(game().tick)
+  })
+
+  it('положенное разбирается ближайшим тиком, а не копится', () => {
+    const before = Object.keys(rival().drivers).length
+    store().deliverPlan(RIVAL, plan([{ kind: 'нанять-водителя' }], 'Беру человека.'))
+
+    store().advance(1)
+
+    expect(Object.keys(rival().drivers).length).toBe(before + 1)
+    expect(rival().pendingCommands).toEqual([])
+  })
+
+  it('второй ответ не затирает первый', () => {
+    store().deliverPlan(RIVAL, plan([{ kind: 'нанять-водителя' }], 'Раз.'))
+    store().deliverPlan(RIVAL, plan([{ kind: 'нанять-водителя' }], 'Два.'))
+
+    // Два ответа между двумя тиками — это два решения одной компании, и молча
+    // потерять первое нельзя.
+    expect(rival().pendingCommands).toHaveLength(2)
+    expect(rival().thinking.map((t) => t.text)).toEqual(['Раз.', 'Два.'])
+  })
+
+  it('за игрока план не принимается никогда', () => {
+    const before = game()
+    store().deliverPlan(game().playerId, plan([{ kind: 'нанять-водителя' }], 'Я сам.'))
+
+    // Игрок — это тот, кто решает сам. Разберись он потом, почему грузовик
+    // уехал без его ведома, ему было бы нечем.
+    expect(game()).toBe(before)
+    expect(player().pendingCommands).toEqual([])
+    expect(player().thinking).toEqual([])
+  })
+
+  it('несуществующей компании и пустому плану дверь не открывается', () => {
+    const before = game()
+    store().deliverPlan(companyId('никого'), plan([{ kind: 'нанять-водителя' }], 'Ау.'))
+    expect(game()).toBe(before)
+
+    // Пустой план с пустой мыслью — не событие: будить подписчиков нечем.
+    store().deliverPlan(RIVAL, plan([], ''))
+    expect(game()).toBe(before)
+  })
+
+  it('setController передаёт компанию модели и возвращает скрипту', () => {
+    expect(rival().controller).toBe('скрипт')
+
+    store().setController(RIVAL, 'модель')
+    expect(rival().controller).toBe('модель')
+
+    // Повторный перевод в то же состояние — не событие.
+    const settled = game()
+    store().setController(RIVAL, 'модель')
+    expect(game()).toBe(settled)
+
+    store().setController(RIVAL, 'скрипт')
+    expect(rival().controller).toBe('скрипт')
+  })
+
+  it('компания под моделью перестаёт слушать скриптовую фазу решений', () => {
+    store().setController(RIVAL, 'модель')
+
+    // Ровно игровые сутки: столько между двумя решениями скрипта (isDecisionTick
+    // в sim/tick.ts). Компания, взятая моделью, за эти сутки не должна получить
+    // ни одной мысли — иначе у неё два хозяина и две стратегии разом.
+    store().advance(TICKS_PER_DAY)
+
+    expect(rival().thinking).toEqual([])
+    expect(rival().pendingCommands).toEqual([])
+    // А у соседа со скриптом мысль появилась — значит фаза решений работала, и
+    // проверка выше не холостая.
+    expect(game().companies[COMPETITORS[1].id].thinking.length).toBeGreaterThan(0)
+  })
+
+  it('игрока модели не отдать', () => {
+    const before = game()
+    store().setController(game().playerId, 'модель')
+
+    // 'человек' — не одна из стратегий, а отсутствие автомата за спиной.
+    expect(game()).toBe(before)
+    expect(player().controller).toBe('человек')
   })
 })

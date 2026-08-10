@@ -46,13 +46,47 @@
  * телами сцены. Замок цел — тёплое по-прежнему означает «сюда смотри», и теперь
  * это работает для линии, с которой игрок прямо сейчас работает.
  *
- * ЧУЖИЕ ЛИНИИ НЕ РИСУЮТСЯ ВОВСЕ. Сеть конкурента — это его коммерческая тайна и
- * содержание разведки среза 5, а не бесплатная подсказка на общей карте.
+ * ─── ЧТО ИЗМЕНИЛ СРЕЗ 6: ЧУЖИЕ КОЛЬЦА ПОЯВИЛИСЬ НА КАРТЕ ────────────────────
  *
- * ГЕОМЕТРИЯ. Все невыбранные линии сливаются в ОДИН буфер вершин, выбранная — во
- * второй: два вызова отрисовки на любое число линий. Инстансинг здесь не
- * подходит — у штрихов разная длина и разная ширина концов, то есть разная
- * форма, а не разное положение одной формы.
+ * До этого среза здесь было записано обратное: «чужие линии не рисуются вовсе,
+ * сеть конкурента — его коммерческая тайна». Решение отменено сознательно, и вот
+ * чем.
+ *
+ * ПЕРВОЕ — ИГРОВОЕ. Пока конкурентов не было, скрывать было нечего. Теперь их
+ * трое, и у каждого свой характер: агрессивный ЛЕЗЕТ В ТВОИ НАПРАВЛЕНИЯ,
+ * осторожный сидит на своих, нишевый забирает один груз (types.ts,
+ * CompetitorPersonality). Против разных характеров нужны разные ответы — в этом
+ * весь замысел, — но ответить нельзя на то, чего не видно. Невидимый соперник
+ * читается не как соперник, а как необъяснимый шум в экономике: груз со склада
+ * кто-то забрал, ставка просела, а причины на карте нет.
+ *
+ * ВТОРОЕ — ЧЕСТНОСТЬ ФИКЦИИ. Регулярный маршрут по дорогам общего пользования
+ * тайной не является: чужая фура, каждый день идущая через тот же перекрёсток,
+ * видна любому, кто там стоит. Тайна — это ЧТО она везёт и сколько на этом
+ * зарабатывает, и вот как раз этого чужое кольцо не показывает: ни груза
+ * остановок, ни направления обхода, ни выделения. Только след — где он ездит.
+ *
+ * ЧЕМ ЧУЖОЕ ОТЛИЧАЕТСЯ ОТ СВОЕГО. Опять не цветом (акцент один и он у игрока), а
+ * ТРЕМЯ независимыми геометрическими признаками сразу — по той же причине, по
+ * которой у выбранной линии их три: на общем плане кольцо занимает считаные
+ * пиксели, и одного признака там не хватает.
+ *
+ *   МЕСТО. Свои линии идут ПО дороге, в пучке вокруг её оси. Чужие вынесены ЗА
+ *   пучок, на обочину, и на полотно не заезжают. «Своё в середине, чужое сбоку» —
+ *   это читается мгновенно и не требует ни легенды, ни сравнения.
+ *
+ *   ВЕС. Чужая лента вдвое тоньше своей.
+ *
+ *   РИТМ И ТОН. Чужой штрих короткий, частый и БЕЗ КЛИНА — то есть без указания
+ *   направления, которого игрок и не должен получать даром, — а тон взят
+ *   тусклее: приглушённая застройка вместо приглушённого текста. Своё ярче
+ *   чужого впятеро по относительной яркости, чужое ярче рельефа втрое. Порядок
+ *   внимания получается ровно тот, что нужен: своё → чужое → фон.
+ *
+ * ГЕОМЕТРИЯ. Все невыбранные свои линии сливаются в ОДИН буфер вершин, выбранная
+ * — во второй, все чужие — в третий: три вызова отрисовки на любое число линий и
+ * любое число контор. Инстансинг здесь не подходит — у штрихов разная длина и
+ * разная ширина концов, то есть разная форма, а не разное положение одной формы.
  */
 
 import { useMemo } from 'react'
@@ -60,11 +94,20 @@ import type { JSX } from 'react'
 import { useShallow } from 'zustand/shallow'
 
 import { useGameStore } from '../app/store'
+import type { GameStore } from '../app/store'
 import { ringOrder } from '../ui/lineEconomy'
 import { useLineSelection } from '../ui/lineSelection'
 import { MIN_LINE_STOPS } from '../sim/logistics/line'
 import { STARTER_CRUISE_KMH } from '../sim/state'
-import type { City, CityId, Edge, EdgeId, Line, LineId } from '../sim/types'
+import type {
+  City,
+  CityId,
+  CompanyId,
+  Edge,
+  EdgeId,
+  Line,
+  LineId,
+} from '../sim/types'
 import type { RoadGraph } from '../sim/world/graph'
 import { buildGraph } from '../sim/world/graph'
 import { findRoute } from '../sim/world/pathfind'
@@ -120,6 +163,58 @@ const DASH_TAIL_SCALE = 0.34
 const LINE_HALF_KM = 0.85
 const SELECTED_HALF_KM = 1.6
 
+// ─── Чужие кольца ──────────────────────────────────────────────────────────
+
+/**
+ * Где проходит первая чужая полоса, км от оси дороги.
+ *
+ * Число ВЫВЕДЕНО, а не подобрано. Свой пучок занимает полосы −1.5…+1.5, и с
+ * учётом полуширины ленты его внешний край лежит на 2.35. Половина федерального
+ * полотна — 1.7 (RoadMesh). Значит любая величина от 2.4 уводит чужую ленту и за
+ * свой пучок, и за асфальт одновременно; 3.4 — это ровно ширина федеральной
+ * дороги от её оси, то есть чужой след идёт по обочине на расстоянии, которое
+ * глаз меряет об саму дорогу, а не об пустоту.
+ */
+const RIVAL_LANE_KM = 3.4
+
+/** Расстояние между соседними чужими полосами. */
+const RIVAL_LANE_STEP_KM = 1.2
+
+/**
+ * Сколько чужих полос с каждой стороны, дальше рисунок повторяется.
+ *
+ * Три — то же число, что и у своих полос, и предел здесь тот же по смыслу: пучок
+ * из четырёх с лишним полос перестаёт держаться за дорогу и читается как
+ * самостоятельная трасса рядом с ней. Двух сторон по три полосы хватает на шесть
+ * различимых чужих колец; седьмое ляжет на первую полосу, и это записано здесь,
+ * а не выясняется на карте.
+ */
+const RIVAL_LANE_COUNT = 3
+
+/** Полуширина чужой ленты — вдвое тоньше своей. */
+const RIVAL_HALF_KM = LINE_HALF_KM / 2
+
+/**
+ * Ритм чужого штриха: чаще и короче своего.
+ *
+ * Свой штрих сопоставим с длиной машины (8.5 при периоде 15) и читается как
+ * «путь машины». Чужой втрое короче при вдвое меньшем периоде — это уже не путь,
+ * а ПУНКТИР, след на обочине. Разница ритма видна даже там, где обе ленты попали
+ * в один пиксель по толщине.
+ */
+const RIVAL_DASH_PERIOD_KM = 7.5
+const RIVAL_DASH_LENGTH_KM = 2.8
+
+/**
+ * Клина у чужого штриха нет: хвост равен голове.
+ *
+ * Клин у своих линий означает направление обхода кольца — а это ровно то знание,
+ * которое из окна машины не добывается и даром доставаться не должно. Заодно
+ * освобождается ещё один канал различия: прямоугольный штрих против клиновидного
+ * виден и там, где тон уже неразличим.
+ */
+const RIVAL_TAIL_SCALE = 1
+
 /** Порог, ниже которого отрезок считается вырожденным. */
 const EPSILON_KM = 1e-6
 
@@ -145,6 +240,15 @@ type Ring = {
   offsetKm: number
   /** Сдвиг штриховки вдоль кольца, км. */
   phaseKm: number
+  /**
+   * Кольцо игрока, а не конкурента.
+   *
+   * Флаг, а не идентификатор компании: всё, что решает рисование, — «моё или не
+   * моё». Кому именно принадлежит чужое кольцо, карта не сообщает намеренно
+   * (разбор — в шапке файла), и знай об этом геометрия, соблазн развести конторы
+   * по оттенкам появился бы сам собой.
+   */
+  own: boolean
 }
 
 /**
@@ -239,6 +343,27 @@ type RibbonStyle = {
   elevation: number
   /** Сплошная лента вместо штриховой — вид выбранной линии. */
   solid: boolean
+  /** Период штриховки и длина штриха, км. У сплошной не спрашиваются. */
+  periodKm: number
+  dashKm: number
+  /** Во сколько раз хвост штриха уже головы. Единица — штрих без клина. */
+  tailScale: number
+}
+
+/** Вид своей невыбранной линии: клиновидный штрих в пучке вокруг оси дороги. */
+const OWN_STYLE: Omit<RibbonStyle, 'elevation' | 'solid'> = {
+  halfWidthKm: LINE_HALF_KM,
+  periodKm: DASH_PERIOD_KM,
+  dashKm: DASH_LENGTH_KM,
+  tailScale: DASH_TAIL_SCALE,
+}
+
+/** Вид чужой линии: тонкий частый пунктир без клина. Разбор — в шапке файла. */
+const RIVAL_STYLE: Omit<RibbonStyle, 'elevation' | 'solid'> = {
+  halfWidthKm: RIVAL_HALF_KM,
+  periodKm: RIVAL_DASH_PERIOD_KM,
+  dashKm: RIVAL_DASH_LENGTH_KM,
+  tailScale: RIVAL_TAIL_SCALE,
 }
 
 /**
@@ -307,20 +432,20 @@ function pushRibbon(out: number[], ring: Ring, style: RibbonStyle): void {
 
     /** Полуширина клина на доле пути от начала штриха. */
     const taper = (share: number): number =>
-      half * (DASH_TAIL_SCALE + (1 - DASH_TAIL_SCALE) * share)
+      half * (style.tailScale + (1 - style.tailScale) * share)
 
     // Штрихи стоят в точках m·период − фаза по ГЛОБАЛЬНОМУ пути вдоль кольца.
     // Начинаем с округления вниз, а не вверх: штрих, начавшийся на предыдущем
     // отрезке, обязан заехать на этот, иначе на каждом стыке появится дырка.
     const segmentEnd = traveled + length
-    let m = Math.floor((traveled + ring.phaseKm) / DASH_PERIOD_KM)
+    let m = Math.floor((traveled + ring.phaseKm) / style.periodKm)
 
     for (;;) {
-      const dashStart = m * DASH_PERIOD_KM - ring.phaseKm
+      const dashStart = m * style.periodKm - ring.phaseKm
       if (dashStart >= segmentEnd) break
       m++
 
-      const dashEnd = dashStart + DASH_LENGTH_KM
+      const dashEnd = dashStart + style.dashKm
       if (dashEnd <= traveled) continue
 
       const from = Math.max(dashStart, traveled)
@@ -332,8 +457,8 @@ function pushRibbon(out: number[], ring: Ring, style: RibbonStyle): void {
       emit(
         from - traveled,
         to - traveled,
-        taper((from - dashStart) / DASH_LENGTH_KM),
-        taper((to - dashStart) / DASH_LENGTH_KM),
+        taper((from - dashStart) / style.dashKm),
+        taper((to - dashStart) / style.dashKm),
       )
     }
 
@@ -343,51 +468,146 @@ function pushRibbon(out: number[], ring: Ring, style: RibbonStyle): void {
 
 // ─── Компонент ─────────────────────────────────────────────────────────────
 
+/**
+ * Линии всех компаний: РОВНО ОДИН реестр на компанию, игрок строго первым.
+ *
+ * Список плоский, а владелец определяется ПОЛОЖЕНИЕМ — нулевой элемент всегда
+ * принадлежит игроку. Обёртка вида `{own, lines}` была бы честнее на вид и
+ * ломала бы всё: поверхностное сравнение подписки идёт по Object.is, а свежая
+ * обёртка не равна вчерашней ни при каких условиях, — то есть геометрия всей
+ * карты, вместе с поиском пути внутри неё, перестраивалась бы каждый тик. Здесь
+ * же в массиве лежат САМИ объекты `lines` из состояния, а они переживают тик по
+ * ссылке, пока линии не правили.
+ *
+ * Порядок при этом обязан быть явным ещё и по второй причине: полосы и фазы
+ * раздаются по порядку, и порядок ключей объекта companies годился бы ровно до
+ * первого банкротства — пропавшая контора сдвинула бы полосы у всех, кто стоял
+ * за ней, и чужая часть карты переехала бы за один тик.
+ */
+type LineSets = readonly Record<LineId, Line>[]
+
 /** Пустой реестр линий — чтобы селектор не отдавал новый объект каждый раз. */
 const NO_LINES: Record<LineId, Line> = {}
 
+/** Индекс игрока в списке реестров. Всё остальное — конкуренты. */
+const PLAYER_SET = 0
+
 function buildRings(
-  lines: Record<LineId, Line>,
+  sets: LineSets,
   cities: Record<CityId, City>,
   edges: Record<EdgeId, Edge>,
 ): Ring[] {
-  const ids = Object.keys(lines) as LineId[]
-  if (ids.length === 0) return []
+  if (sets.length === 0) return []
 
   const graph = buildGraph(edges)
   const rings: Ring[] = []
 
-  ids.forEach((id, order) => {
-    const line = lines[id]
-    // Недостроенная линия не кольцо и не работает (MIN_LINE_STOPS в
-    // logistics/line.ts). Рисовать её значит показать работающей ту, по которой
-    // ни одна машина не поедет.
-    if (line.stops.length < MIN_LINE_STOPS) return
+  /*
+   * Счётчики СВОИХ и ЧУЖИХ колец ведутся раздельно.
+   *
+   * Иначе первое чужое кольцо занимало бы полосу по общему счёту, и полосы своих
+   * линий зависели бы от того, сколько колец построил конкурент, — то есть
+   * собственная сеть игрока переезжала бы по карте от чужих решений. Свои полосы
+   * обязаны зависеть только от своих линий.
+   */
+  let ownOrder = 0
+  let rivalOrder = 0
 
-    const points: Point[] = []
-    for (const cityId of ringCities(graph, line)) {
-      const city = cities[cityId]
-      // Город исчез из мира — то же правило, что в RoadMesh: остальная карта
-      // важнее одного плеча.
-      if (city === undefined) continue
-      points.push(cityPoint(city))
+  sets.forEach((lines, setIndex) => {
+    const own = setIndex === PLAYER_SET
+
+    for (const id of Object.keys(lines) as LineId[]) {
+      const line = lines[id]
+      // Недостроенная линия не кольцо и не работает (MIN_LINE_STOPS в
+      // logistics/line.ts). Рисовать её значит показать работающей ту, по которой
+      // ни одна машина не поедет.
+      if (line.stops.length < MIN_LINE_STOPS) continue
+
+      const points: Point[] = []
+      for (const cityId of ringCities(graph, line)) {
+        const city = cities[cityId]
+        // Город исчез из мира — то же правило, что в RoadMesh: остальная карта
+        // важнее одного плеча.
+        if (city === undefined) continue
+        points.push(cityPoint(city))
+      }
+      if (points.length < 2) continue
+
+      rings.push(
+        own
+          ? ownRing(id, points, ownOrder++)
+          : rivalRing(id, points, rivalOrder++),
+      )
     }
-    if (points.length < 2) return
-
-    const slot = order % SLOT_COUNT
-    const phase = Math.floor(order / SLOT_COUNT) % PHASE_COUNT
-
-    rings.push({
-      id,
-      points,
-      // Полосы разложены симметрично относительно оси дороги: при одной линии
-      // на трассе она идёт ровно по её середине, а не съезжает в кювет.
-      offsetKm: (slot - (SLOT_COUNT - 1) / 2) * SLOT_STEP_KM,
-      phaseKm: (phase / PHASE_COUNT) * DASH_PERIOD_KM,
-    })
   })
 
   return rings
+}
+
+/** Своё кольцо: полоса внутри пучка вокруг оси дороги, фаза по второму кругу. */
+function ownRing(id: LineId, points: Point[], order: number): Ring {
+  const slot = order % SLOT_COUNT
+  const phase = Math.floor(order / SLOT_COUNT) % PHASE_COUNT
+
+  return {
+    id,
+    points,
+    own: true,
+    // Полосы разложены симметрично относительно оси дороги: при одной линии
+    // на трассе она идёт ровно по её середине, а не съезжает в кювет.
+    offsetKm: (slot - (SLOT_COUNT - 1) / 2) * SLOT_STEP_KM,
+    phaseKm: (phase / PHASE_COUNT) * DASH_PERIOD_KM,
+  }
+}
+
+/**
+ * Чужое кольцо: полоса ЗА пучком, поочерёдно с двух сторон дороги.
+ *
+ * Стороны чередуются, а не заполняются по порядку («сначала три справа, потом
+ * три слева»), по той же причине, по которой свои полосы разложены симметрично:
+ * два чужих кольца, оказавшихся на одной трассе, должны разойтись по РАЗНЫЕ
+ * стороны от неё, а не лечь рядом одной кучей — тогда их видно как два, а не как
+ * одну ленту потолще.
+ */
+function rivalRing(id: LineId, points: Point[], order: number): Ring {
+  const lane = Math.floor(order / 2) % RIVAL_LANE_COUNT
+  const side = order % 2 === 0 ? 1 : -1
+  const phase = Math.floor(order / (RIVAL_LANE_COUNT * 2)) % PHASE_COUNT
+
+  return {
+    id,
+    points,
+    own: false,
+    offsetKm: side * (RIVAL_LANE_KM + lane * RIVAL_LANE_STEP_KM),
+    phaseKm: (phase / PHASE_COUNT) * RIVAL_DASH_PERIOD_KM,
+  }
+}
+
+/**
+ * Реестры линий всех компаний одним плоским списком, игрок нулевым.
+ *
+ * ПОДПИСКА ПОВЕРХНОСТНАЯ, и держится она на одном свойстве состояния: реестр
+ * компаний пересобирается каждый тик (деньги-то меняются), но объект `lines`
+ * внутри компании при этом остаётся ПРЕЖНИМ по ссылке, пока линии не правили.
+ * Поэтому useShallow сравнивает ровно то, что нужно, и геометрия — а в ней живёт
+ * поиск пути — не перестраивается по несколько раз в секунду.
+ *
+ * Место игрока занимается БЕЗУСЛОВНО, даже когда компании игрока в состоянии
+ * почему-либо нет: иначе нулевым в списке оказался бы конкурент и получил бы
+ * вместе с местом чужой вид на карте.
+ */
+const selectLineSets = (store: GameStore): LineSets => {
+  const state = store.state
+  const sets: Record<LineId, Line>[] = [
+    state.companies[state.playerId]?.lines ?? NO_LINES,
+  ]
+
+  for (const id of Object.keys(state.companies) as CompanyId[]) {
+    if (id === state.playerId) continue
+    sets.push(state.companies[id].lines)
+  }
+
+  return sets
 }
 
 export function Lines(): JSX.Element | null {
@@ -399,28 +619,48 @@ export function Lines(): JSX.Element | null {
    */
   const cities = useGameStore(useShallow((store) => store.state.world.cities))
   const edges = useGameStore(useShallow((store) => store.state.world.edges))
-  const lines = useGameStore(
-    useShallow(
-      (store) =>
-        store.state.companies[store.state.playerId]?.lines ?? NO_LINES,
-    ),
-  )
+  const sets = useGameStore(useShallow(selectLineSets))
   const selected = useLineSelection((store) => store.line)
 
   // Разбор колец отделён от сборки буферов НАМЕРЕННО: здесь живёт поиск пути,
   // и он не должен запускаться заново от того, что игрок ткнул в другую линию.
   const rings = useMemo(
-    () => buildRings(lines, cities, edges),
-    [lines, cities, edges],
+    () => buildRings(sets, cities, edges),
+    [sets, cities, edges],
   )
 
   const buffers = useMemo(() => {
     const plain: number[] = []
     const highlighted: number[] = []
+    const rival: number[] = []
 
     for (const ring of rings) {
+      if (!ring.own) {
+        /*
+         * ЧУЖАЯ ЛЕНТА ЛЕЖИТ НА ТОЙ ЖЕ ВЫСОТЕ, ЧТО И СВОЯ НЕВЫБРАННАЯ, и своей
+         * ступени в render/layers.ts себе не заводит. Ступени там разводят
+         * слои, которые НАКЛАДЫВАЮТСЯ друг на друга (полотно под линией, линия
+         * под машиной); чужая же лента разведена со своей не по высоте, а вбок —
+         * она физически не может оказаться под своей, потому что идёт за
+         * пределами её пучка. Единственное место, где две ленты пересекаются
+         * копланарно, — перекрёсток двух РАЗНЫХ дорог, и там ровно та же
+         * ситуация, что у двух своих невыбранных линий сегодня: проект её
+         * терпит, а лечится она подъёмом выбранной линии, который уже сделан.
+         */
+        pushRibbon(rival, ring, {
+          ...RIVAL_STYLE,
+          elevation: layers.lineRoute,
+          solid: false,
+        })
+        continue
+      }
+
+      // Выделение принадлежит только своим кольцам. Проверка на own здесь не
+      // перестраховка: идентификаторы линий нумеруются внутри компании, и
+      // совпадение ключей у двух контор — вопрос времени, а не случайность.
       const chosen = ring.id === selected
       pushRibbon(chosen ? highlighted : plain, ring, {
+        ...OWN_STYLE,
         halfWidthKm: chosen ? SELECTED_HALF_KM : LINE_HALF_KM,
         elevation: chosen ? layers.lineSelected : layers.lineRoute,
         solid: chosen,
@@ -430,15 +670,43 @@ export function Lines(): JSX.Element | null {
     return {
       plain: new Float32Array(plain),
       highlighted: new Float32Array(highlighted),
+      rival: new Float32Array(rival),
     }
   }, [rings, selected])
 
-  if (buffers.plain.length === 0 && buffers.highlighted.length === 0) {
+  if (
+    buffers.plain.length === 0 &&
+    buffers.highlighted.length === 0 &&
+    buffers.rival.length === 0
+  ) {
     return null
   }
 
   return (
     <group>
+      {/*
+        ЧУЖИЕ КОЛЬЦА РИСУЮТСЯ ПЕРВЫМИ, до своих. Порядок узлов не решает,
+        что окажется сверху (это дело глубины), но он задаёт порядок ЧТЕНИЯ
+        файла, а читается он как «сначала фон, потом главное». Заодно при
+        одинаковой глубине на редком перекрёстке двух дорог верх достаётся
+        своей ленте, а не чужой, — и это именно то, что нужно.
+
+        Тон — приглушённая застройка, самый тёмный холодный из палитры после
+        рельефа. Он втрое светлее рельефа (чужой след виден на обочине) и впятеро
+        темнее своей линии (спорить за внимание ему нечем).
+      */}
+      {buffers.rival.length > 0 && (
+        <mesh frustumCulled={false}>
+          <bufferGeometry>
+            <bufferAttribute
+              attach="attributes-position"
+              args={[buffers.rival, 3]}
+            />
+          </bufferGeometry>
+          <meshBasicMaterial color={palette.buildingLow} toneMapped={false} />
+        </mesh>
+      )}
+
       {/*
         Материал basic, а не standard, и это не экономия. Линия — не асфальт, а
         замысел игрока, наложенный на карту: освещать её значит прятать часть

@@ -242,7 +242,12 @@ describe('createInitialState: предприятия', () => {
 describe('createInitialState: стартовая машина', () => {
   it('единственный ЗИЛ стоит в Москве без задания и без груза', () => {
     const state = createInitialState(1)
-    const vehicles = Object.values(state.vehicles)
+    // Парк ИГРОКА, а не весь мир: с среза 6 у ворот стоят ещё три грузовика
+    // конкурентов (COMPETITORS в state.ts), и они к этой проверке отношения
+    // не имеют.
+    const vehicles = Object.values(state.vehicles).filter(
+      (vehicle) => vehicle.ownerId === state.playerId,
+    )
     expect(vehicles).toHaveLength(1)
 
     const truck = vehicles[0]
