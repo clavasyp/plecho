@@ -972,3 +972,79 @@ describe('deliverPlan и setController: дверь из сети в состоя
     expect(player().controller).toBe('человек')
   })
 })
+
+describe('sellVehicle', () => {
+  it('возвращает половину цены класса и убирает машину из парка', () => {
+    const before = player().money
+    store().sellVehicle(STARTER_VEHICLE_ID)
+
+    expect(game().vehicles[STARTER_VEHICLE_ID]).toBeUndefined()
+    expect(player().money).toBe(before + Math.round(STARTER_CLASS.price / 2))
+  })
+
+  it('водитель возвращается в резерв, а не увольняется', () => {
+    store().sellVehicle(STARTER_VEHICLE_ID)
+
+    const driver = drivers()[STARTER_DRIVER_ID]
+    expect(driver, 'человек остаётся в штате').toBeDefined()
+    expect(driver.vehicleId, 'но уже без машины').toBeNull()
+  })
+
+  it('машину с грузом продать нельзя: груз исчез бы вместе с ней', () => {
+    useGameStore.setState(({ state }) => ({
+      state: {
+        ...state,
+        vehicles: {
+          ...state.vehicles,
+          [STARTER_VEHICLE_ID]: {
+            ...state.vehicles[STARTER_VEHICLE_ID],
+            cargo: { type: 'зерно' as const, tons: 3, originId: MOSCOW },
+          },
+        },
+      },
+    }))
+
+    const before = player().money
+    store().sellVehicle(STARTER_VEHICLE_ID)
+
+    expect(game().vehicles[STARTER_VEHICLE_ID]).toBeDefined()
+    expect(player().money).toBe(before)
+  })
+
+  it('машину в пути продать нельзя', () => {
+    useGameStore.setState(({ state }) => ({
+      state: {
+        ...state,
+        vehicles: {
+          ...state.vehicles,
+          [STARTER_VEHICLE_ID]: {
+            ...state.vehicles[STARTER_VEHICLE_ID],
+            position: {
+              kind: 'ребро' as const,
+              edgeId: Object.keys(state.world.edges)[0] as never,
+              fromId: MOSCOW,
+              progress: 0.5,
+            },
+          },
+        },
+      },
+    }))
+
+    const before = player().money
+    store().sellVehicle(STARTER_VEHICLE_ID)
+
+    expect(game().vehicles[STARTER_VEHICLE_ID]).toBeDefined()
+    expect(player().money).toBe(before)
+  })
+
+  /**
+   * ПРАВИЛА У ИГРОКА И У КОНКУРЕНТА ОДНИ И ТЕ ЖЕ — это и есть смысл единого
+   * набора команд из шапки sim/ai/commands.ts. До этой правки продажа была
+   * доступна ТОЛЬКО конкуренту: команда в наборе была, а действия у игрока не
+   * существовало, то есть соперник играл по более широким правилам.
+   */
+  it('продажа идёт тем же путём, что и у конкурента, — через команду', () => {
+    store().sellVehicle(STARTER_VEHICLE_ID)
+    expect(game().vehicles[STARTER_VEHICLE_ID]).toBeUndefined()
+  })
+})

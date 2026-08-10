@@ -401,6 +401,33 @@ function decide(state: GameState, companyId: CompanyId): Decision {
    */
   const fleet = all.filter((vehicle) => !vehicle.brokenDown)
 
+  /*
+   * ЭКИПАЖ ПЛАНА — машины ЭТОГО кольца плюс те, что пока без задания.
+   *
+   * ЗДЕСЬ БЫЛ ГЛАВНЫЙ ЗАМОК ВСЕГО ФАЙЛА, и стоит записать, как он работал.
+   * Три счётчика — потребность в росте здесь, «некомплект» и «сколько уже
+   * работает» в buyStep — считали парк ВСЕЙ КОНТОРЫ, а сравнивали его с целью
+   * ОДНОГО кольца. Пока контора вела одну линию, разницы не было; со второй
+   * линией контора запиралась намертво.
+   *
+   * Замер на нишевом за 343 суток с двумя линиями:
+   *   потребность в росте закрыта «парк конторы 2 ≥ цели кольца 2»   322 суток
+   *   «некомплект» по конторе истинен (тент не берёт кругляк)        343 суток
+   *   он же по экипажу линии                                          0 суток
+   *   «уже работает ≥ цели» по конторе закрыт                       322 суток
+   *   он же по экипажу                                                0 суток
+   * Вторая линия не получила НИ ОДНОЙ машины за год, простояв пустой при
+   * 524 032 рублях на счету, а контора выдавала пустое решение 305 суток из
+   * 365. Чинить надо все три счётчика разом: почини один — запирает следующий.
+   *
+   * Это не новая условность, а возврат к той, что уже действует в choosePlan и
+   * в staffingSteps: обе спрашивают vehiclesOnLine, а не размер парка.
+   */
+  const crew = [
+    ...vehiclesOnLine(state, companyId, line.id),
+    ...fleet.filter((vehicle) => vehicle.lineId === null),
+  ].filter((vehicle) => !vehicle.brokenDown)
+
   // Списание и увольнение занимают ход целиком: каждое из них меняет расклад
   // настолько, что следующее решение честнее принять уже по новому состоянию.
   const writeOff = writeOffStep(company, all, line)
@@ -414,8 +441,9 @@ function decide(state: GameState, companyId: CompanyId): Decision {
    * водителя ровно за тик до покупки машины, под которую его же и нанимала.
    */
   const target = fleetTarget(plan, personality)
+  // Считается ЭКИПАЖ КОЛЬЦА, а не парк конторы — разбор у объявления crew.
   const growth =
-    fleet.length < target ? affordableClass(state, company, plan, reserve) : null
+    crew.length < target ? affordableClass(state, company, plan, reserve) : null
 
   /*
    * ЗАРАБАТЫВАЮЩАЯ МАШИНА — это кузов ПЛЮС человек с допуском. Не «машина есть»,
@@ -459,15 +487,34 @@ function decide(state: GameState, companyId: CompanyId): Decision {
         VEHICLE_CLASS_BY_ID[vehicle.classId]?.trailers.includes(plan.trailer),
       ))
 
-  const parting = fireStep(state, company, fleet, plan, growth !== null)
+  const parting = fireStep(state, company, fleet, plan, growth !== null, fieldable)
   if (parting !== null) return toDecision(parting)
 
+  /*
+   * КОМУ КАКОЙ СПИСОК МАШИН — не мелочь, а разделение двух разных вопросов.
+   *
+   * ЭКИПАЖ (crew) отвечает на вопросы про ЭТО кольцо: хватает ли ему машин,
+   * укомплектованы ли они, кому перецепить кузов под его грузы. Спрашивать это
+   * у всего парка — тот самый замок, из-за которого вторая линия не получала
+   * машин никогда.
+   *
+   * ВЕСЬ ПАРК (fleet) отвечает на вопросы про КОНТОРУ: не пора ли кому-то на
+   * ТО, есть ли свободные люди, не нужен ли терминал в узле. Эти решения к
+   * кольцу отношения не имеют, и сужать их до экипажа значило бы, например,
+   * перестать обслуживать машину чужой линии.
+   *
+   * ОТДЕЛЬНО ПРО КУЗОВ. trailerStep получает ЭКИПАЖ, и это защита, а не
+   * оптимизация: перебирая весь парк, он однажды перецепит кузов машине
+   * РАБОТАЮЩЕГО чужого кольца — как только у конторы окажутся два кольца под
+   * разные кузова, а класс потянет оба, — и та поедет порожняком. Сегодня это
+   * не стреляет только потому, что ЗИЛ платформу не берёт вовсе.
+   */
   const paid =
     serviceStep(company, fleet, reserve) ??
-    trailerStep(company, fleet, plan, floor) ??
+    trailerStep(company, crew, plan, floor) ??
     hireStep(state, company, fleet, plan, floor, fieldable) ??
     terminalStep(state, company, fleet, reserve) ??
-    buyStep(company, fleet, plan, target, growth)
+    buyStep(company, crew, fleet, plan, target, growth)
 
   const free = staffingSteps(state, company, fleet, plan, line, target)
 
@@ -523,13 +570,23 @@ function choosePlan(
   const ranked = rankedPlans(state, company, personality)
   if (ranked.length === 0) return null
 
+  /*
+   * СЧИТАЮТСЯ МАШИНЫ С ВОДИТЕЛЕМ, А НЕ ЗАПИСИ В СПИСКЕ ЛИНИИ.
+   *
+   * Машина, поставленная на линию и оставшаяся без человека, никуда не поедет —
+   * но по полю lineId читается как укомплектованный экипаж. Тогда «начатое»
+   * считается доведённым до конца, конкурент переходит к следующему кольцу и
+   * бросает первое навсегда. Обратный случай не менее важен: линия с одной
+   * бесхозной машиной обязана оставаться НЕДОсобранной, чтобы контора продолжала
+   * ею заниматься, а не пришпилилась к ней и перестала думать.
+   */
   const started = ranked.find((plan) => {
     const line = findLine(company, plan)
     if (line === undefined) return false
-    return (
-      vehiclesOnLine(state, company.id, line.id).length <
-      fleetTarget(plan, personality)
+    const manned = vehiclesOnLine(state, company.id, line.id).filter(
+      (vehicle) => vehicle.driverId !== null && !vehicle.brokenDown,
     )
+    return manned.length < fleetTarget(plan, personality)
   })
   if (started !== undefined) return started
 
@@ -555,9 +612,29 @@ function choosePlan(
    *
    * Неподъёмное кольцо не выбрасывается из рейтинга, а пропускается: разбогатев,
    * контора вернётся к нему сама, потому что порядок рейтинга не изменился.
+   *
+   * И ЭТО ИМЕННО НОВОЕ КОЛЬЦО — то, линии под которое ещё нет.
+   *
+   * Сюда управление доходит только когда всё начатое уже собрано (проверка
+   * started выше) и место под линию есть. Прежний поиск не спрашивал, построена
+   * ли линия, и потому каждый раз возвращал то самое кольцо, которое контора уже
+   * ведёт: агрессивный 306 решенческих дней подряд получал обратно своё же
+   * «Брянск — Рязань» и за весь год выдал команду «создать линию» РОВНО ОДИН
+   * РАЗ — при потолке в три. Обещание из шапки MAX_LINES («агрессивный и
+   * имитатор расползаются по карте») код не выполнял.
+   *
+   * Запасной вариант тоже из отфильтрованного списка: если ни одно новое кольцо
+   * не подъёмно, работаем по тому, что уже есть, — метаться между неподъёмными
+   * замыслами хуже, чем доводить до ума имеющееся.
    */
   const fleet = ownVehicles(state, company.id).filter((v) => !v.brokenDown)
-  return ranked.find((plan) => canField(company, fleet, plan)) ?? ranked[0]
+  const fresh = ranked.find(
+    (plan) =>
+      findLine(company, plan) === undefined && canField(company, fleet, plan),
+  )
+  if (fresh !== undefined) return fresh
+
+  return ranked.find((plan) => findLine(company, plan) !== undefined) ?? ranked[0]
 }
 
 /**
@@ -1258,11 +1335,25 @@ function writeOffPerKm(vc: VehicleClass): number {
  * место кольца: выпуск источника, приём переработки, выпуск переработки и спрос
  * в точке сбыта, минимум из четырёх. Считать по одному лишь выпуску значило бы
  * поставить на кольцо парк, который привозит вчетверо больше, чем принимают.
+ *
+ * ОКРУГЛЕНИЕ ВНИЗ, И ЭТО ГЛАВНОЕ РЕШЕНИЕ ФУНКЦИИ. Потолок кольца обязан
+ * НЕДОБИРАТЬ, а не перебирать: недобор стоит упущенной выгоды, перебор — денег.
+ * Прежний `ceil` давал парк, подающий до 175% стока: при подаче 6.70 т/сут на
+ * машину и стоке 7.66 округление вверх ставило вторую машину, тридцатисуточный
+ * буфер города забивался за сто суток и упирался в потолок на 116-е, после чего
+ * обратное плечо переставало продаваться вовсе — выручка на километр падала
+ * 22.5 → 13.9, а сданных тонн становилось МЕНЬШЕ при БОЛЬШЕМ числе рейсов
+ * (198 → 126 тонн за 43 рейса против 34). Замер года после правки: нишевый
+ * вместо банкротства с −214 507 приходит к +490 812, банкротов не остаётся ни
+ * одного, а порядок богатства характеров сохраняется.
+ *
+ * Единица снизу остаётся: кольцо, которое не кормит и одной машины, всё равно
+ * обслуживается одной — иначе его незачем было бы и планировать.
  */
 function fleetForRing(perVehicleTons: number, flowTons: number): number {
   if (!(perVehicleTons > 0)) return 1
 
-  const needed = Math.ceil(flowTons / perVehicleTons)
+  const needed = Math.floor(flowTons / perVehicleTons)
   return Math.max(1, Math.min(MAX_FLEET_PER_LINE, needed))
 }
 
@@ -1695,6 +1786,7 @@ function fireStep(
   fleet: readonly Vehicle[],
   plan: ScriptedPlan,
   growing: boolean,
+  fieldable: boolean,
 ): Step[] | null {
   // Пустой резерв — не повод выходить: под замену годится и тот, кто сидит за
   // рулём машины, которую он всё равно не может нагрузить (случай первый ниже).
@@ -1714,8 +1806,21 @@ function fireStep(
    *
    * Пока есть пустые сиденья, никого не увольняем: там человек как раз нужен, и
    * следующий наём его туда и посадит.
+   *
+   * И ТОЛЬКО ЕСЛИ НА КОЛЬЦО ВООБЩЕ ЕСТЬ ЧЕМ ВЫЙТИ. Наём тот же самый поиск
+   * допуска запускает лишь при fieldable, и рядом с ним стоит отдельный разбор,
+   * почему поиск без этой проверки разоряет контору. Здесь проверки не было, и
+   * асимметрия не объяснялась нигде: нишевый уволил трёх водителей (23-и, 26-е
+   * и 29-е сутки) ради лесной линии, которая за год не получила ни одной
+   * машины, и оставил РАБОТАЮЩУЮ машину зернового кольца без человека на шесть
+   * суток. Увольнять людей под кольцо, на которое всё равно не выйти, —
+   * чистый убыток.
+   *
+   * Проверка ставится ТОЛЬКО на эту ветку. Дописать fieldable в сам hunting
+   * нельзя: он второй раз используется ниже, в расчёте wanted, и там молча
+   * исчезло бы резервное место под будущего допускника.
    */
-  if (hunting && seats === 0) {
+  if (hunting && fieldable && seats === 0) {
     const useless =
       spare.find((driver) => !licensedFor(driver, plan.cargoes)) ??
       atWheelWithoutLicence(company, fleet, plan)
@@ -1883,6 +1988,7 @@ function terminalStep(
  */
 function buyStep(
   company: Company,
+  crew: readonly Vehicle[],
   fleet: readonly Vehicle[],
   plan: ScriptedPlan,
   target: number,
@@ -1893,15 +1999,24 @@ function buyStep(
   if (pick === null) return null
   if (missingLicenses(company, plan).length > 0) return null
 
-  // Недоукомплектованный парк — это машина без водителя ИЛИ с кузовом, который
-  // берёт не все грузы кольца. Покупать вторую, пока первая ходит через плечо
-  // порожняком, значит удваивать убыток.
-  const incomplete = fleet.some(
-    (vehicle) => vehicle.driverId === null || !carriesWholeRing(vehicle, plan),
-  )
+  /*
+   * НЕКОМПЛЕКТ СЧИТАЕТСЯ ПО ЭКИПАЖУ КОЛЬЦА, а не по парку конторы: машина
+   * чужой линии с чужим кузовом к этому решению отношения не имеет. Разбор
+   * замка, который получался из общеконторского счёта, — у объявления crew.
+   *
+   * НО ОДНА ОБЩЕКОНТОРСКАЯ ПРОВЕРКА ОСТАЁТСЯ, И НАРОЧНО. Машина без водителя —
+   * это оплаченное железо, которое не поедет НИКУДА, на какой бы линии ни
+   * стояло. Пока такая есть хоть где-то, покупать новую бессмысленно: сажать
+   * за руль всё равно некого. Без этой оговорки контора со второй линией
+   * скупала бы технику, оставляя её без людей, — и это ровно тот случай, ради
+   * которого проверка «некомплект» когда-то и писалась общеконторской.
+   */
+  if (fleet.some((vehicle) => vehicle.driverId === null)) return null
+
+  const incomplete = crew.some((vehicle) => !carriesWholeRing(vehicle, plan))
   if (incomplete) return null
 
-  const working = fleet.filter((vehicle) =>
+  const working = crew.filter((vehicle) =>
     plan.cargoes.some((cargo) => canCarry(vehicle.trailer, cargo)),
   ).length
   if (working >= target) return null

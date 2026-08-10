@@ -167,6 +167,30 @@ export type GameStore = {
    */
   buyTrailer: (vehicleId: VehicleId, trailer: TrailerType) => void
 
+  /**
+   * Продать машину за половину цены класса.
+   *
+   * ЕДИНСТВЕННЫЙ ОТВЕТ НА СТАРЕНИЕ ПАРКА, и до сих пор его у игрока не было
+   * вовсе — при том, что команда «продать-машину» в наборе есть и конкуренту
+   * доступна. Правила у соперника оказывались ШИРЕ, чем у человека, что прямо
+   * противоречит правилу единого набора команд из шапки sim/ai/commands.ts.
+   *
+   * Износ поднимает обслуживание по кривой (1 + 2w², MAINTENANCE_WEAR_GAIN в
+   * logistics/wear.ts): у машины с износом 0.7 километр стоит вдвое дороже
+   * паспортного, а поломки приходят чаще. Замер прогона на год: контора,
+   * меняющая машину на пороге износа 0.3, приходит к +554 899 вместо −214 507.
+   *
+   * Возврат — ровно половина цены класса, независимо от износа. Это осознанное
+   * упрощение в пользу игрока: считать остаточную стоимость по износу значило бы
+   * наказывать дважды — сначала дорогим километром, потом дешёвой продажей.
+   *
+   * ПРОДАЖА ТРЕБУЕТ ПУСТОГО КУЗОВА И СТОЯНКИ В УЗЛЕ (см. isLegal в
+   * sim/ai/commands.ts): машину с грузом посреди трассы продать нельзя, иначе
+   * груз исчез бы вместе с ней. Машину с линии снимает сама продажа, водитель
+   * возвращается в резерв.
+   */
+  sellVehicle: (vehicleId: VehicleId) => void
+
   /** Посадить водителя за машину или отправить в резерв (vehicleId = null). */
   assignDriver: (driverId: DriverId, vehicleId: VehicleId | null) => void
 
@@ -411,6 +435,9 @@ export const useGameStore = create<GameStore>((set, get) => ({
 
   buyTrailer: (vehicleId, trailer) =>
     set((store) => playerCommand(store, { kind: 'купить-прицеп', vehicleId, trailer })),
+
+  sellVehicle: (vehicleId) =>
+    set((store) => playerCommand(store, { kind: 'продать-машину', vehicleId })),
 
   assignDriver: (driverId, vehicleId) =>
     set((store) => playerCommand(store, { kind: 'посадить-водителя', driverId, vehicleId })),

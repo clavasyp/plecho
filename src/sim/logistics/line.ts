@@ -414,6 +414,16 @@ function groupByLine(state: GameState): Map<string, LineGroup> {
 
     const company = state.companies[vehicle.ownerId]
     if (company === undefined) continue
+    /*
+     * ПАРК БАНКРОТА ВСТАЁТ. Партия для конторы окончена: команд ей больше не
+     * подать (все шесть незаконны), расходов ей не начисляют — фаза расходов
+     * зовёт freeze(), — и флаг с неё не снимается никогда. Машина, которая при
+     * этом продолжает нарезать круги, только выбирает груз со складов у живых
+     * компаний и делает это бесплатно. Останавливать надо в диспетчеризации, а
+     * не в движении: выехавшая машина обязана доехать до узла, а не замереть
+     * посреди трассы.
+     */
+    if (company.bankrupt) continue
 
     const line = company.lines[vehicle.lineId]
     if (line === undefined) continue

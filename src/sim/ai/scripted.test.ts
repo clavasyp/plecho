@@ -1042,3 +1042,85 @@ describe('фраза для ленты', () => {
     ).toBeGreaterThan(0)
   })
 })
+
+// ─── Вторая линия ──────────────────────────────────────────────────────────
+
+/**
+ * КОРНЕВОЙ ЗАМОК ФАЙЛА, снятый после разбора игрового года.
+ *
+ * Три счётчика — потребность в росте, «некомплект» и «сколько уже работает» —
+ * считали парк ВСЕЙ КОНТОРЫ, а сравнивали его с целью ОДНОГО кольца. Пока линия
+ * была одна, разницы не было; со второй контора запиралась намертво. Замер на
+ * нишевом за 343 суток с двумя линиями: вторая не получила НИ ОДНОЙ машины,
+ * простояв пустой при 524 032 рублях на счету, а пустых решений было 305 из 365.
+ *
+ * Проверка идёт через ПУБЛИЧНОЕ поведение — какие команды выдаёт конкурент, — а
+ * не через внутренние счётчики: они и разъехались когда-то именно потому, что
+ * их никто не спрашивал снаружи.
+ */
+describe('контора занимается второй линией, а не только первой', () => {
+  it('машина первой линии не мешает укомплектовать вторую', () => {
+    const base = withCompany(
+      createInitialState(SEED),
+      makeCompany(RIVAL, 'агрессивный', RICH),
+    )
+
+    const first = addLine(base, RIVAL, 'Первая', firstPlan().stops)
+    // Первая линия собрана: машина с кузовом и человеком за рулём.
+    const staffed = addDriver(
+      addVehicle(first.state, RIVAL, firstPlan().stops[0].nodeId, {
+        id: 'rival-on-line',
+        trailer: trailerFor(firstPlan().stops),
+        driverId: toDriverId('rival-drv-1'),
+        lineId: first.lineId,
+      }),
+      RIVAL,
+      { id: 'rival-drv-1', vehicleId: toVehicleId('rival-on-line') },
+    )
+
+    const commands = scriptedCommands(staffed, RIVAL)
+
+    /*
+     * Контора обязана ЧТО-ТО делать: строить вторую линию, покупать под неё
+     * машину, нанимать человека. Пустой ход при полном кошельке и свободном
+     * потолке линий — это и есть тот самый замок.
+     */
+    expect(commands.length).toBeGreaterThan(0)
+  })
+
+  it('при свободном потолке берётся НОВОЕ кольцо, а не то, что уже построено', () => {
+    const base = withCompany(
+      createInitialState(SEED),
+      makeCompany(RIVAL, 'агрессивный', RICH),
+    )
+
+    const plan = firstPlan()
+    const first = addLine(base, RIVAL, plan.name, plan.stops)
+    const staffed = addDriver(
+      addVehicle(first.state, RIVAL, plan.stops[0].nodeId, {
+        id: 'rival-on-line',
+        trailer: trailerFor(plan.stops),
+        driverId: toDriverId('rival-drv-1'),
+        lineId: first.lineId,
+      }),
+      RIVAL,
+      { id: 'rival-drv-1', vehicleId: toVehicleId('rival-on-line') },
+    )
+
+    /*
+     * Прежний поиск не спрашивал, построена ли линия, и каждый раз возвращал
+     * контору к её же кольцу: агрессивный 306 решенческих дней подряд получал
+     * обратно «Брянск — Рязань» и за год выдал «создать-линию» РОВНО ОДИН РАЗ
+     * при потолке в три. Обещание из шапки MAX_LINES код не выполнял.
+     */
+    const created = scriptedCommands(staffed, RIVAL).find(
+      (command) => command.kind === 'создать-линию',
+    )
+
+    if (created !== undefined && created.kind === 'создать-линию') {
+      expect(created.stops.map((s) => s.nodeId)).not.toEqual(
+        plan.stops.map((s) => s.nodeId),
+      )
+    }
+  })
+})

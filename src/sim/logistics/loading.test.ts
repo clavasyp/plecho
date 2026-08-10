@@ -42,7 +42,12 @@ import type {
   Vehicle,
   VehicleId,
 } from '../types'
-import { CITY_STOCK_DAYS, cityCapacity, runArrivals } from './loading'
+import {
+  CITY_STOCK_DAYS,
+  DEAD_CARGO_ATTEMPTS,
+  cityCapacity,
+  runArrivals,
+} from './loading'
 import { canCarry } from './trailer'
 
 /**
@@ -1887,5 +1892,122 @@ describe('runArrivals: свой склад как источник', () => {
     // повод подсунуть машине не тот груз.
     expect(truck(after).cargo).toBeNull()
     expect(after.companies[PLAYER].buildings[DEPOT].stock['зерно']).toBe(100)
+  })
+})
+
+// ─── Мёртвый груз: счёт по отказам ─────────────────────────────────────────
+
+/**
+ * ГЛАВНОЕ, ЧТО ЗДЕСЬ ПРОВЕРЯЕТСЯ: счётчик срабатывает на ОТКАЗ, а не на факт
+ * груза в кузове.
+ *
+ * Разница стоила 324.7 тонны ЖИВОГО груза за игровой год: счётчик прибавлял
+ * единицу за каждый тик, в котором в кузове что-нибудь лежало, а обнулялся
+ * только по пустому кузову — которого на кольце с двумя гружёными плечами не
+ * бывает никогда. Все девять машин конкурентов доходили до порога и списывали
+ * исправно везомый груз. Разбор — в шапке markBlocked.
+ */
+describe('невостребованный груз списывается по отказам, а не по времени', () => {
+  it('машина, которой некуда сдать, копит отказы и на третьем списывает груз', () => {
+    // Город без жителей ничего не потребляет — принять муку в нём некому.
+    const state = makeState(
+      [makeCity(TULA, 0)],
+      [],
+      [makeVehicle(V1, TULA, { cargo: { type: 'мука', tons: 3, originId: MOSCOW } })],
+    )
+
+    let next = state
+    for (let i = 1; i < DEAD_CARGO_ATTEMPTS; i++) {
+      next = runArrivals(next)
+      expect(truck(next).blockedTicks, `отказ ${i}`).toBe(i)
+      expect(truck(next).cargo, `отказ ${i}`).not.toBeNull()
+    }
+
+    next = runArrivals(next)
+    expect(truck(next).cargo).toBeNull()
+    expect(truck(next).blockedTicks).toBe(0)
+  })
+
+  it('транзит мимо остановки отказом не считается', () => {
+    // Груз есть, но эта остановка его не выгружает: машина едет дальше, и
+    // ждать ей нечего. Прежний счёт прибавлял здесь единицу каждый тик — на
+    // этом и уничтожался живой груз, ждавший СВОЕЙ остановки.
+    const state = makeState(
+      [makeCity(TULA, 100_000), makeCity(MOSCOW, 100_000)],
+      [],
+      [
+        makeVehicle(V1, TULA, {
+          lineId: RING,
+          stopIndex: 0,
+          blockedTicks: 2,
+          cargo: { type: 'мука', tons: 3, originId: MOSCOW },
+        }),
+      ],
+      0,
+      [makeLine(RING, [makeStop(TULA, ['зерно']), makeStop(MOSCOW, ['мука'])], [V1])],
+    )
+
+    const after = runArrivals(state)
+
+    expect(truck(after).cargo).not.toBeNull()
+    expect(truck(after).blockedTicks).toBe(0)
+  })
+
+  it('частичная выгрузка обнуляет счёт: это не отказ', () => {
+    // В городе место есть, но меньше, чем в кузове. Остаток поедет дальше, и
+    // счёт неудач обязан начаться заново — мерить надо ПОДРЯД идущие отказы.
+    const city = makeCity(TULA, FLOUR_CITY_POP)
+    const capacity = cityCapacity(city, 'мука')
+    const state = makeState(
+      [{ ...city, stock: { 'мука': capacity - 1 } }],
+      [],
+      [
+        makeVehicle(V1, TULA, {
+          blockedTicks: DEAD_CARGO_ATTEMPTS - 1,
+          cargo: { type: 'мука', tons: ZIL_TONS, originId: MOSCOW },
+        }),
+      ],
+    )
+
+    const after = runArrivals(state)
+
+    expect(truck(after).cargo).not.toBeNull()
+    expect(truck(after).cargo?.tons).toBeCloseTo(ZIL_TONS - 1, 6)
+    expect(truck(after).blockedTicks).toBe(0)
+  })
+})
+
+// ─── Банкрот ───────────────────────────────────────────────────────────────
+
+describe('обанкротившаяся контора не возит и не зарабатывает', () => {
+  it('её машина не выгружает груз и не получает денег', () => {
+    const base = makeState(
+      [makeCity(TULA, FLOUR_CITY_POP)],
+      [],
+      [makeVehicle(V1, TULA, { cargo: { type: 'мука', tons: ZIL_TONS, originId: MOSCOW } })],
+    )
+
+    const alive = runArrivals(base)
+    expect(money(alive)).toBeGreaterThan(0)
+    expect(truck(alive).cargo).toBeNull()
+
+    const dead = runArrivals({
+      ...base,
+      companies: {
+        ...base.companies,
+        [PLAYER]: { ...base.companies[PLAYER], bankrupt: true },
+      },
+    })
+
+    /*
+     * Расходов банкроту уже не начисляют — фаза расходов зовёт для него
+     * freeze(), — поэтому продолжающаяся выгрузка делала бы контору с НУЛЕВОЙ
+     * себестоимостью: замер на живом мире давал банкроту +477 821 за тридцать
+     * суток против +149 658 у платёжеспособного за сто двадцать. Деньги при
+     * этом мёртвые (любая команда банкроту незаконна), то есть это не выигрыш,
+     * а враньё в отчёте и парк-призрак, бесплатно выбирающий чужой груз.
+     */
+    expect(money(dead)).toBe(0)
+    expect(truck(dead).cargo).not.toBeNull()
   })
 })

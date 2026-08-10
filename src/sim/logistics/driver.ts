@@ -286,7 +286,7 @@ export const CARGO_LICENSE: Partial<Record<CargoType, DriverLicense>> = {
  * СПРАШИВАТЬ ЭТО ОБЯЗАН ТОТ, КТО ГРУЗИТ, а не тот, кто выпускает в рейс.
  * Проверка на выезде выглядит надёжнее, но запирает уже гружёную машину: груз с
  * неё сам не денется, и она простоит трое суток до списания партии
- * (DEAD_CARGO_DAYS). Поэтому canDepart допуск не смотрит принципиально —
+ * (DEAD_CARGO_ATTEMPTS). Поэтому canDepart допуск не смотрит принципиально —
  * см. комментарий там.
  */
 export function canDrive(driver: Driver, cargo: CargoType | null): boolean {

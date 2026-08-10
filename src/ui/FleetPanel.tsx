@@ -514,6 +514,7 @@ export function FleetPanel(): JSX.Element {
   const fireDriver = useGameStore((store) => store.fireDriver)
   const serviceVehicle = useGameStore((store) => store.serviceVehicle)
   const repairVehicle = useGameStore((store) => store.repairVehicle)
+  const sellVehicle = useGameStore((store) => store.sellVehicle)
 
   const [chosen, setChosen] = useState<VehicleId | null>(null)
   const [hovered, setHovered] = useState<string | null>(null)
@@ -785,6 +786,7 @@ export function FleetPanel(): JSX.Element {
                 onHover={setHovered}
                 onService={() => serviceVehicle(current.id)}
                 onRepair={() => repairVehicle(current.id)}
+                onSell={() => sellVehicle(current.id)}
                 onTrailer={(trailer) => buyTrailer(current.id, trailer)}
                 onSeat={(driverId) => assignDriver(driverId, current.id)}
                 onUnseat={(driverId) => assignDriver(driverId, null)}
@@ -1021,6 +1023,7 @@ function VehicleCard({
   onHover,
   onService,
   onRepair,
+  onSell,
   onTrailer,
   onSeat,
   onUnseat,
@@ -1032,6 +1035,7 @@ function VehicleCard({
   onHover: (key: string | null) => void
   onService: () => void
   onRepair: () => void
+  onSell: () => void
   onTrailer: (trailer: TrailerType) => void
   onSeat: (driver: DriverId) => void
   onUnseat: (driver: DriverId) => void
@@ -1043,6 +1047,13 @@ function VehicleCard({
    */
   const scale = Math.max(row.costPerKm, row.revenuePerKm, 1)
   const unprofitable = row.costPerKm >= row.revenuePerKm
+
+  /**
+   * Машина прошла порог списания — тот самый, что нарисован риской на шкале
+   * износа чуть выше. Отсюда акцент на кнопке продажи: это единственный момент,
+   * когда игра сама советует расстаться с техникой.
+   */
+  const worn = row.writeOffWear !== null && row.wear >= row.writeOffWear
 
   return (
     <>
@@ -1199,6 +1210,44 @@ function VehicleCard({
             <span>ремонт</span>
             <span style={{ marginLeft: 'auto' }}>
               {row.brokenDown ? `${fmtInteger(row.repairCost)} руб` : '—'}
+            </span>
+          </button>
+        </div>
+
+        {/*
+          ПРОДАЖА СТОИТ ЗДЕСЬ, а не в списке парка, и это не вкусовщина: решение
+          «пора списывать» принимается по двум числам, которые нарисованы прямо
+          над кнопкой — стоимости километра и полосе износа с меткой порога.
+          Отдельно от ТО и ремонта, потому что те машину сохраняют, а эта её
+          убирает: перепутать их одним кликом нельзя.
+        */}
+        <div style={{ ...rowStyle, gap: 6, marginTop: 6 }}>
+          <button
+            type="button"
+            onClick={onSell}
+            onMouseEnter={() => onHover('sell')}
+            onMouseLeave={() => onHover(null)}
+            style={buttonStyle(worn, hovered === 'sell', row.sellable, {
+              flex: '1 1 auto',
+            })}
+            disabled={!row.sellable}
+            title={
+              row.sellable
+                ? worn
+                  ? `Машина прошла порог списания: километр обходится дороже, чем она приносит. Вернут ${fmtInteger(
+                      row.sellRefund,
+                    )} руб — половину цены класса, износ на возврат не влияет`
+                  : `Вернут ${fmtInteger(
+                      row.sellRefund,
+                    )} руб — половину цены класса. Водитель уйдёт в резерв, с линии машина снимется сама`
+                : row.cargo !== null
+                  ? 'В кузове груз: сначала сдать, иначе он пропадёт вместе с машиной'
+                  : 'Машина в пути — продать можно только в городе'
+            }
+          >
+            <span>продать</span>
+            <span style={{ marginLeft: 'auto' }}>
+              {row.sellable ? `+${fmtInteger(row.sellRefund)} руб` : '—'}
             </span>
           </button>
         </div>

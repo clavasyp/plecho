@@ -292,6 +292,22 @@ export type FleetRow = {
   brokenDown: boolean
   repairCost: number
 
+  /**
+   * Сколько вернут за машину при продаже, рубли.
+   *
+   * Половина цены класса независимо от износа — так решает sellVehicle в
+   * sim/ai/commands.ts, и панель обязана показывать ЕГО число, а не считать своё.
+   */
+  sellRefund: number
+  /**
+   * Можно ли продать прямо сейчас.
+   *
+   * Условие то же, что проверяет законность команды: машина стоит в узле и кузов
+   * пуст. Дублировать здесь нельзя — разъедется; поэтому обе стороны читают одни
+   * и те же два поля машины, а причину отказа панель объясняет словами.
+   */
+  sellable: boolean
+
   cargo: { type: CargoType; tons: Tons } | null
 
   /** Где сейчас: «Москва → Тула» на ребре, «Тула» в узле. */
@@ -443,6 +459,9 @@ export function fleetRow(vehicle: Vehicle, ctx: FleetContext): FleetRow {
     serviceCost: serviceCost(vehicle),
     brokenDown: vehicle.brokenDown,
     repairCost: repairCost(vehicle),
+
+    sellRefund: Math.round((vc?.price ?? 0) / 2),
+    sellable: vehicle.position.kind === 'узел' && vehicle.cargo === null,
 
     cargo:
       vehicle.cargo === null
