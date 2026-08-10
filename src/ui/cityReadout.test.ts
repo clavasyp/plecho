@@ -16,7 +16,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { CONSUMPTION_PER_1K } from '../data/recipes'
+import { demandPerDay } from '../sim/economy/consumption'
 
 import { RECIPE_BY_INDUSTRY } from '../data/recipes'
 import {
@@ -143,12 +143,16 @@ describe('диагноз предприятия', () => {
   })
 
   it('запас выхода считается в сутках ДО ЗАПОЛНЕНИЯ — это дедлайн приезда', () => {
-    // Мельница: 40 т/сут, склад 120 т. Лежит 40 → свободно 80 → двое суток.
+    // Ровно суточный выпуск на складе: свободно остаётся на STOCK_DAYS − 1
+    // суток. Числа выводятся из рецепта, а не вписаны: выпуск комбината
+    // менялся вместе с масштабом мира, а правило «сутки до заполнения»
+    // осталось прежним, и проверять надо именно его.
+    const rate = RECIPE_BY_INDUSTRY['мукомольный'].dailyRate
     const view = describeIndustry(
-      makeIndustry('мукомольный', { зерно: 150, мука: 40 }),
+      makeIndustry('мукомольный', { зерно: rate * 2, мука: rate }),
     )
 
-    expect(view.output?.note).toBe('2.0 сут')
+    expect(view.output?.note).toBe(`${(STOCK_DAYS - 1).toFixed(1)} сут`)
   })
 
   it('долгий простой урезает мощность и объясняет это отдельной строкой', () => {
@@ -255,7 +259,7 @@ describe('склад города', () => {
   it('запас переводится в сутки по той же норме, по которой город ест', () => {
     // Запас ровно на пять суток — величина выводится из нормы, а не вписана
     // числом: перебалансировка норм не должна ронять проверку формата.
-    const daily = (CONSUMPTION_PER_1K['мука'] ?? 0) * 100
+    const daily = demandPerDay(100_000, 'мука')
     const lines = cityStockLines(makeCity(100_000, { мука: daily * 5 }))
     const flour = lines.find((line) => line.cargo === 'мука')
 

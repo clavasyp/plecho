@@ -1,9 +1,4 @@
 import { describe, expect, it } from 'vitest'
-import { STARTER_CLASS } from './state'
-
-/** Тариф стартового класса: тесты писались под ЗИЛ, и он им и остаётся. */
-const TARIFF = STARTER_CLASS.tariffPerTonKm
-const HANDLING = STARTER_CLASS.handlingPerTon
 import { FUEL_PRICE_PER_LITER } from '../data/operating'
 import { CARGO_PREMIUM, RECIPE_BY_INDUSTRY } from '../data/recipes'
 import { costPerKm, VEHICLE_CLASSES } from '../data/vehicles'
@@ -433,7 +428,22 @@ describe.each(VEHICLE_CLASSES.map((vc) => [vc.id, vc] as const))(
        * разгружающейся машины. Разбор, почему единым тарифом обойтись
        * невозможно, — в шапке data/vehicles.ts.
        */
-      const legRevenue = deliveryRevenue('зерно', vehicleClass.capacity, LEG_KM, TARIFF, HANDLING)
+      /*
+       * ТАРИФ БЕРЁТСЯ У ЭТОГО КЛАССА, а не у стартового, и это не мелочь —
+       * это ровно то, о чём говорит абзац выше. Здесь стояли TARIFF и HANDLING
+       * стартового ЗИЛа при ЁМКОСТИ проверяемого класса, то есть тест
+       * воспроизводил ту самую ошибку, которую взялся ловить: двадцать тонн по
+       * тарифу шеститонника. Проходил он при этом по чистому совпадению — с
+       * запасом в четыреста рублей из двадцати восьми тысяч, — и первая же
+       * правка надбавки за зерно его уронила. Совпадение и было сигналом.
+       */
+      const legRevenue = deliveryRevenue(
+        'зерно',
+        vehicleClass.capacity,
+        LEG_KM,
+        vehicleClass.tariffPerTonKm,
+        vehicleClass.handlingPerTon,
+      )
       const ringCost = 2 * LEG_KM * costPerKm(vehicleClass)
 
       expect(legRevenue).toBeLessThan(ringCost)

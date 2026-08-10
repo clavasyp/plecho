@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { CITIES_BY_ID } from '../../data/cities'
-import { CONSUMER_CARGO, CONSUMPTION_PER_1K } from '../../data/recipes'
+import { CONSUMER_CARGO } from '../../data/recipes'
 import { cityId, companyId, TICKS_PER_DAY } from '../types'
 import type {
   CargoType,
@@ -41,9 +41,15 @@ const PLAYER: CompanyId = companyId('player')
 /** Круглое население для проверок спроса. */
 const ROUND_POPULATION = 500_000
 
-/** Суточный спрос по одному грузу на круглом населении, тонн. */
-const dailyFor = (cargo: string) =>
-  (CONSUMPTION_PER_1K[cargo] ?? 0) * (ROUND_POPULATION / 1000)
+/**
+ * Суточный спрос по одному грузу на круглом населении, тонн.
+ *
+ * Через demandPerDay, а не через свою копию формулы: иначе проверки ниже
+ * сверяли бы две копии одного правила и пережили бы любую смену формы спроса
+ * молча. Форма как раз менялась — с прямой пропорции на корень.
+ */
+const dailyFor = (cargo: CargoType) =>
+  demandPerDay(ROUND_POPULATION, cargo)
 
 /** Суточный спрос города на круглом населении по всем грузам, тонн. */
 const DAILY_DEMAND = CONSUMER_CARGO.reduce((sum, c) => sum + dailyFor(c), 0)
@@ -178,7 +184,7 @@ describe('потребление со склада', () => {
     expect(after.stock['мука']).toBeCloseTo(1000 - FLOUR_DAILY / TICKS_PER_DAY, 9)
   })
 
-  it('спрос пропорционален населению', () => {
+  it('город побольше ест больше — но не во столько же раз', () => {
     const small = makeCity(TULA, {
       population: ROUND_POPULATION,
       stock: fullStock(1000),
@@ -189,14 +195,23 @@ describe('потребление со склада', () => {
     })
     const after = runDays(makeState([small, big]), 1)
 
-    expect(totalStock(cityOf(after, small.id))).toBeCloseTo(
-      3000 - DAILY_DEMAND,
+    const eatenSmall = 3000 - totalStock(cityOf(after, small.id))
+    const eatenBig = 3000 - totalStock(cityOf(after, big.id))
+
+    expect(eatenSmall).toBeCloseTo(DAILY_DEMAND, 9)
+    // Съеденное — ровно то, что игра назначает этому населению. Своё «вдвое
+    // больше» здесь стояло, пока спрос был прямо пропорционален жителям.
+    expect(eatenBig).toBeCloseTo(
+      CONSUMER_CARGO.reduce(
+        (sum, cargo) => sum + demandPerDay(ROUND_POPULATION * 2, cargo),
+        0,
+      ),
       9,
     )
-    expect(totalStock(cityOf(after, big.id))).toBeCloseTo(
-      3000 - DAILY_DEMAND * 2,
-      9,
-    )
+    // И главное свойство формы: больше — да, вдвое — нет (разбор у нормы в
+    // data/recipes.ts: крупный город кормит железная дорога, а не шоссе).
+    expect(eatenBig).toBeGreaterThan(eatenSmall)
+    expect(eatenBig).toBeLessThan(eatenSmall * 2)
   })
 
   it('город без склада не уходит в отрицательный запас', () => {
@@ -370,21 +385,46 @@ describe('обратная связь: выросший город требуе�
 
     // Ядро игры: сеть, которая справлялась вчера, сегодня уже не справляется.
     expect(after).toBeGreaterThan(before)
-    // И ровно настолько, насколько выросло население.
-    expect(after / before).toBeCloseTo(grownPopulation / ROUND_POPULATION, 3)
+    // И ровно настолько, насколько выросла ПОТРЕБНОСТЬ выросшего города —
+    // спрошенная у самой игры. Своё «во столько же раз, во сколько население»
+    // здесь стояло, пока спрос был прямо пропорционален жителям; форма спроса
+    // с тех пор изменилась, и проверка обязана следовать за ней, а не за
+    // отменённой формулой.
+    const expected = CONSUMER_CARGO.reduce(
+      (sum, cargo) => sum + demandPerDay(grownPopulation, cargo),
+      0,
+    )
+    expect(after).toBeCloseTo(expected, 1)
     // Порог — доля суточной нормы, а не абсолютные тонны: при перебалансировке
     // норм абсолютное число теряет смысл, а отношение остаётся верным.
-    expect(after - before).toBeGreaterThan(DAILY_DEMAND * 0.05)
+    expect(after - before).toBeGreaterThan(DAILY_DEMAND * 0.01)
   })
 
   it('норма считается от текущего населения, а не от стартового', () => {
     const grown = makeCity(TULA, { population: ROUND_POPULATION * 1.5 })
-    expect(demandPerDay(grown.population, 'мука')).toBeCloseTo(FLOUR_DAILY * 1.5, 9)
+    expect(demandPerDay(grown.population, 'мука')).toBeGreaterThan(FLOUR_DAILY)
     // Паспортное население Тулы — норма обязана считаться и от него тоже.
-    expect(demandPerDay(CITIES_BY_ID[TULA].population, 'мука')).toBeCloseTo(
-      (CONSUMPTION_PER_1K['мука'] ?? 0) * (CITIES_BY_ID[TULA].population / 1000),
-      9,
-    )
+    expect(demandPerDay(CITIES_BY_ID[TULA].population, 'мука')).toBeGreaterThan(0)
+  })
+
+  /**
+   * ФОРМА СПРОСА — ЭТО ИГРОВОЕ РЕШЕНИЕ, А НЕ ДЕТАЛЬ РЕАЛИЗАЦИИ, и она
+   * закрепляется здесь отдельной проверкой.
+   *
+   * Автодоставка закрывает тем меньшую долю потребления, чем крупнее город: у
+   * миллионника есть узловая станция, труба и река, у трёхсоттысячного — только
+   * шоссе. Прямая пропорция приписывала бы весь этот поток автомобилям и делала
+   * Москву единственным потребителем мира — из-за чего каждое кольцо возвращалось
+   * от неё порожняком через всю карту (разбор — в шапке нормы в data/recipes.ts).
+   */
+  it('спрос растёт медленнее населения: вдесятеро больший город ест не вдесятеро', () => {
+    const small = demandPerDay(300_000, 'мука')
+    const big = demandPerDay(3_000_000, 'мука')
+
+    expect(big).toBeGreaterThan(small)
+    expect(big).toBeLessThan(small * 10)
+    // И при этом не вырождается в «всем поровну»: разница обязана быть заметной.
+    expect(big).toBeGreaterThan(small * 2)
   })
 })
 

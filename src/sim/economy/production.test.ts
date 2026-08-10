@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { RECIPE_BY_INDUSTRY } from '../../data/recipes'
 import { cityId, companyId, industryId, TICKS_PER_DAY } from '../types'
 import type {
   CargoType,
@@ -17,17 +18,37 @@ import {
 } from './production'
 
 /**
- * Числа в этих тестах взяты из data/recipes.ts и посчитаны на бумаге, а не
- * выведены из кода производства. Так тест проверяет БАЛАНС, а не сам себя:
- * если формула выпуска поедет, ожидаемые тонны останутся прежними.
+ * Ожидания ВЫВОДЯТСЯ ИЗ РЕЦЕПТОВ (data/recipes.ts), но НЕ из кода производства.
+ * Это ровно та середина, которая нужна: тест по-прежнему считает выпуск своими
+ * руками, то есть проверяет правило, а не сам себя, — но переживает
+ * перебалансировку данных.
  *
- * Опорные величины при 96 тиках в сутках:
- *   элеватор     60 т/сут зерна          → 0.625     т/тик, склад 180 т
- *   ЦБК          30 т/сут пиломатериалов → 0.3125    т/тик, склад  90 т
- *                1.6 т кругляка на тонну → 0.5       т/тик входа
- *   мукомольный  40 т/сут муки           → 0.4166667 т/тик, склад 120 т
- *                1.25 т зерна на тонну   → 0.5208333 т/тик входа
+ * Прежде числа были вписаны на бумаге: 60 тонн зерна, 40 муки, 30
+ * пиломатериалов. Подъём масштаба мира уронил тринадцать проверок разом, при
+ * том что ни одно ПРАВИЛО производства не изменилось — изменились только
+ * данные. Тест, который помнит цифры из чужого файла, ловит не ошибки, а правки.
  */
+
+/** Суточный выпуск — прямо из рецептов. */
+const RATE = {
+  элеватор: RECIPE_BY_INDUSTRY['элеватор'].dailyRate,
+  мукомольный: RECIPE_BY_INDUSTRY['мукомольный'].dailyRate,
+  ЦБК: RECIPE_BY_INDUSTRY['ЦБК'].dailyRate,
+} as const
+
+/** Сколько сырья предприятие съедает за сутки при полной загрузке. */
+function inputPerDay(type: 'мукомольный' | 'ЦБК'): number {
+  const recipe = RECIPE_BY_INDUSTRY[type]
+  return recipe.dailyRate * recipe.inputs[0].perUnit
+}
+
+/** Расход сырья на тонну продукции. */
+function perUnit(type: 'мукомольный' | 'ЦБК'): number {
+  return RECIPE_BY_INDUSTRY[type].inputs[0].perUnit
+}
+
+/** Выпуск за один тик. */
+const perTick = (type: keyof typeof RATE) => RATE[type] / TICKS_PER_DAY
 
 const TULA = cityId('tula')
 const PLAYER = companyId('player')
@@ -132,11 +153,13 @@ describe('stockCapacity', () => {
     const elevator = makeIndustry(ELEV, 'элеватор')
     const mill = makeIndustry(MILL, 'мукомольный')
 
-    expect(stockCapacity(elevator, 'зерно')).toBe(60 * STOCK_DAYS)
+    expect(stockCapacity(elevator, 'зерно')).toBe(RATE.элеватор * STOCK_DAYS)
     // У переработки запас считается по КАЖДОМУ грузу отдельно и по её
-    // собственному обороту: 40 т муки в сутки требуют 50 т зерна.
-    expect(stockCapacity(mill, 'мука')).toBe(40 * STOCK_DAYS)
-    expect(stockCapacity(mill, 'зерно')).toBe(50 * STOCK_DAYS)
+    // собственному обороту: суточная мука и суточное зерно под неё.
+    expect(stockCapacity(mill, 'мука')).toBe(RATE.мукомольный * STOCK_DAYS)
+    expect(stockCapacity(mill, 'зерно')).toBe(
+      inputPerDay('мукомольный') * STOCK_DAYS,
+    )
   })
 
   it('не принимает груз, которого нет в рецепте', () => {
@@ -150,7 +173,7 @@ describe('runProduction: источники', () => {
 
     const day = run(state, TICKS_PER_DAY)
 
-    expect(at(day, ELEV).stock.зерно).toBeCloseTo(60, 9)
+    expect(at(day, ELEV).stock.зерно).toBeCloseTo(RATE.элеватор, 9)
     expect(at(day, ELEV).utilization).toBe(1)
     expect(at(day, ELEV).idleTicks).toBe(0)
   })
@@ -160,32 +183,39 @@ describe('runProduction: источники', () => {
 
     const half = run(state, TICKS_PER_DAY / 2)
 
-    expect(at(half, ELEV).stock.зерно).toBeCloseTo(30, 9)
+    expect(at(half, ELEV).stock.зерно).toBeCloseTo(RATE.элеватор / 2, 9)
   })
 
   it('полный склад останавливает предприятие', () => {
-    // 180 т — трое суток выпуска, склад забит под завязку.
-    const state = makeState(makeIndustry(ELEV, 'элеватор', { зерно: 180 }))
+    // Трое суток выпуска — склад забит под завязку.
+    const full = RATE.элеватор * STOCK_DAYS
+    const state = makeState(makeIndustry(ELEV, 'элеватор', { зерно: full }))
 
     const after = run(state, 1)
 
     expect(at(after, ELEV).utilization).toBe(0)
-    expect(at(after, ELEV).stock.зерно).toBe(180)
+    expect(at(after, ELEV).stock.зерно).toBe(full)
     expect(at(after, ELEV).idleTicks).toBe(1)
   })
 
   it('перед остановкой тормозит, а не выключается', () => {
-    // Места осталось 0.2 т при выпуске 0.625 т/тик — работаем на остаток.
-    const state = makeState(makeIndustry(ELEV, 'элеватор', { зерно: 179.8 }))
+    // Места осталось на треть тика выпуска — работаем на остаток.
+    const full = RATE.элеватор * STOCK_DAYS
+    const room = perTick('элеватор') / 3
+    const state = makeState(
+      makeIndustry(ELEV, 'элеватор', { зерно: full - room }),
+    )
 
     const after = run(state, 1)
 
-    expect(at(after, ELEV).stock.зерно).toBeCloseTo(180, 9)
-    expect(at(after, ELEV).utilization).toBeCloseTo(0.2 / 0.625, 9)
+    expect(at(after, ELEV).stock.зерно).toBeCloseTo(full, 9)
+    expect(at(after, ELEV).utilization).toBeCloseTo(1 / 3, 9)
   })
 
   it('освобождение склада возобновляет работу', () => {
-    const state = makeState(makeIndustry(ELEV, 'элеватор', { зерно: 180 }))
+    const state = makeState(
+      makeIndustry(ELEV, 'элеватор', { зерно: RATE.элеватор * STOCK_DAYS }),
+    )
 
     const stalled = run(state, 5)
     expect(at(stalled, ELEV).utilization).toBe(0)
@@ -195,7 +225,7 @@ describe('runProduction: источники', () => {
     const resumed = run(withStock(stalled, ELEV, {}), 1)
 
     expect(at(resumed, ELEV).utilization).toBe(1)
-    expect(at(resumed, ELEV).stock.зерно).toBeCloseTo(0.625, 9)
+    expect(at(resumed, ELEV).stock.зерно).toBeCloseTo(perTick('элеватор'), 9)
     expect(at(resumed, ELEV).idleTicks).toBe(0)
   })
 })
@@ -203,22 +233,30 @@ describe('runProduction: источники', () => {
 describe('runProduction: переработка', () => {
   it('потребляет вход и производит выход в пропорции рецепта', () => {
     // Трое суток зерна на складе — комбинату есть из чего работать сутки.
-    const state = makeState(makeIndustry(MILL, 'мукомольный', { зерно: 150 }))
+    const grain = inputPerDay('мукомольный') * STOCK_DAYS
+    const state = makeState(makeIndustry(MILL, 'мукомольный', { зерно: grain }))
 
     const day = run(state, TICKS_PER_DAY)
 
-    expect(at(day, MILL).stock.мука).toBeCloseTo(40, 9)
-    expect(at(day, MILL).stock.зерно).toBeCloseTo(100, 9)
+    expect(at(day, MILL).stock.мука).toBeCloseTo(RATE.мукомольный, 9)
+    expect(at(day, MILL).stock.зерно).toBeCloseTo(
+      grain - inputPerDay('мукомольный'),
+      9,
+    )
     expect(at(day, MILL).utilization).toBe(1)
   })
 
   it('при половине нужного сырья выпуск падает вдвое', () => {
-    // ЦБК съедает 0.5 т кругляка за тик — даём ровно половину.
-    const state = makeState(makeIndustry(CBK, 'ЦБК', { кругляк: 0.25 }))
+    // Даём ровно половину того, что ЦБК съедает за тик.
+    const half = inputPerDay('ЦБК') / TICKS_PER_DAY / 2
+    const state = makeState(makeIndustry(CBK, 'ЦБК', { кругляк: half }))
 
     const after = run(state, 1)
 
-    expect(at(after, CBK).stock.пиломатериалы).toBeCloseTo(0.3125 / 2, 9)
+    expect(at(after, CBK).stock.пиломатериалы).toBeCloseTo(
+      perTick('ЦБК') / 2,
+      9,
+    )
     expect(at(after, CBK).utilization).toBeCloseTo(0.5, 9)
     expect(at(after, CBK).stock.кругляк).toBe(0)
   })
@@ -226,11 +264,15 @@ describe('runProduction: переработка', () => {
   it('дефицит режет темп, а не выключает цепочку', () => {
     // Половина суточной нормы зерна должна дать половину суточной нормы муки —
     // неважно, что кончится она в середине суток.
-    const state = makeState(makeIndustry(MILL, 'мукомольный', { зерно: 25 }))
+    const state = makeState(
+      makeIndustry(MILL, 'мукомольный', {
+        зерно: inputPerDay('мукомольный') / 2,
+      }),
+    )
 
     const day = run(state, TICKS_PER_DAY)
 
-    expect(at(day, MILL).stock.мука).toBeCloseTo(20, 9)
+    expect(at(day, MILL).stock.мука).toBeCloseTo(RATE.мукомольный / 2, 9)
   })
 
   it('без сырья стоит и ничего не создаёт', () => {
@@ -246,14 +288,16 @@ describe('runProduction: переработка', () => {
   it('полный склад продукции останавливает и расход сырья', () => {
     // Ключевое для среза: невывезенная мука не даёт сжечь зерно. Завод именно
     // задыхается, а не работает в никуда.
+    const grain = inputPerDay('мукомольный') * STOCK_DAYS
+    const flour = RATE.мукомольный * STOCK_DAYS
     const state = makeState(
-      makeIndustry(MILL, 'мукомольный', { зерно: 150, мука: 120 }),
+      makeIndustry(MILL, 'мукомольный', { зерно: grain, мука: flour }),
     )
 
     const day = run(state, TICKS_PER_DAY)
 
-    expect(at(day, MILL).stock.зерно).toBe(150)
-    expect(at(day, MILL).stock.мука).toBe(120)
+    expect(at(day, MILL).stock.зерно).toBe(grain)
+    expect(at(day, MILL).stock.мука).toBe(flour)
     expect(at(day, MILL).utilization).toBe(0)
     expect(at(day, MILL).idleTicks).toBe(TICKS_PER_DAY)
   })
@@ -270,29 +314,32 @@ describe('runProduction: переработка', () => {
     const eaten = grain - left
 
     expect(left).toBe(0)
-    expect(eaten).toBeCloseTo(flour * 1.25, 9)
-    expect(flour).toBeCloseTo(grain / 1.25, 9)
+    expect(eaten).toBeCloseTo(flour * perUnit('мукомольный'), 9)
+    expect(flour).toBeCloseTo(grain / perUnit('мукомольный'), 9)
   })
 
   it('баланс массы держится и при непрерывном подвозе с вывозом', () => {
-    const state = makeState(makeIndustry(MILL, 'мукомольный', { зерно: 150 }))
+    const grain = inputPerDay('мукомольный') * STOCK_DAYS
+    const state = makeState(makeIndustry(MILL, 'мукомольный', { зерно: grain }))
 
     // Машины стоят и на входе, и на выходе: муку увозят, зерно досыпают до
     // трёх суток. Проверяем, что за неделю не появилось лишней массы.
     let hauled = 0
     const day = run(state, TICKS_PER_DAY * 7, (s) => {
       hauled += at(s, MILL).stock.мука ?? 0
-      return withStock(s, MILL, { зерно: 150 })
+      return withStock(s, MILL, { зерно: grain })
     })
 
-    expect(hauled).toBeCloseTo(40 * 7, 6)
+    expect(hauled).toBeCloseTo(RATE.мукомольный * 7, 6)
     expect(at(day, MILL).utilization).toBe(1)
   })
 })
 
 describe('runProduction: простой и деградация', () => {
   it('счётчик простоя растёт при остановке и обнуляется при работе', () => {
-    const state = makeState(makeIndustry(ELEV, 'элеватор', { зерно: 180 }))
+    const state = makeState(
+      makeIndustry(ELEV, 'элеватор', { зерно: RATE.элеватор * STOCK_DAYS }),
+    )
 
     const stalled = run(state, 7)
     expect(at(stalled, ELEV).idleTicks).toBe(7)
@@ -317,7 +364,9 @@ describe('runProduction: простой и деградация', () => {
   })
 
   it('долгий простой снижает выпуск', () => {
-    const state = makeState(makeIndustry(ELEV, 'элеватор', { зерно: 180 }))
+    const state = makeState(
+      makeIndustry(ELEV, 'элеватор', { зерно: RATE.элеватор * STOCK_DAYS }),
+    )
 
     // Пятнадцать суток забвения: пять суток сверх порога — минус 25%.
     const forgotten = run(state, TICKS_PER_DAY * 15)
@@ -326,12 +375,17 @@ describe('runProduction: простой и деградация', () => {
     const first = run(withStock(forgotten, ELEV, {}), 1)
 
     expect(at(first, ELEV).utilization).toBeCloseTo(0.75, 9)
-    expect(at(first, ELEV).stock.зерно).toBeCloseTo(0.625 * 0.75, 9)
+    expect(at(first, ELEV).stock.зерно).toBeCloseTo(
+      perTick('элеватор') * 0.75,
+      9,
+    )
   })
 
   it('работа восстанавливает мощность, но не мгновенно', () => {
     const forgotten = run(
-      makeState(makeIndustry(ELEV, 'элеватор', { зерно: 180 })),
+      makeState(
+        makeIndustry(ELEV, 'элеватор', { зерно: RATE.элеватор * STOCK_DAYS }),
+      ),
       TICKS_PER_DAY * 15,
     )
     const revived = withStock(forgotten, ELEV, {})
@@ -395,8 +449,10 @@ describe('runProduction: чистота фазы', () => {
   it('предприятия считаются независимо друг от друга', () => {
     // Забитый элеватор не должен мешать работающему комбинату и наоборот.
     const state = makeState(
-      makeIndustry(ELEV, 'элеватор', { зерно: 180 }),
-      makeIndustry(MILL, 'мукомольный', { зерно: 150 }),
+      makeIndustry(ELEV, 'элеватор', { зерно: RATE.элеватор * STOCK_DAYS }),
+      makeIndustry(MILL, 'мукомольный', {
+        зерно: inputPerDay('мукомольный') * STOCK_DAYS,
+      }),
     )
 
     const day = run(state, TICKS_PER_DAY)
@@ -404,6 +460,6 @@ describe('runProduction: чистота фазы', () => {
     expect(at(day, ELEV).utilization).toBe(0)
     expect(at(day, ELEV).idleTicks).toBe(TICKS_PER_DAY)
     expect(at(day, MILL).utilization).toBe(1)
-    expect(at(day, MILL).stock.мука).toBeCloseTo(40, 9)
+    expect(at(day, MILL).stock.мука).toBeCloseTo(RATE.мукомольный, 9)
   })
 })

@@ -77,8 +77,6 @@ const LINE_TRUCK = 'zil-1'
  * командой, а state.ts, и остаётся 'zil-1'.
  */
 const CONTROL_TRUCK = 'player-zil-130-1'
-/** Машина, выданная на старте партии. */
-const STARTER_TRUCK = 'zil-1'
 
 /**
  * Сколько игровых суток наблюдаем.
@@ -377,11 +375,12 @@ test('линия держит машину гружёной, а разовые �
         __plecho: {
           getState(): {
             buyVehicle(classId: string): void
+            buyTrailer(vehicleId: string, trailer: string): void
             hireDriver(): void
             assignDriver(driverId: string, vehicleId: string): void
             state: {
               playerId: string
-              vehicles: Record<string, unknown>
+              vehicles: Record<string, { ownerId: string }>
               companies: Record<
                 string,
                 { drivers: Record<string, { id: string; vehicleId: string | null }> }
@@ -411,41 +410,98 @@ test('линия держит машину гружёной, а разовые �
 
     store.getState().buyVehicle('zil-130')
 
-    // В срезе 4 купленная машина без водителя не трогается с места. Для
-    // контрольной машины это не предмет проверки, а препятствие: нанимаем и
-    // сажаем за руль, иначе тест меряет не порожний пробег, а простой.
+    /*
+     * КУПЛЕННУЮ МАШИНУ НАДО ДОСОБРАТЬ, И ЭТО НЕ ОБХОД ПРАВИЛ, А САМИ ПРАВИЛА.
+     *
+     * Машина в этой игре собирается из трёх решений: тягач, прицеп, водитель
+     * (см. buyVehicle в app/store.ts). Тест берёт все три штатными действиями
+     * стора — иначе он меряет не порожний пробег, а недокомплект:
+     *
+     *   без водителя машина не трогается с места вовсе (срез 4);
+     *   без прицепа едет, но не может взять НИ ОДНОГО груза, и её порожняя
+     *   доля равна ста процентам при любом диспетчере. Сравнивать с такой
+     *   машиной линию бессмысленно — это сравнение с неработающей единицей,
+     *   а не с худшим способом работы.
+     *
+     * Тент — тот же кузов, что стоит на стартовой машине: контроль обязан
+     * отличаться от линии СПОСОБОМ РАБОТЫ, а не оснащением.
+     */
     const s2 = store.getState()
+    s2.buyTrailer('player-zil-130-1', 'тент')
     s2.hireDriver()
+
     const after = store.getState()
     const player = after.state.companies[after.state.playerId]
     const freeDriver = Object.values(player.drivers).find(
       (d) => d.vehicleId === null,
     )
+
+    /*
+     * МАШИНА ИЩЕТСЯ В ПАРКЕ ИГРОКА, А НЕ В МИРЕ. С среза 6 в состоянии живут
+     * три конкурента, и у каждого свой ЗИЛ у ворот; в ключах state.vehicles они
+     * стоят РАНЬШЕ купленной машины. Прежний поиск «первая, чей id не zil-1»
+     * находил magistral-zil-1 и сажал водителя игрока в чужой грузовик —
+     * назначение отвергалось, контрольная машина оставалась без водителя, и
+     * весь контроль давал ноль километров. Отсюда же росло ложное объяснение
+     * «покупка не даёт прицепа»: без водителя машина не поехала бы и с ним.
+     */
     const newTruck = Object.keys(after.state.vehicles).find(
-      (id) => id !== 'zil-1',
+      (id) =>
+        id !== 'zil-1' &&
+        after.state.vehicles[id].ownerId === after.state.playerId,
     )
     if (freeDriver && newTruck) {
       after.assignDriver(freeDriver.id, newTruck)
     }
   })
 
-  // Идентификатор новой машины назначает стор, и его формат — его дело:
-  // в срезе 4 он стал зависеть от класса. Тест ищет машину, которой не было,
-  // а не угадывает имя.
-  const bought = await page.evaluate(
-    (known) =>
-      Object.keys(
-        (
-          globalThis as unknown as {
-            __plecho: {
-              getState(): { state: { vehicles: Record<string, unknown> } }
+  /*
+   * КОНТРОЛЬНАЯ МАШИНА СОБРАНА ЦЕЛИКОМ — проверяется до прогона, а не после.
+   *
+   * Раньше здесь стояло «в мире есть машина, кроме стартовой», и утверждение
+   * было пустым: чужих машин в мире три, и оно проходило, даже когда покупка
+   * игрока не срабатывала вовсе. Проверять надо ровно то, от чего зависит
+   * опыт, — что контроль может ехать (водитель) и может брать груз (прицеп).
+   */
+  const rig = await page.evaluate(
+    ([id, owner]) => {
+      const state = (
+        globalThis as unknown as {
+          __plecho: {
+            getState(): {
+              state: {
+                playerId: string
+                vehicles: Record<
+                  string,
+                  {
+                    ownerId: string
+                    driverId: string | null
+                    trailer: string | null
+                  }
+                >
+              }
             }
           }
-        ).__plecho.getState().state.vehicles,
-      ).some((id) => id !== known),
-    STARTER_TRUCK,
+        }
+      ).__plecho.getState().state
+
+      const vehicle = state.vehicles[id]
+      if (vehicle === undefined) return { есть: false }
+
+      return {
+        есть: true,
+        своя: vehicle.ownerId === state[owner as 'playerId'],
+        водитель: vehicle.driverId,
+        прицеп: vehicle.trailer,
+      }
+    },
+    [CONTROL_TRUCK, 'playerId'] as const,
   )
-  expect(bought, 'вторая машина куплена штатным действием стора').toBe(true)
+
+  expect(rig.есть, 'вторая машина куплена штатным действием стора').toBe(true)
+  expect(rig.своя, 'контрольная машина принадлежит игроку').toBe(true)
+  expect(rig.водитель, 'за рулём контрольной машины сидит водитель').toBeTruthy()
+  expect(rig.прицеп, 'на контрольной машине стоит кузов').toBe('тент')
 
   // ─── Линия ───────────────────────────────────────────────────────────────
 
@@ -613,30 +669,19 @@ test('линия держит машину гружёной, а разовые �
       )} из ${Math.round(control.loadedKm + control.emptyKm)} км)`,
   )
 
-  // Обе машины действительно работали. Без этой проверки нулевые счётчики
-  // сравнились бы как «0 меньше 0» и тест был бы зелёным на мёртвой игре.
-  expect(line.loadedKm, 'машина на линии возила груз').toBeGreaterThan(0)
-
   /*
-   * СРАВНЕНИЕ С РАЗОВЫМИ РЕЙСАМИ ВРЕМЕННО ОСЛАБЛЕНО, и стоит сказать почему.
+   * ОБЕ МАШИНЫ ДЕЙСТВИТЕЛЬНО РАБОТАЛИ, и проверяется это безусловно.
    *
-   * Контрольная машина покупается, ей нанимается и сажается водитель — это
-   * проверено пробой в браузере, — но в прогоне она остаётся с нулевым
-   * пробегом, то есть челнок так и не отправляет её в рейс. Разбор упирается в
-   * то, что купленная машина приходит БЕЗ ПРИЦЕПА (buyVehicle его не даёт), и
-   * это отдельный вопрос к интерфейсу покупки, а не к линиям.
-   *
-   * Само утверждение среза при этом доказано и без контрольной машины: линия
-   * держит порожний пробег в пределах геометрии кольца. Замер печатается выше
-   * и лежит около 16% — против 100% у машины, которая ездит разовыми рейсами
-   * (это видно в прогонах вручную). Как только починится покупка прицепа,
-   * сравнение вернётся сюда целиком.
+   * Без такой проверки нулевые счётчики сравнились бы как «0 меньше 0», и тест
+   * был бы зелёным на мёртвой игре. Ровно это здесь и случилось однажды: пока
+   * контроль стоял без водителя, сравнение было обёрнуто в «если машина вообще
+   * ездила» — и молча не выполнялось ни разу. Условие в утверждении означает,
+   * что утверждения нет.
    */
-  if (control.loadedKm + control.emptyKm > 0) {
-    expect(control.emptyKm, 'контрольная машина ездила порожняком').toBeGreaterThan(0)
-  }
+  expect(line.loadedKm, 'машина на линии возила груз').toBeGreaterThan(0)
+  expect(control.loadedKm, 'контрольная машина возила груз').toBeGreaterThan(0)
+  expect(control.emptyKm, 'контрольная машина ездила порожняком').toBeGreaterThan(0)
 
-  if (control.loadedKm + control.emptyKm > 0)
   expect(
     line.share,
     `порожний пробег: линия ${percent(line.share)}, разовые рейсы ${percent(
@@ -648,8 +693,7 @@ test('линия держит машину гружёной, а разовые �
   // из двух. Линия с двумя гружёными плечами из трёх обязана быть по эту
   // сторону границы, контроль — по ту.
   expect(line.share, 'кольцо лучше челнока').toBeLessThan(SHUTTLE_EMPTY_SHARE)
-  if (control.loadedKm + control.emptyKm > 0)
-    expect(control.share, 'челнок не лучше кольца').toBeGreaterThan(
+  expect(control.share, 'челнок не лучше кольца').toBeGreaterThan(
     RING_EMPTY_SHARE,
   )
 

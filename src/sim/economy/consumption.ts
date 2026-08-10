@@ -32,7 +32,7 @@
  */
 
 import { CITIES_BY_ID } from '../../data/cities'
-import { CONSUMER_CARGO, CONSUMPTION_PER_1K } from '../../data/recipes'
+import { CONSUMER_CARGO, CONSUMPTION_PER_ROOT_1K } from '../../data/recipes'
 import { TICKS_PER_DAY } from '../types'
 import type { CargoType, City, CityId, GameState, Tons } from '../types'
 
@@ -151,14 +151,18 @@ const SHRINK_TICK_STEP =
  * Суточная потребность города в грузе, тонн.
  *
  * Нормы заданы на тысячу жителей — отсюда деление. Неизвестный груз даёт ноль,
- * а не NaN: списки CONSUMER_CARGO и CONSUMPTION_PER_1K лежат в данных рядом, но
+ * а не NaN: списки CONSUMER_CARGO и CONSUMPTION_PER_ROOT_1K лежат в данных рядом, но
  * порознь, и рассинхрон между ними обязан оставить город без спроса, а не
  * превратить его население в NaN — NaN отсюда расползётся по всей экономике и
  * переживёт сохранение.
  */
 export function demandPerDay(population: number, cargo: CargoType): Tons {
-  const rate = CONSUMPTION_PER_1K[cargo] ?? 0
-  const demand = (rate * population) / 1000
+  const rate = CONSUMPTION_PER_ROOT_1K[cargo] ?? 0
+  // Корень из тысяч жителей — разбор, почему не сами тысячи, в шапке нормы.
+  // Отрицательное население (битый сейв) дало бы NaN, поэтому пол нулём стоит
+  // ДО корня, а не после.
+  const thousands = population > 0 ? population / 1000 : 0
+  const demand = rate * Math.sqrt(thousands)
   return demand > 0 ? demand : 0
 }
 

@@ -2,6 +2,9 @@ import { describe, expect, it } from 'vitest'
 import { RECIPE_BY_INDUSTRY } from '../data/recipes'
 import { VEHICLE_CLASS_BY_ID } from '../data/vehicles'
 import { runCommands } from './ai/commands'
+import { SHIFT_STRETCH } from './ai/scripted'
+import { demandPerDay } from './economy/consumption'
+import { CITY_STOCK_DAYS } from './logistics/loading'
 import { needsService, repairVehicle, serviceVehicle } from './logistics/wear'
 import {
   COMPETITORS,
@@ -10,10 +13,13 @@ import {
   starterDriverIdOf,
   starterVehicleIdOf,
   START_MONEY,
+  STARTER_CLASS_ID,
   STARTER_VEHICLE_ID,
 } from './state'
 import { THINKING_LIMIT, tick, tickMany } from './tick'
 import { TICKS_PER_DAY, cityId, industryId, lineId } from './types'
+import { buildGraph } from './world/graph'
+import { shortestKm } from './world/pathfind'
 import type {
   CargoType,
   CityId,
@@ -105,14 +111,20 @@ function onRing(
   state: GameState,
   owner: CompanyId,
   stops: readonly Stop[],
-  truckId: VehicleId,
+  trucks: VehicleId | readonly VehicleId[],
 ): GameState {
+  const ids = Array.isArray(trucks) ? trucks : [trucks as VehicleId]
   const company = state.companies[owner]
   const line: Line = {
     id: RING,
     name: 'Кольцо',
     stops: copyStops(stops),
-    assignedVehicles: [truckId],
+    assignedVehicles: [...ids],
+  }
+
+  const vehicles = { ...state.vehicles }
+  for (const id of ids) {
+    vehicles[id] = { ...vehicles[id], lineId: RING, stopIndex: 0 }
   }
 
   return {
@@ -121,10 +133,7 @@ function onRing(
       ...state.companies,
       [owner]: { ...company, lines: { [RING]: line } },
     },
-    vehicles: {
-      ...state.vehicles,
-      [truckId]: { ...state.vehicles[truckId], lineId: RING, stopIndex: 0 },
-    },
+    vehicles,
   }
 }
 
@@ -593,9 +602,51 @@ describe('конкурент реально мешает: та же линия �
    * и первые недели обе машины разбирают ЗАПАС, а не текущую выработку: на
    * двадцати сутках прогоны сходятся до рубля. Дефицит начинается там, где запас
    * кончился, и меряется он только на длинной дистанции.
+   *
+   * ПОЧЕМУ У КАЖДОГО ПАРК, А НЕ ОДНА МАШИНА. Прежде здесь ездили две машины,
+   * по одной на компанию, и этого хватало: мукомольный выпускал сорок тонн в
+   * сутки, а ЗИЛ на плече в 395 км увозит около семи — двое уже дрались за
+   * остаток. После подъёма масштаба мира комбинат даёт больше сотни тонн, и
+   * две машины делить попросту нечего: каждая грузится полным кузовом, сколько
+   * бы соседей рядом ни работало. Это не поломка конкуренции, а её новая цена —
+   * в большом мире соперничество начинается с ПАРКА. Размер парка выведен из
+   * выпуска завода, а не назначен числом: изменится выпуск — изменится и он.
    */
-  const DAYS = 40
+  const DAYS = 70
   const RIVAL = COMPETITORS[0].id
+
+  /**
+   * Сколько машин держит одна компания.
+   *
+   * Ровно столько, чтобы ОДНА компания закрывала аппетит Москвы по муке — и ни
+   * машиной больше. Тогда второй перевозчик обязан ОТНИМАТЬ, а не подбирать.
+   *
+   * МЕРА — СПРОС ГОРОДА, А НЕ ВЫПУСК ЗАВОДА, и это стоило одного прогона.
+   * Сначала парк был отмерен по мельнице (сто тонн в сутки), и в одиночку игрок
+   * зарабатывал два миллиона, а вдвоём ОБЕ компании разорялись: Москва берёт
+   * около полусотни тонн, её склад забивался под завязку, выгружаться становилось
+   * некуда, и парки стояли гружёными. Это не конкуренция, а обоюдное удушение
+   * перепроизводством — и мерить им влияние соперника нельзя.
+   *
+   * Аппетит машины считается грубо — плечо, крейсерская скорость и растяжка
+   * смены, без постов, — потому что точность здесь не нужна: нужен порядок
+   * величины.
+   */
+  const FLEET = (() => {
+    const zil = VEHICLE_CLASS_BY_ID[STARTER_CLASS_ID]
+    const mill = RECIPE_BY_INDUSTRY['мукомольный']
+    const world = createInitialState(SEED)
+    const ringKm =
+      2 * shortestKm(buildGraph(world.world.edges), MOSCOW, SMOLENSK)
+    const cycleHours = (ringKm / zil.cruiseKmh) * SHIFT_STRETCH
+    const tonsPerDay = (zil.capacity * 24) / cycleHours
+    const appetite = demandPerDay(world.world.cities[MOSCOW].population, 'мука')
+    // Парк меряется по ЗЕРНУ, а мука выходит из него с потерей массы: обратно
+    // машина увезёт кузов, делённый на perUnit. Поэтому аппетит города
+    // умножается на perUnit — иначе одна компания привозила бы Москве меньше,
+    // чем та съедает, и склад не насыщался бы даже вдвоём.
+    return Math.max(2, Math.round((appetite * mill.inputs[0].perUnit) / tonsPerDay))
+  })()
 
   /** Кольцо с двумя гружёными плечами: зерно туда, мука обратно. */
   const RING_STOPS: Stop[] = [
@@ -641,6 +692,60 @@ describe('конкурент реально мешает: та же линия �
     >
   }
 
+  /** Идентификаторы парка компании: стартовая машина плюс клоны. */
+  function fleetIdsOf(owner: CompanyId): VehicleId[] {
+    const first =
+      owner === PLAYER_ID ? STARTER_VEHICLE_ID : starterVehicleIdOf(owner)
+    const rest: VehicleId[] = []
+    for (let i = 2; i <= FLEET; i++) {
+      rest.push(`${first}-${i}` as VehicleId)
+    }
+    return [first, ...rest]
+  }
+
+  /**
+   * Парк из клонов стартовой машины — с водителем и кузовом.
+   *
+   * Клонируется именно СТАРТОВАЯ машина, а не собирается новая: так у обеих
+   * компаний парк совпадает до последнего поля, и разница между прогонами
+   * остаётся ровно одна — присутствие соперника.
+   */
+  function withFleet(state: GameState, owner: CompanyId): GameState {
+    const [first, ...clones] = fleetIdsOf(owner)
+    const origin = state.vehicles[first]
+    // Первый водитель компании, а не «player-drv-1»: у игрока стартовый водитель
+    // зовётся driver-1 (STARTER_DRIVER_ID в state.ts), у конкурентов — по схеме
+    // starterDriverIdOf. Клонировать надо того, кто есть.
+    const driver = Object.values(state.companies[owner].drivers)[0]
+
+    const vehicles = { ...state.vehicles }
+    const drivers = { ...state.companies[owner].drivers }
+
+    for (const id of clones) {
+      const driverId = `${id}-drv` as typeof driver.id
+      drivers[driverId] = { ...driver, id: driverId, vehicleId: id }
+      vehicles[id] = {
+        ...origin,
+        id,
+        driverId,
+        // Счётчики пробега с нуля: клон не наследует чужую историю, иначе
+        // порожняя доля прогона считалась бы от выдуманных километров.
+        odometer: 0,
+        loadedKm: 0,
+        emptyKm: 0,
+      }
+    }
+
+    return {
+      ...state,
+      vehicles,
+      companies: {
+        ...state.companies,
+        [owner]: { ...state.companies[owner], drivers },
+      },
+    }
+  }
+
   function world(owners: readonly CompanyId[]): GameState {
     const base = keepOnly(createInitialState(SEED), owners)
     let next: GameState = {
@@ -648,14 +753,22 @@ describe('конкурент реально мешает: та же линия �
       world: { ...base.world, industries: trainingIndustries() },
     }
     for (const owner of owners) {
-      next = onRing(
-        next,
-        owner,
-        RING_STOPS,
-        owner === PLAYER_ID ? STARTER_VEHICLE_ID : starterVehicleIdOf(owner),
-      )
+      next = withFleet(next, owner)
+      next = onRing(next, owner, RING_STOPS, fleetIdsOf(owner))
     }
     return next
+  }
+
+  /** Заработок компании за прогон — по всему парку, а не по одной машине. */
+  function profitOf(state: GameState, owner: CompanyId): number {
+    return state.companies[owner].money - START_MONEY
+  }
+
+  /** Суммарный пробег парка компании. */
+  function odometerOf(state: GameState, owner: CompanyId): number {
+    return Object.values(state.vehicles)
+      .filter((vehicle) => vehicle.ownerId === owner)
+      .reduce((sum, vehicle) => sum + vehicle.odometer, 0)
   }
 
   const solo = runTended(world([PLAYER_ID]), DAYS)
@@ -664,6 +777,8 @@ describe('конкурент реально мешает: та же линия �
   const soloTruck = solo.vehicles[STARTER_VEHICLE_ID]
   const sharedTruck = shared.vehicles[STARTER_VEHICLE_ID]
   const rivalTruck = shared.vehicles[starterVehicleIdOf(RIVAL)]
+  const soloKm = odometerOf(solo, PLAYER_ID)
+  const sharedKm = odometerOf(shared, PLAYER_ID)
 
   it('кольцо кормит: в пустом мире игрок в плюсе', () => {
     // Без этого проверка ниже сравнивала бы два убытка, и «приносит меньше»
@@ -684,13 +799,16 @@ describe('конкурент реально мешает: та же линия �
      * это РАЗНИЦА В ВЫРУЧКЕ, а не в расходах: без этой проверки тест доказывал
      * бы лишь то, что рядом с конкурентом машина стала меньше кататься.
      */
+    expect(sharedKm).toBeGreaterThan(soloKm * 0.95)
+    expect(sharedKm).toBeLessThan(soloKm * 1.05)
+    // И это верно для отдельной машины тоже, а не только в сумме по парку.
     expect(sharedTruck.odometer).toBeGreaterThan(soloTruck.odometer * 0.95)
     expect(sharedTruck.odometer).toBeLessThan(soloTruck.odometer * 1.05)
   })
 
   it('рядом с конкурентом та же линия приносит МЕНЬШЕ', () => {
-    const soloProfit = solo.companies[PLAYER_ID].money - START_MONEY
-    const sharedProfit = shared.companies[PLAYER_ID].money - START_MONEY
+    const soloProfit = profitOf(solo, PLAYER_ID)
+    const sharedProfit = profitOf(shared, PLAYER_ID)
 
     // ЭТО И ЕСТЬ КОНКУРЕНЦИЯ, ВЫРАЖЕННАЯ В РУБЛЯХ. Кольцо, расходы, машина и
     // водитель совпадают; отличается только то, что часть муки увёз чужой.
@@ -701,14 +819,41 @@ describe('конкурент реально мешает: та же линия �
     expect(soloProfit - sharedProfit).toBeGreaterThan(soloProfit * 0.25)
   })
 
-  it('делят они именно выработку завода', () => {
-    const mill = industryId('smolensk-mill')
-    // Прямая улика: в одиночку игрок не успевает вывезти всё, что смолол завод,
-    // и мука на складе остаётся. Вдвоём склад выметается почти дочиста — вот эти
-    // тонны у игрока и отняли.
-    const alone = solo.world.industries[mill].stock['мука'] ?? 0
-    const together = shared.world.industries[mill].stock['мука'] ?? 0
-    expect(together).toBeLessThan(alone)
+  it('делят они конечный мир: вдвоём каждый везёт меньше', () => {
+    /*
+     * ПРЯМАЯ УЛИКА — В ТОННО-КИЛОМЕТРАХ ИГРОКА, А НЕ В ОСТАТКЕ НА СКЛАДЕ ЗАВОДА.
+     *
+     * Прежде здесь сравнивался остаток муки на мельнице: в одиночку игрок не
+     * успевал вывезти всё, вдвоём склад выметался дочиста. После подъёма
+     * масштаба мира узкое место переехало — теперь первым насыщается не завод,
+     * а ПОТРЕБИТЕЛЬ: мельница мелет больше сотни тонн в сутки, а Москва берёт
+     * около полусотни, и вдвоём перевозчики упираются в её склад раньше, чем в
+     * выработку. Остаток на мельнице при этом РАСТЁТ, а не падает, — и старая
+     * улика начинает указывать в противоположную сторону, оставаясь при этом
+     * верной по сути: мир конечен.
+     *
+     * Поэтому мерим то, что не зависит от того, какой именно предел сработал
+     * первым: сколько ГРУЖЁНЫХ километров сделал парк игрока. Меньше гружёных
+     * километров при том же общем пробеге — это и есть отнятый груз.
+     */
+    const population = solo.world.cities[MOSCOW].population
+    const daily = demandPerDay(population, 'мука')
+    const capacity = daily * CITY_STOCK_DAYS
+
+    const aloneStock = solo.world.cities[MOSCOW].stock['мука'] ?? 0
+    const sharedStock = shared.world.cities[MOSCOW].stock['мука'] ?? 0
+
+    // В одиночку игрок кормит столицу ровно по аппетиту: склад пуст, каждая
+    // привезённая тонна съедена.
+    expect(aloneStock).toBeLessThan(daily)
+
+    // Вдвоём привозят вдвое, а съедает столица столько же — склад забит под
+    // завязку, и дальше выгружаться просто некуда. Вот эти тонны и не доехали.
+    expect(sharedStock).toBeGreaterThan(capacity * 0.9)
+
+    // Соперник при этом не голодал: он увёз ту часть спроса, которая досталась
+    // ему, и заработал на ней. Отнятое у игрока не исчезло — оно у него.
+    expect(profitOf(shared, RIVAL)).toBeGreaterThan(0)
   })
 })
 

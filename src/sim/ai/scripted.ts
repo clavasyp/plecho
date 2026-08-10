@@ -436,9 +436,7 @@ function decide(state: GameState, companyId: CompanyId): Decision {
    * планом, и оба раза виноват был порог, придуманный для расширения.
    */
   const earning = fleet.some((vehicle) => {
-    if (!plan.cargoes.some((cargo) => canCarry(vehicle.trailer, cargo))) {
-      return false
-    }
+    if (!carriesWholeRing(vehicle, plan)) return false
     const driver =
       vehicle.driverId === null ? undefined : company.drivers?.[vehicle.driverId]
     return driver !== undefined && licensedFor(driver, plan.cargoes)
@@ -454,9 +452,7 @@ function decide(state: GameState, companyId: CompanyId): Decision {
   const trailerPrice = TRAILER_PRICE[plan.trailer]
   const fieldable =
     growth !== null ||
-    fleet.some((vehicle) =>
-      plan.cargoes.some((cargo) => canCarry(vehicle.trailer, cargo)),
-    ) ||
+    fleet.some((vehicle) => carriesWholeRing(vehicle, plan)) ||
     (trailerPrice !== undefined &&
       affordable(company, trailerPrice, floor) &&
       fleet.some((vehicle) =>
@@ -546,7 +542,58 @@ function choosePlan(
     return ranked.find((plan) => findLine(company, plan) !== undefined) ?? null
   }
 
-  return ranked[0]
+  /*
+   * НОВОЕ КОЛЬЦО БЕРЁТСЯ ТОЛЬКО ТО, НА КОТОРОЕ ЕСТЬ ЧЕМ ВЫЙТИ.
+   *
+   * Замысел, под который у конторы нет ни подходящего кузова, ни денег на него,
+   * ни денег на машину нужного класса, — это не амбиция, а приговор: контора
+   * платит зарплату, не делает ни одной ходки и разоряется с исправным планом в
+   * голове. Ровно так умирал нишевый характер: его ниша выпадала на лес,
+   * лесовоз и платформа на ЗИЛ не вешаются вовсе (см. trailers в
+   * data/vehicles.ts), КамАЗ вдвое дороже стартового капитала — и следующие
+   * полгода он стоял у ворот.
+   *
+   * Неподъёмное кольцо не выбрасывается из рейтинга, а пропускается: разбогатев,
+   * контора вернётся к нему сама, потому что порядок рейтинга не изменился.
+   */
+  const fleet = ownVehicles(state, company.id).filter((v) => !v.brokenDown)
+  return ranked.find((plan) => canField(company, fleet, plan)) ?? ranked[0]
+}
+
+/**
+ * Есть ли у конторы способ выйти на это кольцо ПРЯМО СЕЙЧАС.
+ *
+ * Три способа, и все три про кузов, а не про людей: допуск бесплатен и приходит
+ * с наймом (разбор — у LICENCE_RESERVE), а кузов стоит денег и вешается не на
+ * всякий класс.
+ */
+function canField(
+  company: Company,
+  fleet: readonly Vehicle[],
+  plan: ScriptedPlan,
+): boolean {
+  // Своя машина уже берёт все грузы кольца.
+  if (fleet.some((vehicle) => carriesWholeRing(vehicle, plan))) return true
+
+  const trailerPrice = TRAILER_PRICE[plan.trailer]
+  if (trailerPrice !== undefined) {
+    // Своей машине можно купить нужный кузов — и класс его тянет.
+    const fits = fleet.some((vehicle) =>
+      VEHICLE_CLASS_BY_ID[vehicle.classId]?.trailers.includes(plan.trailer),
+    )
+    if (fits && company.money >= trailerPrice) return true
+
+    // Или денег хватает на машину нужного класса вместе с кузовом.
+    const vehicleClass = VEHICLE_CLASS_BY_ID[plan.classId]
+    if (
+      vehicleClass !== undefined &&
+      company.money >= vehicleClass.price + trailerPrice
+    ) {
+      return true
+    }
+  }
+
+  return false
 }
 
 /**
@@ -563,8 +610,17 @@ function choosePlan(
  *      нет длинномера под кругляк), уходит вниз — но не выбрасывается: допуск
  *      придёт со следующим наймом, а бросать из-за него целую цепочку значит
  *      навсегда отдать игроку две трети карты.
- *   3. ДЕНЬГИ. Прибыль кольца за час работы машины.
+ *   3. ДЕНЬГИ — И ЗДЕСЬ ХАРАКТЕР ГОВОРИТ ВТОРОЙ РАЗ, см. moneyKey.
  *   4. ИМЯ. Разрыв ничьих, чтобы порядок не зависел от порядка ключей объекта.
+ *
+ * ПОЧЕМУ ДЕНЕЖНЫЙ КЛЮЧ ТОЖЕ ЗАВИСИТ ОТ ХАРАКТЕРА. Первый ключ на СТАРТЕ ПАРТИИ
+ * не различает никого: у игрока ещё нет линий, значит агрессивному некуда
+ * лезть; никто ничего не занял, значит осторожному нечего обходить. Оба ключа
+ * дают ничью на всех кольцах разом, и решение падало на общую прибыль — то есть
+ * два разных характера гарантированно строили ОДНУ И ТУ ЖЕ первую линию. Именно
+ * это и наблюдалось в прогонах, и никакой правкой первого ключа это не
+ * лечится: в пустом мире различать просто нечего. Различать надо не мир, а
+ * СПОСОБ ЗАРАБАТЫВАТЬ — он у характера есть всегда.
  */
 function rankedPlans(
   state: GameState,
@@ -594,8 +650,11 @@ function rankedPlans(
     plan,
     keys: [
       characterKey(plan, personality, playerCities, niche),
-      staffed(company, plan) ? 0 : 1,
-      -plan.profitPerHour,
+      ...orderedByPersonality(
+        personality,
+        staffed(company, plan) ? 0 : 1,
+        moneyKey(plan, personality),
+      ),
     ],
   }))
 
@@ -607,6 +666,73 @@ function rankedPlans(
   })
 
   return keyed.map((item) => item.plan)
+}
+
+/**
+ * ЧТО ВАЖНЕЕ — ЛЮДИ ИЛИ ДЕНЬГИ. Порядок этих двух ключей задаёт характер.
+ *
+ * Здесь и живёт главное различие между агрессивным и осторожным, и оно
+ * содержательное, а не декоративное. Без ДОПОГ закрыты нефть и топливо, без
+ * длинномера — кругляк, а допуск не покупается: его ищут перебором кандидатов
+ * (разбор — у LICENCE_RESERVE). Значит выбор стоит так:
+ *
+ *   АГРЕССИВНЫЙ БЕРЁТ ЛУЧШУЮ ЦЕПОЧКУ И ЖДЁТ ЧЕЛОВЕКА. Деньги выше людей: он
+ *   заявляет топливное кольцо на 173 руб/ч, покупает под него технику и месяцами
+ *   перебирает водителей, пока не выпадет допуск. Дорого и рискованно — ровно
+ *   то, что значит быть агрессивным.
+ *
+ *   ОСТОРОЖНЫЙ БЕРЁТ ТО, ЧТО МОЖЕТ ВЕЗТИ СЕГОДНЯ. Люди выше денег: зерновое
+ *   кольцо на 127 руб/ч начинает работать в тот же день, потому что на муку
+ *   допуск не нужен. Он сознательно уступает в ставке ради того, чтобы техника
+ *   не стояла.
+ *
+ * ПОЧЕМУ ЭТО ПРИШЛОСЬ РАЗВОДИТЬ ИМЕННО ЗДЕСЬ. Первый ключ на старте партии не
+ * различает никого: у игрока нет линий, значит агрессивному некуда лезть; никто
+ * ничего не занял, значит осторожному нечего обходить. Оба ключа дают ничью на
+ * всех кольцах разом. Пока «люди» стояли выше «денег» у всех, все характеры
+ * гарантированно строили одну и ту же первую линию — это и наблюдалось в
+ * прогонах. Различать надо не мир, а СПОСОБ РАБОТАТЬ: он у характера есть
+ * всегда, даже в пустом мире.
+ *
+ * Нишевый и имитатор уже сказали своё первым ключом (груз и копия), поэтому
+ * ведут себя осмотрительно — как осторожный.
+ */
+function orderedByPersonality(
+  personality: CompetitorPersonality,
+  people: number,
+  money: number,
+): [number, number] {
+  return personality === 'агрессивный' ? [money, people] : [people, money]
+}
+
+/**
+ * Денежный ключ: КАК характер предпочитает зарабатывать.
+ *
+ * Работает и в пустом мире, в отличие от первого ключа, и потому именно он
+ * разводит характеры на первой линии партии.
+ *
+ *   АГРЕССИВНЫЙ берёт максимум рублей в час и не смотрит на длину. Это ставка на
+ *   оборот: дальнее плечо с большой выручкой, длинный оборот, много машин.
+ *
+ *   ОСТОРОЖНЫЙ берёт максимум рублей на КИЛОМЕТР. Смысл прямой: короткое
+ *   плотное кольцо — это быстрый оборот, малый запас топлива в пути, база рядом
+ *   и меньше того, что может пойти не так. Он сознательно уступает в объёме
+ *   ради устойчивости, и это то самое решение, за которое отвечает характер.
+ *
+ *   НИШЕВЫЙ И ИМИТАТОР уже сказали своё первым ключом — груз и копия. Второй раз
+ *   их ограничивать нечем, и они считают деньги как все.
+ *
+ * Ключ отрицательный: сортировка идёт по возрастанию, а больше — лучше.
+ */
+function moneyKey(
+  plan: ScriptedPlan,
+  personality: CompetitorPersonality,
+): number {
+  if (personality !== 'осторожный') return -plan.profitPerHour
+  // Прибыль за километр кольца. Нулевая длина здесь невозможна (плечи проверены
+  // в ringPlans), но копия чужой линии приходит извне — и делить на её длину
+  // вслепую значит однажды получить бесконечность в ключе сортировки.
+  return plan.ringKm > 0 ? -(plan.profitPerHour / plan.ringKm) : 0
 }
 
 /** Первый ключ сортировки — тот самый, которым характер меняет стратегию. */
@@ -661,6 +787,22 @@ function nicheCargo(
   return Rng.forKey(`${companyId}/ниша`).pick(products)
 }
 
+/**
+ * Берёт ли эта машина ВСЕ грузы кольца — не какой-нибудь, а все.
+ *
+ * ЭТО «ВСЕ», А НЕ «ХОТЬ ОДИН», И РАЗНИЦА СТОИЛА КОНТОРЫ. Кольцо на то и кольцо,
+ * что гружёными обязаны быть оба плеча; кузов, берущий половину грузов, делает
+ * половину плеч порожними — то есть ровно ту работу, против которой построена
+ * вся игра. Пока здесь стояло «хоть один», нишевый конкурент выходил на лесное
+ * кольцо со стартовым тентом: тент везёт пиломатериалы и не берёт кругляк.
+ * Замер прогона — 5078 гружёных километров против 5475 порожних, минус 25 263
+ * рубля на сороковые сутки, и планировщик всё это время считал, что менять
+ * кузов незачем, ведь машина «уже возит грузы этого кольца».
+ */
+function carriesWholeRing(vehicle: Vehicle, plan: ScriptedPlan): boolean {
+  return plan.cargoes.every((cargo) => canCarry(vehicle.trailer, cargo))
+}
+
 /** Есть ли в штате люди с допусками под все грузы кольца. */
 function staffed(company: Company, plan: ScriptedPlan): boolean {
   const drivers = Object.values(company.drivers ?? {})
@@ -693,7 +835,7 @@ function staffed(company: Company, plan: ScriptedPlan): boolean {
  *   • точка выгрузки не съедает то, что машина привозит, — кольцо запрёт машину;
  *   • оборот не окупает пробег — то есть нарушен главный инвариант игры.
  */
-function ringPlans(state: GameState): ScriptedPlan[] {
+export function ringPlans(state: GameState): ScriptedPlan[] {
   const graph = buildGraph(state.world.edges)
   const industries = Object.values(state.world.industries)
   const cityIds = Object.keys(state.world.cities) as CityId[]
@@ -743,9 +885,21 @@ function ringPlans(state: GameState): ScriptedPlan[] {
               : shortestKm(graph, sale, source.cityId)
           if (!Number.isFinite(legHome)) continue
 
+          /*
+           * ОБРАТНОЕ ПЛЕЧО ВЕЗЁТ РОВНО СТОЛЬКО, СКОЛЬКО ВЫШЛО ИЗ ПРИВЕЗЁННОГО.
+           *
+           * Продукцию на этом кольце делают из того самого сырья, которое та же
+           * машина только что подала: других поставщиков у завода в расчёте
+           * конкурента нет. Значит из полного кузова сырья получается кузов,
+           * делённый на perUnit, — и никакая ловкость диспетчера этого не
+           * изменит. Потеря массы при переделе заложена в data/recipes.ts и
+           * названа там прямо: подвозить надо больше, чем вывозишь.
+           */
+          const productShare = input.perUnit > 0 ? 1 / input.perUnit : 1
+
           const legs: Leg[] = [
             { cargo: raw, km: legRaw },
-            { cargo: product, km: legProduct },
+            { cargo: product, km: legProduct, share: productShare },
             { cargo: null, km: legHome },
           ]
 
@@ -769,18 +923,28 @@ function ringPlans(state: GameState): ScriptedPlan[] {
            */
           if (!(money.marginPerCycle > 0)) continue
 
-          // Сколько тонн одна машина подаёт в сутки на КАЖДУЮ точку выгрузки.
-          const perVehicle = vehicleClass.capacity * money.cyclesPerDay
-          // Точка, которая столько не съест, запрёт машину гружёной — разбор в
-          // шапке файла. Отвергаем кольцо целиком: возить меньше нельзя, кузов
-          // грузится целиком (Stop в types.ts не знает про тонны).
-          if (perVehicle > rawSink || perVehicle > productSink) continue
+          /*
+           * СКОЛЬКО ТОНН ОДНА МАШИНА ПОДАЁТ В СУТКИ — ОТДЕЛЬНО НА КАЖДЫЙ КОНЕЦ.
+           *
+           * Раньше здесь стояло одно число на оба конца, и это была ошибка того
+           * же рода, что и полный кузов на обратном плече: на завод машина
+           * привозит полный кузов сырья, а в город увозит только то, что из него
+           * вышло. Одной величиной эти два потока не описываются — они
+           * отличаются ровно в perUnit раз.
+           *
+           * Точка, которая столько не съест, запрёт машину гружёной — разбор в
+           * шапке файла. Отвергаем кольцо целиком: возить меньше нельзя, кузов
+           * грузится целиком (Stop в types.ts не знает про тонны).
+           */
+          const rawPerVehicle = vehicleClass.capacity * money.cyclesPerDay
+          const productPerVehicle = rawPerVehicle * productShare
+          if (rawPerVehicle > rawSink || productPerVehicle > productSink) continue
 
           const flow = Math.min(
             sourceRecipe.dailyRate,
             rawSink,
             recipe.dailyRate,
-            productSink,
+            productSink / productShare,
           )
 
           const stops: Stop[] =
@@ -807,7 +971,9 @@ function ringPlans(state: GameState): ScriptedPlan[] {
             classId: vehicleClass.id,
             ringKm: legRaw + legProduct + legHome,
             profitPerHour: money.profitPerHour,
-            fleetTarget: fleetForRing(perVehicle, flow),
+            // Парк считается по СЫРЬЕВОМУ потоку: он и есть то, что кольцо
+            // подаёт на завод, а всё остальное — следствие.
+            fleetTarget: fleetForRing(rawPerVehicle, flow),
             raw,
             product,
             origin: 'своё',
@@ -946,7 +1112,24 @@ function copyPlans(state: GameState, company: Company): ScriptedPlan[] {
 // ─── Экономика кольца ──────────────────────────────────────────────────────
 
 /** Плечо кольца: что везём и сколько километров. null — идём порожняком. */
-type Leg = { cargo: CargoType | null; km: number }
+/**
+ * Плечо кольца в расчёте конкурента.
+ *
+ * `share` — какую долю кузова плечо РЕАЛЬНО везёт, 0..1. Полный кузов (1) —
+ * случай сырьевого плеча: на складе источника лежит всё, что успел накопить
+ * поставщик. А вот обратное плечо с продукцией полным не бывает НИКОГДА, и это
+ * не баланс, а физика передела: переработка теряет массу (perUnit в
+ * data/recipes.ts всегда больше единицы), поэтому из двадцати тонн кругляка
+ * выходит двенадцать с половиной пиломатериалов. Возить обратно двадцать
+ * попросту нечего.
+ *
+ * ДО ПОЯВЛЕНИЯ ЭТОГО ПОЛЯ КОНКУРЕНТ СЧИТАЛ ОБА ПЛЕЧА ПОЛНЫМИ и потому
+ * переоценивал каждое кольцо примерно на четверть. Замер: нишевый брал кольцо
+ * Тверь ↔ Калуга с расчётной прибылью 119 руб/ч, вёз обратно вдвое меньше
+ * расчётного и разорялся к шестидесятым суткам, ни разу не приняв плохого
+ * решения — его обманывал собственный расчёт.
+ */
+type Leg = { cargo: CargoType | null; km: number; share?: number }
 
 type RingMoney = {
   /** КАЛЕНДАРНЫХ часов на оборот: дорога, обязательный отдых и посты. */
@@ -990,20 +1173,31 @@ type RingMoney = {
  * что-нибудь ПОСЛЕ постоянных статей. Кольцо, которое отбивает солярку, но не
  * отбивает водителя, — это не работа, а благотворительность.
  */
-function ringEconomy(vc: VehicleClass, legs: readonly Leg[]): RingMoney {
+export function ringEconomy(vc: VehicleClass, legs: readonly Leg[]): RingMoney {
   let km = 0
   let revenue = 0
-  let loaded = 0
+  /** Тонн, прошедших через посты за оборот, — по всем гружёным плечам. */
+  let handled = 0
 
   for (const leg of legs) {
     if (!Number.isFinite(leg.km) || leg.km < 0) continue
     km += leg.km
     if (leg.cargo === null || leg.km === 0) continue
 
-    loaded++
+    // Доля кузова: полная по умолчанию, урезанная там, где везти столько
+    // физически неоткуда (разбор — у объявления Leg). Битое значение читается
+    // как полный кузов, а не как ноль: молча обнулить выручку плеча значило бы
+    // выбросить кольцо, а не оценить его.
+    const share =
+      leg.share === undefined || !Number.isFinite(leg.share) || leg.share <= 0
+        ? 1
+        : Math.min(leg.share, 1)
+    const tons = vc.capacity * share
+
+    handled += tons
     revenue += deliveryRevenue(
       leg.cargo,
-      vc.capacity,
+      tons,
       leg.km,
       vc.tariffPerTonKm,
       vc.handlingPerTon,
@@ -1011,8 +1205,9 @@ function ringEconomy(vc: VehicleClass, legs: readonly Leg[]): RingMoney {
   }
 
   // Каждое гружёное плечо занимает пост дважды: погрузка на одном конце и
-  // выгрузка на другом. Ставка поста — в data/infrastructure.ts.
-  const postHours = (2 * loaded * vc.capacity) / TONS_PER_POST_HOUR
+  // выгрузка на другом. Ставка поста — в data/infrastructure.ts. Считается по
+  // ФАКТИЧЕСКИМ тоннам: полупустой кузов и грузят вдвое быстрее.
+  const postHours = (2 * handled) / TONS_PER_POST_HOUR
   const cycleHours = (km / vc.cruiseKmh) * SHIFT_STRETCH + postHours
   if (!(cycleHours > 0)) {
     return {
@@ -1080,7 +1275,7 @@ function fleetForRing(perVehicleTons: number, flowTons: number): number {
  * Техника из будущего не рассматривается: год берётся из тика, как и в покупке
  * игрока (buyVehicle в app/store.ts).
  */
-function bestClassFor(
+export function bestClassFor(
   state: GameState,
   trailer: TrailerType,
   legs: readonly Leg[],
@@ -1107,7 +1302,7 @@ function bestClassFor(
 }
 
 /** Кузов, в котором поедут оба груза. null — такого кузова нет. */
-function sharedTrailer(a: CargoType, b: CargoType): TrailerType | null {
+export function sharedTrailer(a: CargoType, b: CargoType): TrailerType | null {
   for (const trailer of trailersFor(a)) {
     if (canCarry(trailer, b)) return trailer
   }
@@ -1237,8 +1432,10 @@ function staffingSteps(
     if (onLine >= target) break
     if (vehicle.lineId !== null) continue
     // Машина без подходящего кузова на это кольцо не годится: прицеп ей купят
-    // отдельным шагом, и вот тогда она поедет.
-    if (!plan.cargoes.some((cargo) => canCarry(vehicle.trailer, cargo))) continue
+    // отдельным шагом, и вот тогда она поедет. Проверка именно на ВСЕ грузы —
+    // машина, берущая половину, пойдёт по кольцу через плечо порожняком, и
+    // лучше подождать кузов, чем возить воздух (разбор — у carriesWholeRing).
+    if (!carriesWholeRing(vehicle, plan)) continue
 
     /*
      * И НЕ ВЫПУСКАЕМ МАШИНУ, ЗА РУЛЁМ КОТОРОЙ ЧЕЛОВЕК БЕЗ ДОПУСКА. Она не
@@ -1389,8 +1586,8 @@ function trailerStep(
 
   for (const vehicle of fleet) {
     if (vehicle.trailer === plan.trailer) continue
-    // Машина уже возит грузы этого кольца другим кузовом — менять незачем.
-    if (plan.cargoes.some((cargo) => canCarry(vehicle.trailer, cargo))) continue
+    // Машина уже возит ВСЕ грузы этого кольца другим кузовом — менять незачем.
+    if (carriesWholeRing(vehicle, plan)) continue
 
     const vehicleClass = VEHICLE_CLASS_BY_ID[vehicle.classId]
     if (vehicleClass === undefined) continue
@@ -1696,10 +1893,11 @@ function buyStep(
   if (pick === null) return null
   if (missingLicenses(company, plan).length > 0) return null
 
+  // Недоукомплектованный парк — это машина без водителя ИЛИ с кузовом, который
+  // берёт не все грузы кольца. Покупать вторую, пока первая ходит через плечо
+  // порожняком, значит удваивать убыток.
   const incomplete = fleet.some(
-    (vehicle) =>
-      vehicle.driverId === null ||
-      !plan.cargoes.some((cargo) => canCarry(vehicle.trailer, cargo)),
+    (vehicle) => vehicle.driverId === null || !carriesWholeRing(vehicle, plan),
   )
   if (incomplete) return null
 

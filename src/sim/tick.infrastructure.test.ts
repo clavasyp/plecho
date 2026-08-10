@@ -4,7 +4,8 @@ import {
   BUILDING_SPEC,
   TONS_PER_POST_HOUR,
 } from '../data/infrastructure'
-import { CONSUMPTION_PER_1K, RECIPE_BY_INDUSTRY } from '../data/recipes'
+import { RECIPE_BY_INDUSTRY } from '../data/recipes'
+import { demandPerDay } from './economy/consumption'
 import { VEHICLE_CLASS_BY_ID } from '../data/vehicles'
 import { buildBuilding } from './economy/buildings'
 import { CARGO_LICENSE, wageFor } from './logistics/driver'
@@ -214,7 +215,7 @@ const PEAK_TONS_PER_DAY =
  * привезти.
  *
  * Мегаполис выходит неправдоподобный, и это осознанно: норма потребления в игре
- * крошечная (полтора килограмма муки на человека в сутки, CONSUMPTION_PER_1K),
+ * крошечная (см. нормы в data/recipes.ts),
  * поэтому обычный город насыщается раньше, чем упирается пост, — и прогон
  * измерял бы аппетит, а не пропускную способность. Тройной запас берётся ещё и
  * потому, что склад города вмещает ровно тридцать суток потребления
@@ -222,9 +223,15 @@ const PEAK_TONS_PER_DAY =
  * одной ходки тягача.
  */
 function populationFor(cargo: CargoType): number {
-  return Math.ceil(
-    (3 * PEAK_TONS_PER_DAY * 1000) / (CONSUMPTION_PER_1K[cargo] ?? 1),
-  )
+  // Перебором, а не обратной формулой: форма спроса — игровое решение (сейчас
+  // корень из тысяч жителей), и вторая её копия здесь молча разъехалась бы с
+  // первой. Спрашиваем у самой игры.
+  const need = 3 * PEAK_TONS_PER_DAY
+  let population = 1000
+  while (demandPerDay(population, cargo) < need && population < 1e10) {
+    population *= 2
+  }
+  return population
 }
 
 /**
@@ -518,8 +525,7 @@ describe('очередь съедает выигрыш от лишней маш�
       [FAR, THERE],
     ] as const) {
       const target = relieved.end.world.cities[city]
-      const consumedPerDay =
-        (CONSUMPTION_PER_1K[cargo] ?? 0) * (target.population / 1000)
+      const consumedPerDay = demandPerDay(target.population, cargo)
       // Город ел быстрее, чем ему возили: на складе меньше, чем он съедает за
       // десять суток, то есть принять он мог всегда.
       expect(target.stock[cargo] ?? 0, city).toBeLessThan(consumedPerDay * 10)

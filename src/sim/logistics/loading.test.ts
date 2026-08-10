@@ -7,7 +7,8 @@ const HANDLING = STARTER_CLASS.handlingPerTon
 import { BUILDING_SPEC } from '../../data/infrastructure'
 import { TRANSSHIPMENT_SHARE } from '../economy/buildings'
 import { deliveryRevenue } from '../economy/finance'
-import { CONSUMPTION_PER_1K, RECIPE_BY_INDUSTRY } from '../../data/recipes'
+import { RECIPE_BY_INDUSTRY } from '../../data/recipes'
+import { demandPerDay } from '../economy/consumption'
 import { STOCK_DAYS, stockCapacity } from '../economy/production'
 import {
   buildingId,
@@ -140,12 +141,21 @@ const ZIL_FUEL_PER_100KM = 30
  * нужен город, способный принять всю ходку целиком: прими он половину, остаток
  * остался бы в кузове, машина не смогла бы взять обратную загрузку, и тест
  * порожнего пробега показывал бы не то, что проверяет. Двойной запас — чтобы
- * умеренная правка CONSUMPTION_PER_1K не превращала тест про пробег в тест про
+ * умеренная правка норм потребления не превращала тест про пробег в тест про
  * вместимость.
+ *
+ * Население подбирается ПЕРЕБОРОМ, а не обратной формулой: форма спроса — это
+ * игровое решение (сейчас корень из тысяч жителей), и держать здесь её обратную
+ * функцию значило бы завести вторую копию правила, которая молча разъедется с
+ * первой. Перебор спрашивает у самой игры и переживает любую смену формы.
  */
 function popForFullTruck(cargo: CargoType): number {
-  const perDayPer1k = CONSUMPTION_PER_1K[cargo] ?? 0
-  return Math.ceil((2 * ZIL_TONS * 1000) / (perDayPer1k * CITY_STOCK_DAYS))
+  const need = (2 * ZIL_TONS) / CITY_STOCK_DAYS
+  let population = 1000
+  while (demandPerDay(population, cargo) < need && population < 100_000_000) {
+    population *= 2
+  }
+  return population
 }
 
 const FLOUR_CITY_POP = popForFullTruck('мука')
@@ -401,10 +411,15 @@ describe('вместимость складов', () => {
     const big = makeCity(MOSCOW, 1_000_000)
 
     expect(cityCapacity(small, 'мука')).toBeCloseTo(
-      100 * (CONSUMPTION_PER_1K['мука'] ?? 0) * CITY_STOCK_DAYS,
+      demandPerDay(100_000, 'мука') * CITY_STOCK_DAYS,
       9,
     )
-    expect(cityCapacity(big, 'мука')).toBeCloseTo(10 * cityCapacity(small, 'мука'), 9)
+    // Больше — но не во столько же раз, во сколько жителей: форма спроса
+    // подлинейна (разбор — у нормы в data/recipes.ts).
+    expect(cityCapacity(big, 'мука')).toBeGreaterThan(cityCapacity(small, 'мука'))
+    expect(cityCapacity(big, 'мука')).toBeLessThan(
+      10 * cityCapacity(small, 'мука'),
+    )
 
     // Сырьё городу не нужно — его негде хранить и незачем.
     expect(cityCapacity(big, 'зерно')).toBe(0)
