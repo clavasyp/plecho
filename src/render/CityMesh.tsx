@@ -68,11 +68,11 @@
  * за пределы ЦФО.
  */
 
-import { useEffect, useLayoutEffect, useMemo, useRef } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { JSX } from 'react'
 import * as THREE from 'three'
 import { Html } from '@react-three/drei'
-import { useFrame } from '@react-three/fiber'
+import { useFrame, useThree } from '@react-three/fiber'
 import { useShallow } from 'zustand/shallow'
 import { useGameStore } from '../app/store'
 import { Rng } from '../sim/rng'
@@ -225,6 +225,38 @@ const LABEL_CLEARANCE = 4
 
 /** С какого населения город получает подпись полной яркости. */
 const MAJOR_POPULATION = 1_000_000
+
+/**
+ * Сколько подписей карта готова показать разом — и когда именно.
+ *
+ * ПЯТЬДЕСЯТ ТРИ ИМЕНИ НА ОДНОМ ЭКРАНЕ — ЭТО НЕ КАРТА, А СПИСОК. На общем плане
+ * подписи сливаются в кашу: Москва перекрывает Ярославль, Белгород — Старый
+ * Оскол, Тольятти — Саратов. Причём мельче они не становятся: подпись рисуется
+ * в пикселях экрана, а не в километрах мира, поэтому чем дальше отъезжаешь, тем
+ * плотнее они наезжают друг на друга.
+ *
+ * Ответ тот же, что у любой настоящей карты: чем мельче масштаб, тем меньше
+ * имён. Порог считается от ТОГО, СКОЛЬКО КИЛОМЕТРОВ ВЛЕЗЛО В ЭКРАН, — величины
+ * точной и не зависящей ни от размера окна, ни от истории движений камеры.
+ *
+ * Границы выбраны по карте: три с половиной тысячи километров — это страна
+ * целиком, восемьсот — это край вокруг одного города, тот масштаб, на котором
+ * игрок строит линию и обязан видеть каждое имя.
+ */
+const FULL_MAP_KM = 3500
+const CLOSE_UP_KM = 800
+
+const LABELS_AT_FULL_MAP = 14
+const LABELS_AT_CLOSE_UP = 53
+
+/**
+ * Во сколько ступеней разбита плотность подписей.
+ *
+ * Масштаб меняется непрерывно, а перерисовывать дерево на каждый его пиксель
+ * нельзя. Ступени дают ровно то, что нужно: смена подписей происходит заметным
+ * шагом при заметном изменении масштаба, а между шагами React не трогают.
+ */
+const LABEL_TIERS = 8
 
 // ─── Профиль города ────────────────────────────────────────────────────────
 
@@ -830,13 +862,63 @@ function buildPads(
 
 // ─── Компонент ─────────────────────────────────────────────────────────────
 
+/**
+ * Пустой обработчик перекрытия. Один на модуль: новая функция на каждый рендер
+ * заставляла бы drei переподписываться на каждом кадре.
+ */
+const noHiding = (): void => {}
+
 export function Cities(): JSX.Element {
-  // useShallow, а не голый селектор: реестр городов пересобирается на каждом
-  // тике вместе с состоянием, и без поверхностного сравнения компонент
-  // перестраивал бы всю застройку по несколько раз в секунду. Сами объекты
-  // City не меняются, поэтому сравнение по значениям верхнего уровня отсекает
-  // всё лишнее.
-  const cities = useGameStore(useShallow((store) => store.state.world.cities))
+  /*
+   * ПОДПИСКА НА РЕЕСТР, А НЕ НА ОБЪЕКТЫ ГОРОДОВ.
+   *
+   * Здесь стоял useShallow по самим объектам City с пояснением «сами объекты не
+   * меняются». Это перестало быть правдой: население дрейфует КАЖДЫЙ ТИК у всех
+   * пятидесяти трёх городов (рост и сжатие в economy/consumption.ts), поэтому
+   * поверхностное сравнение не отсекало ничего, и вся застройка страны
+   * пересобиралась по несколько раз в секунду — впустую, потому что силуэт
+   * выходил бит в бит тот же.
+   *
+   * Ключ — идентификаторы плюс население, ОКРУГЛЁННОЕ до процента. Округление
+   * здесь и есть решение: силуэт считается от населения, но десятая доля
+   * процента его не двигает, а сравнение без округления меняется каждый тик.
+   * Тот же приём уже применён в BuildingMesh и IndustryMesh.
+   */
+  const roster = useGameStore((store) =>
+    Object.values(store.state.world.cities)
+      .map((city) => `${city.id}:${Math.round(city.population / 1000)}`)
+      .join('|'),
+  )
+  const cities = useGameStore.getState().state.world.cities
+
+  /*
+   * СТУПЕНЬ ПЛОТНОСТИ ПОДПИСЕЙ — от текущего зума камеры.
+   *
+   * Считается в кадре, а в состояние попадает только при СМЕНЕ ступени: зум
+   * меняется непрерывно, и перерисовывать дерево на каждый его пиксель нельзя.
+   */
+  const camera = useThree((state) => state.camera)
+  const viewport = useThree((state) => state.size)
+  const [tier, setTier] = useState(LABEL_TIERS - 1)
+
+  useFrame(() => {
+    const zoom = (camera as THREE.OrthographicCamera).zoom
+    if (!Number.isFinite(zoom) || zoom <= 0) return
+
+    /*
+     * Ортографическая камера кладёт на пиксель ровно 1/zoom единиц мира, а
+     * единица мира здесь — километр (см. projection.ts). Значит ширина кадра в
+     * километрах считается точно, без всяких наблюдений за поведением камеры.
+     */
+    const visibleKm = viewport.width / zoom
+
+    const share =
+      (FULL_MAP_KM - visibleKm) / (FULL_MAP_KM - CLOSE_UP_KM)
+    const clamped = Math.min(1, Math.max(0, share))
+    const next = Math.round(clamped * (LABEL_TIERS - 1))
+
+    if (next !== tier) setTier(next)
+  })
 
   const layout = useMemo(() => {
     const items = Object.values(cities).map((city) => {
@@ -879,7 +961,8 @@ export function Cities(): JSX.Element {
         yaw: item.form.grid,
       })),
     }
-  }, [cities])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roster])
 
   const pads = useMemo(() => buildPads(layout.pads), [layout.pads])
 
@@ -995,6 +1078,25 @@ export function Cities(): JSX.Element {
     }
   }, [layout])
 
+  /*
+   * КОГО ПОДПИСЫВАЕМ НА ЭТОЙ СТУПЕНИ.
+   *
+   * Крупные города получают имя всегда, мелкие — по мере приближения. Порядок
+   * отбора строго по населению, поэтому на любом масштабе подписаны САМЫЕ
+   * ЗНАЧИМЫЕ из видимых, а не случайные: карта, на которой подписан Тобольск, но
+   * не Москва, читалась бы как ошибка.
+   */
+  const named = useMemo(() => {
+    const share = tier / (LABEL_TIERS - 1)
+    const budget = Math.round(
+      LABELS_AT_FULL_MAP + (LABELS_AT_CLOSE_UP - LABELS_AT_FULL_MAP) * share,
+    )
+
+    return [...layout.items]
+      .sort((a, b) => b.city.population - a.city.population)
+      .slice(0, Math.max(1, budget))
+  }, [layout, tier])
+
   return (
     <group>
       <mesh receiveShadow>
@@ -1065,7 +1167,7 @@ export function Cities(): JSX.Element {
         </instancedMesh>
       )}
 
-      {layout.items.map((item) => (
+      {named.map((item) => (
         <Html
           key={item.city.id}
           center
@@ -1073,6 +1175,29 @@ export function Cities(): JSX.Element {
           // Подпись не должна перехватывать курсор: под ней панорамирование
           // карты, и «мёртвые» пятна вокруг городов ощущаются как поломка.
           pointerEvents="none"
+          /*
+           * ПУСТОЙ ОБРАБОТЧИК ПЕРЕКРЫТИЯ — И ЭТО НЕ ЗАГЛУШКА, А ЛЕЧЕНИЕ.
+           *
+           * drei решает, показывать ли подпись, по функции isObjectBehindCamera:
+           * берёт вектор «камера → объект» и сравнивает его угол с направлением
+           * взгляда; больше девяноста градусов — прячет. Для перспективной
+           * камеры это верно, для ОРТОГРАФИЧЕСКОЙ — бессмысленно: у неё нет
+           * точки схода, а ближняя плоскость у нас вообще отрицательная
+           * (CAMERA_NEAR = −3500 в Scene.tsx), потому что карта тянется «за
+           * спину» камере и обязана рисоваться.
+           *
+           * Пока карта была округом в 600 км, все города укладывались в переднюю
+           * полусферу и это не проявлялось. На карте страны в 3700 км за
+           * плоскость уходит половина: двадцать подписей не показывались на
+           * первом же кадре, а после панорамирования исчезали Урал, Сибирь и юг
+           * целиком — двадцать пять имён.
+           *
+           * Передав onOcclude, мы забираем у drei право трогать display (см. его
+           * Html.js: `if (onOcclude) onOcclude(...) else el.style.display = ...`).
+           * Прятать подписи по перекрытию нам не нужно вовсе — их видимость
+           * решает ступень масштаба выше.
+           */
+          onOcclude={noHiding}
           zIndexRange={[20, 0]}
           style={{
             color:

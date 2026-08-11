@@ -95,45 +95,70 @@ function pathHours(path: readonly CityId[], cruiseKmh: number): number {
 }
 
 /**
- * Все простые пути между городами.
+ * Эталонный кратчайший путь — независимым алгоритмом.
  *
- * Десять узлов и восемнадцать рёбер — перебор считается мгновенно и даёт
- * заведомо верный ответ, с которым можно сверять Дейкстру.
+ * ЗДЕСЬ БЫЛ ПЕРЕБОР ВСЕХ ПРОСТЫХ ПУТЕЙ, и он честно работал, пока карта была
+ * округом: десять узлов и восемнадцать рёбер перебираются мгновенно. На карте
+ * страны (53 города, 100 дорог) простых путей между двумя городами — миллионы,
+ * и перебор съедал 3.6 ГБ, убивая воркер по памяти через десять минут. Файл
+ * переставал выполняться ЦЕЛИКОМ: двадцать пять проверок ядра логистики молча
+ * исчезали из прогона, `npm test` возвращал единицу, а сборка вставала.
+ *
+ * Замена — Беллман — Форд по тем же рёбрам. Он ОСТАЁТСЯ НЕЗАВИСИМЫМ от того,
+ * что проверяет, а это здесь главное: эталон, посчитанный тем же кодом, не
+ * доказывает ничего. Дейкстра из pathfind.ts выбирает вершину минимумом и
+ * закрывает её навсегда; Беллман — Форд просто расслабляет все дуги V−1 раз и
+ * ни о каком порядке обхода не знает. Совпадение двух настолько разных
+ * алгоритмов — настоящее доказательство, а не тавтология.
+ *
+ * Мера передаётся снаружи: тот же эталон считает и километры, и часы.
  */
-function allPaths(from: CityId, to: CityId): CityId[][] {
-  const found: CityId[][] = []
-  const path: CityId[] = [from]
-  const visited = new Set<CityId>([from])
-
-  const walk = (city: CityId): void => {
-    if (city === to) {
-      found.push([...path])
-      return
-    }
-    for (const next of ADJACENCY.get(city) ?? []) {
-      if (visited.has(next)) continue
-      visited.add(next)
-      path.push(next)
-      walk(next)
-      path.pop()
-      visited.delete(next)
-    }
-  }
-
-  walk(from)
-  return found
-}
-
-/** Путь с минимальной суммой по заданной мере. */
 function bestPath(
   from: CityId,
   to: CityId,
   measure: (path: readonly CityId[]) => number,
 ): CityId[] {
-  const paths = allPaths(from, to)
-  return paths.reduce((best, path) =>
-    measure(path) < measure(best) ? path : best,
-  )
+  /** Вес дуги по той же мере, что и весь путь: мера от пути из двух городов. */
+  const weight = (a: CityId, b: CityId): number => measure([a, b])
+
+  const best = new Map<CityId, number>([[from, 0]])
+  const previous = new Map<CityId, CityId>()
+
+  // V − 1 проходов: за столько любой кратчайший путь успевает достроиться,
+  // потому что длиннее V − 1 дуг он быть не может.
+  for (let round = 0; round < ALL_CITIES.length - 1; round++) {
+    let moved = false
+
+    for (const city of ALL_CITIES) {
+      const reached = best.get(city)
+      if (reached === undefined) continue
+
+      for (const next of ADJACENCY.get(city) ?? []) {
+        const candidate = reached + weight(city, next)
+        const known = best.get(next)
+        // Строгое сравнение с допуском: ничьи разрешаются в пользу пути,
+        // найденного раньше, — иначе результат зависел бы от порядка обхода.
+        if (known === undefined || candidate < known - 1e-12) {
+          best.set(next, candidate)
+          previous.set(next, city)
+          moved = true
+        }
+      }
+    }
+
+    if (!moved) break
+  }
+
+  if (!best.has(to)) return []
+
+  const path: CityId[] = [to]
+  for (let city = to; city !== from; ) {
+    const back = previous.get(city)
+    if (back === undefined) return []
+    path.unshift(back)
+    city = back
+  }
+  return path
 }
 
 /** Пары городов в обе стороны — для проверок «на всём графе». */

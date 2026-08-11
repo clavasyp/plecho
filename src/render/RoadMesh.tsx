@@ -55,11 +55,13 @@
 import { useEffect, useMemo, useRef } from 'react'
 import type { JSX } from 'react'
 import { Color } from 'three'
-import type { Group, Mesh } from 'three'
+import type { Group, Mesh, MeshStandardMaterial } from 'three'
+import { useFrame } from '@react-three/fiber'
 import { useShallow } from 'zustand/shallow'
 import { useGameStore } from '../app/store'
 import { cityPoint } from './CityMesh'
 import { layers as sceneLayers } from './layers'
+import { atmosphere } from './sky'
 import { palette } from './palette'
 import { shoulderProfile, surfaceSteps, surfaceTone } from './roadSurface'
 import type { CityId, RoadClass } from '../sim/types'
@@ -329,6 +331,36 @@ export function Roads(): JSX.Element {
     }
   }, [])
 
+  /*
+   * ЗИМОЙ ПОЛОТНО УХОДИТ В ТЁМНОЕ, И ЭТО НЕ ВКУСОВЩИНА, А ЧИТАЕМОСТЬ.
+   *
+   * Земля меняет цвет по сезону (seasonGround в palette.ts): зимой она белеет
+   * до #4d5a68. Полотно федеральной трассы — #4d5a6b. Это ОДИН И ТОТ ЖЕ ЦВЕТ с
+   * точностью до последнего разряда, и зимой дорожная сеть с карты исчезала
+   * целиком: замер медианного отклика ленты дал 0.03 из 255 при уровне
+   * плёночного зерна 3, то есть дорога была ровно вшестеро слабее шума. А
+   * партия начинается 1 января.
+   *
+   * Лечится множителем материала, а не пересборкой вершин: вершинный буфер
+   * хранит класс и качество дороги (разбор — в roadSurface.ts), трогать его
+   * ради сезона значило бы перезаливать полмегабайта на каждую смену погоды.
+   * Множитель применяется в кадре, к тем же материалам, что уже созданы.
+   *
+   * Землю светлее делать нельзя: снежная пелена и так поднимает её медиану, и
+   * у части точек полярность уже перевёрнута — дорога светлее фона там, где
+   * должна быть темнее.
+   */
+  const materials = useRef<MeshStandardMaterial[]>([])
+
+  useFrame(() => {
+    const winter = atmosphere.winter
+    // Зимой втрое темнее, летом без изменений. Единица — это «как в палитре».
+    const tint = 1 - 0.62 * winter
+    for (const material of materials.current) {
+      material.color.setRGB(tint, tint, tint)
+    }
+  })
+
   return (
     <group ref={groupRef}>
       {layers.map((layer) =>
@@ -351,11 +383,17 @@ export function Roads(): JSX.Element {
             {/* Тени лента принимает, но не отбрасывает: плоскость толщиной ноль
                 отбрасывает только артефакты самозатенения.
 
-                Цвет материала не задан намеренно: белый — единица умножения, а
-                настоящий тон приходит из вершин (см. buildRibbons). Задай мы
-                здесь оттенок, он домножился бы на вершинный и увёл бы все
-                дороги из палитры разом. */}
-            <meshStandardMaterial vertexColors roughness={0.95} metalness={0} />
+                Тон приходит из ВЕРШИН (см. buildRibbons), а цвет материала —
+                общий множитель поверх него. Он и ведёт сезон: зимой полотно
+                уходит в тёмное. Разбор — у SEASON_TINT. */}
+            <meshStandardMaterial
+              ref={(material) => {
+                if (material !== null) materials.current.push(material)
+              }}
+              vertexColors
+              roughness={0.95}
+              metalness={0}
+            />
           </mesh>
         ),
       )}
