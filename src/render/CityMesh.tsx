@@ -6,7 +6,7 @@
  * в этом весь конфликт игры — всё едет в столицу, а обратное плечо порожнее.
  * Число, если его не показать глазами, останется числом в таблице.
  *
- * Файл определяют три решения.
+ * Файл определяют пять решений.
  *
  * ПЕРВОЕ. Силуэт считается, а не хранится, и считается от `Rng.forKey(cityId)`.
  * Math.random здесь был бы катастрофой: React перерисовывает компонент когда
@@ -22,22 +22,63 @@
  * читался с изометрии. Это карта-диорама, а не макет местности; то же самое
  * делает любая настольная игра, когда ставит на клетку фишку-домик.
  *
- * ТРЕТЬЕ. Все здания всех городов — один InstancedMesh. Их под семьсот, и
- * семьсот отдельных Mesh дали бы семьсот вызовов отрисовки на кадр: столько
- * сцена не выдержит вместе с постпроцессингом.
+ * ТРЕТЬЕ, ГЛАВНОЕ ДЛЯ УЗНАВАЕМОСТИ. ФОРМУ ГОРОДА ЗАДАЁТ НЕ ТОЛЬКО РАЗМЕР, НО И
+ * ПРОФИЛЬ. Пока силуэт считался от одного населения, столица, промышленный центр
+ * и райцентр отличались друг от друга ровно масштабом: увеличенный Орёл и есть
+ * Москва. Это ровно то, чего не должно быть на карте, где профиль решает, что
+ * отсюда везут. Теперь `CityStatic.profile` двигает восемь параметров генерации
+ * сразу, и разница читается ПЛАНОМ И ПРОФИЛЕМ КРЫШ, а не подписью:
+ *
+ *   столица       — круглое пятно с высотным ядром в середине и резким спадом
+ *                   к окраинам: издалека это свеча, а не холм;
+ *   промышленный  — широкое пятно, невысокие ПЛАСТИНЫ корпусов, строгая сетка:
+ *                   квартал, нарезанный по линейке;
+ *   транзитный    — узкая длинная полоса вдоль своей оси, низкие длинные склады:
+ *                   город, вытянувшийся вдоль коридора трассы;
+ *   аграрный      — самое широкое и самое плоское пятно, зданий мало, доминант
+ *                   почти нет: посёлок, расплывшийся по полю;
+ *   ресурсный     — компактное плотное пятно средней высоты (заведён под
+ *                   расширение за пределы ЦФО, где такие города появятся).
+ *
+ * Пятно перестало быть кругом: вытянутость города описывается эллипсом, и по
+ * этому же эллипсу режется площадка застройки. Раньше площадка была круглой, а
+ * застройка эллиптической — и при сильной вытянутости здания вылезали за
+ * собственную землю. Теперь такого режима отказа нет по построению.
+ *
+ * ЧЕТВЁРТОЕ. НОЧЬЮ В ГОРОДАХ ГОРЯТ ОКНА — ТОЧКАМИ, А НЕ ЗАЛИВКОЙ. Стилевой замок
+ * проекта гласит: светится только акцент. Окно поэтому не подсвечивает фасад и
+ * не красит здание, а даёт одну тёплую точку на грани — кубик в четверть ширины
+ * дома, наполовину утопленный в стену. Их под тысячу на весь округ, но суммарная
+ * площадь ничтожна, и ночью самым ярким объектом карты остаётся машина, как и
+ * задумано. Окна получают только ЗДАНИЯ ВЫШЕ ТРЕТИ ПИКА своего города: ночью
+ * светится ядро, а окраина тонет — тот же силуэт, показанный вторым способом.
+ *
+ * Час берётся из `dayProgress(tick)` — той же чистой функции, которой считает
+ * время интерфейс. Своего представления о том, когда наступает ночь, файл не
+ * заводит: разъехавшиеся определения ночи в двух местах — это карта, на которой
+ * окна зажигаются раньше, чем гаснет солнце.
+ *
+ * ПЯТОЕ. Вся застройка округа — ОДИН InstancedMesh, все окна — ВТОРОЙ. Зданий
+ * под восемьсот, окон под тысячу; при наивной сборке это почти две тысячи
+ * вызовов отрисовки на кадр, столько сцена не выдержит вместе с
+ * постпроцессингом. Здесь их два, и это число не изменится, когда карта вырастет
+ * за пределы ЦФО.
  */
 
-import { useLayoutEffect, useMemo, useRef } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import type { JSX } from 'react'
 import * as THREE from 'three'
 import { Html } from '@react-three/drei'
+import { useFrame } from '@react-three/fiber'
 import { useShallow } from 'zustand/shallow'
+import { clock } from '../app/loop'
 import { useGameStore } from '../app/store'
 import { Rng } from '../sim/rng'
+import { dayProgress } from '../sim/time'
 import { CFO_ORIGIN, project } from '../sim/world/projection'
 import { layers } from './layers'
 import { palette } from './palette'
-import type { City } from '../sim/types'
+import type { City, CityProfile } from '../sim/types'
 
 // ─── Мир ───────────────────────────────────────────────────────────────────
 
@@ -97,7 +138,7 @@ const REFERENCE_COUNT = 28
  *
  * Ниже единицы намеренно: линейный рост дал бы Москве больше тысячи коробок при
  * почти нулевом выигрыше в читаемости — на экране они всё равно сливаются в
- * массу. 0.75 держит Москву около четырёхсот, а весь мир — под семьюстами.
+ * массу. 0.75 держит Москву около пятисот, а весь мир — под восемьюстами.
  */
 const COUNT_EXPONENT = 0.75
 
@@ -112,26 +153,32 @@ const MIN_BUILDING_COUNT = 8
  * на маленьком пятне застройка сомкнётся в сплошную плиту, а Москва при том же
  * размере рассыплется в редкую крупу. Через плотность обе крайности исчезают
  * сами: размер подстраивается под радиус и число зданий.
+ *
+ * Вытянутость пятна на плотность не влияет: полуоси эллипса — radius·aspect и
+ * radius/aspect, их произведение равно radius², то есть площадь сохраняется при
+ * любой вытянутости. Это и было причиной задать вытянутость именно так.
  */
 const BUILDING_COVERAGE = 0.45
-
-/**
- * Смещение застройки к центру: r = radius * u^CORE_BIAS.
- *
- * При 0.5 точки легли бы равномерно по площади, и город вышел бы блином. Выше
- * 0.5 — сгущение к середине, то есть центр выше и плотнее окраин, как в любом
- * городе, выросшем вокруг одной точки.
- */
-const CORE_BIAS = 0.8
 
 /** Сколько кандидатов перебирается при выборе места под здание. */
 const PLACEMENT_CANDIDATES = 6
 
-/** Вероятность доминанты — одиночной башни выше окружающей застройки. */
-const LANDMARK_CHANCE = 0.06
+/** Доля высоты, которая есть у здания даже на самой окраине. */
+const HEIGHT_FLOOR = 0.16
 
-/** Во сколько раз доминанта выше своего расчётного роста. */
-const LANDMARK_FACTOR = 1.55
+/** Разброс высоты между соседями: без него квартал выходит стриженым. */
+const HEIGHT_JITTER_MIN = 0.6
+
+/**
+ * Насколько близко к центру садятся здания высотного ядра, доля радиуса.
+ *
+ * Ядро — приём одного профиля, столичного, но константа общая: доля зданий в
+ * ядре задаётся профилем, а его плотность одинакова везде, где оно вообще есть.
+ */
+const CORE_SPAN = 0.28
+
+/** Во сколько раз здание ядра уже обычного: башня, а не пластина. */
+const CORE_SLIMNESS = 0.72
 
 /**
  * Высота площадки застройки над нулём, км.
@@ -153,30 +200,324 @@ const LABEL_CLEARANCE = 4
 /** С какого населения город получает подпись полной яркости. */
 const MAJOR_POPULATION = 1_000_000
 
+// ─── Профиль города ────────────────────────────────────────────────────────
+
+/**
+ * Как профиль перекраивает силуэт.
+ *
+ * Каждое поле — множитель или диапазон к базовой формуле от населения. Профиль
+ * НЕ отменяет иерархию по размеру: аграрный миллионник всё равно крупнее
+ * промышленного райцентра. Он меняет ХАРАКТЕР пятна при том же населении, и
+ * именно это позволяет отличить Тверь от Тулы, у которых население расходится на
+ * одиннадцать процентов — то есть на глаз не расходится вовсе.
+ */
+type ProfileShape = {
+  /** Множитель радиуса застройки. */
+  radius: number
+  /** Множитель потолка высоты. */
+  peak: number
+  /** Множитель числа зданий. */
+  count: number
+  /**
+   * Смещение застройки к центру: r = radius · u^coreBias.
+   *
+   * При 0.5 точки легли бы равномерно по площади, и город вышел бы блином. Выше
+   * 0.5 — сгущение к середине, то есть центр плотнее окраин, как в любом городе,
+   * выросшем вокруг одной точки.
+   */
+  coreBias: number
+  /**
+   * Показатель спада высоты от центра к окраине.
+   *
+   * Единица — линейный спад, ровный холм. Больше — центр держит высоту, а потом
+   * обрывается: столичный профиль. Это самый заметный из восьми параметров.
+   */
+  falloff: number
+  /**
+   * Вытянутость пятна: полуоси эллипса равны radius·aspect и radius/aspect.
+   *
+   * Меньше единицы — город вытянут поперёк своей уличной сетки, больше — вдоль.
+   * Конкретное значение бросается один раз на город, поэтому две Твери из разных
+   * партий вытянуты одинаково.
+   */
+  aspectMin: number
+  aspectMax: number
+  /** Вероятность доминанты — одиночной башни выше окружающей застройки. */
+  landmarkChance: number
+  /** Во сколько раз доминанта выше своего расчётного роста. */
+  landmarkFactor: number
+  /** Доля зданий, уходящих в высотное ядро. Ноль — ядра у этого профиля нет. */
+  coreShare: number
+  /** Во сколько раз здание ядра выше своего расчётного роста. */
+  towerFactor: number
+  /**
+   * Вытянутость коробки вдоль уличной сетки.
+   *
+   * Единица — квадрат в плане, больше — пластина. Склад транзитного города — это
+   * длинный низкий ангар, и отличается он от жилого квартала именно планом.
+   */
+  slab: number
+  /** Разброс разворота коробки относительно сетки, радианы. */
+  yawJitter: number
+}
+
+const PROFILE_SHAPES: Record<CityProfile, ProfileShape> = {
+  // Высотное ядро и резкий обрыв к окраинам. Единственный профиль с башнями:
+  // на карте ЦФО он ровно один, и это правильно — вторая такая свеча отняла бы
+  // у Москвы её единственность, на которой стоит вся экономика игры.
+  'столица': {
+    radius: 1,
+    peak: 1.22,
+    count: 1.06,
+    coreBias: 0.95,
+    falloff: 2.2,
+    aspectMin: 0.88,
+    aspectMax: 1.16,
+    landmarkChance: 0.1,
+    landmarkFactor: 1.7,
+    coreShare: 0.1,
+    towerFactor: 1.5,
+    slab: 1,
+    yawJitter: 0.14,
+  },
+
+  // Широкое пятно, низкие пластины, строгая сетка. Разворот коробок почти
+  // нулевой намеренно: промзона и типовые кварталы нарезаны по линейке, и эта
+  // регулярность — сама по себе признак, читаемый раньше высоты.
+  'промышленный': {
+    radius: 1.08,
+    peak: 0.86,
+    count: 1,
+    coreBias: 0.7,
+    falloff: 1.45,
+    aspectMin: 0.78,
+    aspectMax: 1.3,
+    landmarkChance: 0.05,
+    landmarkFactor: 1.4,
+    coreShare: 0,
+    towerFactor: 1,
+    slab: 1.3,
+    yawJitter: 0.08,
+  },
+
+  // Самое плоское и самое рыхлое пятно: зданий на треть меньше при большем
+  // радиусе, доминант почти нет. Орёл рядом с Калугой должен читаться как
+  // посёлок рядом с заводом, хотя население у них расходится на одиннадцать
+  // процентов.
+  'аграрный': {
+    radius: 1.16,
+    peak: 0.6,
+    count: 0.7,
+    coreBias: 0.55,
+    falloff: 1,
+    aspectMin: 0.8,
+    aspectMax: 1.24,
+    landmarkChance: 0.02,
+    landmarkFactor: 1.3,
+    coreShare: 0,
+    towerFactor: 1,
+    slab: 1.34,
+    yawJitter: 0.2,
+  },
+
+  // Узкая длинная полоса. Диапазон вытянутости целиком ниже единицы — это
+  // единственный профиль, у которого пятно гарантированно не круглое: город,
+  // выросший вдоль коридора трассы, ни при каком броске не станет компактным.
+  'транзитный': {
+    radius: 1.12,
+    peak: 0.7,
+    count: 0.84,
+    coreBias: 0.6,
+    falloff: 1.15,
+    aspectMin: 0.62,
+    aspectMax: 0.78,
+    landmarkChance: 0.03,
+    landmarkFactor: 1.35,
+    coreShare: 0,
+    towerFactor: 1,
+    slab: 1.8,
+    yawJitter: 0.06,
+  },
+
+  // Компактное плотное пятно средней высоты. В ЦФО таких городов нет — профиль
+  // заведён под расширение на Урал и Поволжье (об этом прямо сказано в
+  // data/cities.ts), и форма для него описана заранее, чтобы новый регион не
+  // приехал на карту безликими коробками.
+  'ресурсный': {
+    radius: 0.9,
+    peak: 0.82,
+    count: 0.78,
+    coreBias: 0.88,
+    falloff: 1.75,
+    aspectMin: 0.86,
+    aspectMax: 1.18,
+    landmarkChance: 0.07,
+    landmarkFactor: 1.5,
+    coreShare: 0,
+    towerFactor: 1,
+    slab: 1.15,
+    yawJitter: 0.16,
+  },
+}
+
+/**
+ * Профиль испорченного сохранения не должен ронять карту.
+ *
+ * Промышленный выбран запасным как самый нейтральный: он ровно посередине шкалы
+ * и по высоте, и по рыхлости, поэтому город с неизвестным профилем выглядит
+ * обычным городом, а не аномалией.
+ */
+const FALLBACK_SHAPE = PROFILE_SHAPES['промышленный']
+
+// ─── Окна ──────────────────────────────────────────────────────────────────
+
+/** Ниже этой доли от пика здание считается низким и окон не получает. */
+const WINDOW_MIN_TONE = 0.34
+
+/** Размер окна как доля меньшей стороны здания. */
+const WINDOW_SIZE_SHARE = 0.22
+
+/** Границы размера окна, км: тёплая точка, а не пятно и не невидимый пиксель. */
+const WINDOW_SIZE_MIN = 0.22
+const WINDOW_SIZE_MAX = 0.85
+
+/** Больше трёх окон на здание — это уже заливка фасада, а не точки. */
+const WINDOW_MAX_PER_BUILDING = 3
+
+/** Предельная непрозрачность окна в самую глухую ночь. */
+const WINDOW_OPACITY = 0.92
+
+/** Ниже этой непрозрачности меш окон гасится целиком — вместе с вызовом отрисовки. */
+const GLOW_EPSILON = 0.004
+
+/** Когда зажигаются и когда гаснут окна, доля суток. */
+const DUSK = 18.5 / 24
+const DAWN = 6.5 / 24
+
+/**
+ * Длительность сумерек, доля суток.
+ *
+ * Час с небольшим: за это время окна успевают разгореться плавно, но не тянутся
+ * половину светового дня. Резкий переход был бы виден как щелчок на скорости ×5,
+ * где сутки проходят за двадцать секунд.
+ */
+const TWILIGHT = 1.1 / 24
+
+const clamp01 = (value: number): number =>
+  value < 0 ? 0 : value > 1 ? 1 : value
+
+/** Классический smoothstep: плавный переход с нулевой производной на краях. */
+function smoothstep(edge0: number, edge1: number, x: number): number {
+  const t = clamp01((x - edge0) / (edge1 - edge0))
+  return t * t * (3 - 2 * t)
+}
+
+/**
+ * Насколько горят окна, 0..1: 0 — день, 1 — глухая ночь.
+ *
+ * Чистая функция от тика — именно поэтому она проверяется юнит-тестом, а не
+ * глазами. Тик допускается дробный: рендер интерполирует между шагами
+ * симуляции, и без дробной части рассвет шёл бы ступеньками по пятнадцать минут.
+ *
+ * Сезон здесь сознательно не учитывается. Длина светового дня — часть общего
+ * суточного цикла (свет, туман, палитра), а не свойство окон; заведи файл
+ * собственную зиму — и однажды окна погаснут раньше, чем встанет солнце.
+ */
+export function windowGlow(tick: number): number {
+  const p = dayProgress(tick)
+  const evening = smoothstep(DUSK - TWILIGHT, DUSK, p)
+  const morning = 1 - smoothstep(DAWN - TWILIGHT, DAWN, p)
+  return Math.max(evening, morning)
+}
+
 // ─── Генерация ─────────────────────────────────────────────────────────────
 
-type Silhouette = {
-  /** Радиус застройки, км. */
+/**
+ * Форма города до расстановки зданий.
+ *
+ * Считается двумя бросками ГПСЧ и парой формул, поэтому её дёшево спросить
+ * снаружи: IndustryMesh нужен только вынос застройки, чтобы поставить завод ЗА
+ * городом, и гонять ради этого расстановку пятисот коробок было бы расточительно.
+ *
+ * ГПСЧ отдаётся ВМЕСТЕ С ФОРМОЙ и это не небрежность. Порядок бросков — часть
+ * контракта детерминизма: расстановка обязана продолжить ту же
+ * последовательность, с которой были взяты сетка и вытянутость. Верни функция
+ * только числа, вызывающему пришлось бы завести свой Rng и повторить первые два
+ * броска руками — а повторённый вручную контракт разъезжается при первой же
+ * правке.
+ */
+export type CityForm = {
+  shape: ProfileShape
+  /** Радиус эквивалентного круга, км: по нему считается плотность застройки. */
   radius: number
-  /** Потолок высоты для этого города, км. */
+  /** Потолок высоты, км. */
   peak: number
   /** Число зданий. */
   count: number
+  /** Поворот уличной сетки, радианы. */
+  grid: number
+  /** Вытянутость пятна. */
+  aspect: number
+  /** Полуось пятна вдоль сетки, км. */
+  radiusX: number
+  /** Полуось пятна поперёк сетки, км. */
+  radiusZ: number
+  /** Наибольший вынос ПЛОЩАДКИ от центра города, км. */
+  padReach: number
+  /** Поток случайности, который продолжает расстановка. */
+  rng: Rng
 }
 
-function silhouetteOf(city: City): Silhouette {
+export function cityForm(city: City): CityForm {
+  const shape = PROFILE_SHAPES[city.profile] ?? FALLBACK_SHAPE
   const scale = city.population / REFERENCE_POPULATION
 
+  const radius = REFERENCE_RADIUS * scale ** RADIUS_EXPONENT * shape.radius
+  // Логарифм, а не степень: высота — самый заметный признак, и линейный рост
+  // превратил бы Москву в иглу на фоне плинтусов.
+  const peak = (REFERENCE_PEAK + PEAK_PER_DECADE * Math.log10(scale)) * shape.peak
+  const count = Math.max(
+    MIN_BUILDING_COUNT,
+    Math.round(REFERENCE_COUNT * scale ** COUNT_EXPONENT * shape.count),
+  )
+
+  const rng = Rng.forKey(city.id)
+
+  // Своя ориентация уличной сетки у каждого города. Дешёвая деталь, а города
+  // перестают выглядеть штампованными: коробки в Твери развёрнуты не так, как в
+  // Рязани, и это заметно раньше, чем понимаешь почему.
+  const grid = rng.range(0, Math.PI / 2)
+  const aspect = rng.range(shape.aspectMin, shape.aspectMax)
+
+  const radiusX = radius * aspect
+  const radiusZ = radius / aspect
+
   return {
-    radius: REFERENCE_RADIUS * scale ** RADIUS_EXPONENT,
-    // Логарифм, а не степень: высота — самый заметный признак, и линейный рост
-    // превратил бы Москву в иглу на фоне плинтусов.
-    peak: REFERENCE_PEAK + PEAK_PER_DECADE * Math.log10(scale),
-    count: Math.max(
-      MIN_BUILDING_COUNT,
-      Math.round(REFERENCE_COUNT * scale ** COUNT_EXPONENT),
-    ),
+    shape,
+    radius,
+    peak,
+    count,
+    grid,
+    aspect,
+    radiusX,
+    radiusZ,
+    padReach: Math.max(radiusX, radiusZ) * PAD_MARGIN,
+    rng,
   }
+}
+
+/**
+ * Вынос городской площадки от центра, км.
+ *
+ * Публичная и единственная величина, которую про размер города спрашивают
+ * снаружи: IndustryMesh отодвигает по ней промышленность. Раньше та же формула
+ * была ПЕРЕПИСАНА в IndustryMesh с честной пометкой «известный долг» — и долг
+ * этот стал настоящей ошибкой ровно в тот момент, когда радиус начал зависеть от
+ * профиля: скопированная формула про профиль не знает, и заводы аграрного города
+ * встали бы внутрь его застройки.
+ */
+export function cityPadReach(city: City): number {
+  return cityForm(city).padReach
 }
 
 type Building = {
@@ -186,34 +527,52 @@ type Building = {
   depth: number
   height: number
   yaw: number
+  /** Доля от пика города, 0..1: по ней красится тон и раздаются окна. */
+  tone: number
 }
 
 /**
- * Здания одного города.
+ * Окно — тёплая точка на грани дома.
+ *
+ * Названо WindowLight, а не Window, намеренно: в .tsx подключён lib DOM, и тип
+ * с именем Window перекрыл бы глобальный интерфейс браузерного окна внутри
+ * файла. Такое перекрытие ничего не ломает сегодня и ломает всё в тот день,
+ * когда в файле понадобится настоящий window.
+ */
+type WindowLight = {
+  x: number
+  z: number
+  /** Высота центра окна над нулём сцены, км. */
+  y: number
+  yaw: number
+  size: number
+}
+
+type Blocks = {
+  buildings: Building[]
+  windows: WindowLight[]
+  /** Верх самого высокого здания, км: по нему ставится подпись. */
+  top: number
+}
+
+/**
+ * Здания одного города и окна на них.
  *
  * Порядок обращений к ГПСЧ здесь — часть контракта: последовательность бросков
  * должна быть одинаковой при каждом вызове, иначе силуэт перестанет быть
  * стабильным. Поэтому кандидаты на место перебираются всегда все шесть, даже
- * когда победитель очевиден с первого.
+ * когда победитель очевиден с первого, а бросок на доминанту делается даже для
+ * зданий ядра, которым доминанта не положена, — результат просто не применяется.
  */
-function buildingsOf(city: City, silhouette: Silhouette): Building[] {
-  const rng = Rng.forKey(city.id)
-  const { radius, peak, count } = silhouette
-
-  // Своя ориентация уличной сетки у каждого города. Дешёвая деталь, а города
-  // перестают выглядеть штампованными: коробки в Твери развёрнуты не так, как в
-  // Рязани, и это заметно раньше, чем понимаешь почему.
-  const grid = rng.range(0, Math.PI / 2)
+function blocksOf(form: CityForm): Blocks {
+  const { shape, radius, peak, count, grid, aspect, rng } = form
   const gridCos = Math.cos(grid)
   const gridSin = Math.sin(grid)
 
-  // Города не круглые: вытянутость вдоль сетки даёт долину реки или коридор
-  // трассы, вокруг которых город и рос.
-  const aspect = rng.range(0.72, 1.35)
-
   const side = radius * Math.sqrt((Math.PI * BUILDING_COVERAGE) / count)
+  const towers = Math.round(count * shape.coreShare)
 
-  const placed: { x: number; z: number; core: number }[] = []
+  const placed: { x: number; z: number; core: number; tower: boolean }[] = []
 
   for (let i = 0; i < count; i++) {
     // Наилучший из нескольких кандидатов — выборка Митчелла. Честный
@@ -221,12 +580,18 @@ function buildingsOf(city: City, silhouette: Silhouette): Building[] {
     // читает это как ошибку, а не как город. Отбраковка по минимальному
     // расстоянию решала бы ту же задачу, но на плотной застройке Москвы рискует
     // не найти свободного места и зациклиться; здесь проходов ровно шесть.
-    let best = { x: 0, z: 0, core: 0 }
+    //
+    // Ядро идёт ПЕРВЫМ и садится в середину: башни занимают центр, а обычная
+    // застройка потом обходит их той же выборкой Митчелла, то есть жмётся к
+    // краям сама, без отдельного правила.
+    const tower = i < towers
+    let best = { x: 0, z: 0, core: 0, tower }
     let bestGap = -1
 
     for (let candidate = 0; candidate < PLACEMENT_CANDIDATES; candidate++) {
       const angle = rng.range(0, Math.PI * 2)
-      const core = rng.float() ** CORE_BIAS
+      const raw = rng.float() ** shape.coreBias
+      const core = tower ? raw * CORE_SPAN : raw
       const r = radius * core
 
       // Эллипс в осях сетки, затем поворот сетки — порядок важен: повернуть
@@ -247,43 +612,135 @@ function buildingsOf(city: City, silhouette: Silhouette): Building[] {
 
       if (gap > bestGap) {
         bestGap = gap
-        best = { x, z, core }
+        best = { x, z, core, tower }
       }
     }
 
     placed.push(best)
   }
 
-  return placed.map((spot) => {
+  const buildings: Building[] = []
+  let top = 0
+
+  for (const spot of placed) {
     // Ближе к центру — выше и уже, к окраине — ниже и шире: так выглядит любой
-    // город, где земля в центре дороже. Даёт ровно тот колокол силуэта, ради
-    // которого всё и затевалось.
-    const height =
-      peak *
-      (0.16 + 0.84 * (1 - spot.core) ** 1.6) *
-      rng.range(0.6, 1) *
-      (rng.chance(LANDMARK_CHANCE) ? LANDMARK_FACTOR : 1)
+    // город, где земля в центре дороже. Показатель спада даёт профиль: единица
+    // — ровный холм аграрного посёлка, 2.2 — обрыв столичного центра.
+    const shoulder =
+      HEIGHT_FLOOR + (1 - HEIGHT_FLOOR) * (1 - spot.core) ** shape.falloff
 
-    const spread = 0.82 + 0.36 * spot.core
+    // Бросок делается всегда, применяется — только к обычной застройке: башня
+    // ядра и без того выше всех, а перемножение двух надбавок дало бы одинокую
+    // иглу вдвое выше города.
+    const landmark = rng.chance(shape.landmarkChance)
+    const boost = spot.tower
+      ? shape.towerFactor
+      : landmark
+        ? shape.landmarkFactor
+        : 1
 
-    return {
+    const height = Math.max(
+      peak * shoulder * rng.range(HEIGHT_JITTER_MIN, 1) * boost,
+      peak * 0.12,
+    )
+    if (height > top) top = height
+
+    const spread = (0.82 + 0.36 * spot.core) * (spot.tower ? CORE_SLIMNESS : 1)
+    const plan = spot.tower ? 1 : shape.slab
+
+    buildings.push({
       x: spot.x,
       z: spot.z,
-      width: side * spread * rng.range(0.75, 1.3),
-      depth: side * spread * rng.range(0.75, 1.3),
-      height: Math.max(height, peak * 0.12),
+      // Пластина вытянута ВДОЛЬ сетки: ширина умножается на slab, глубина на
+      // столько же делится, поэтому площадь застройки не зависит от профиля и
+      // плотность остаётся той, что заказана BUILDING_COVERAGE.
+      width: side * spread * rng.range(0.75, 1.3) * plan,
+      depth: (side * spread * rng.range(0.75, 1.3)) / plan,
+      height,
       // Небольшой разброс относительно сетки: идеально выровненные коробки
-      // выглядят как склад контейнеров, а не как застройка.
-      yaw: grid + rng.range(-0.12, 0.12),
+      // выглядят как склад контейнеров, а не как застройка. У промышленного и
+      // транзитного профиля разброс почти нулевой — регулярность там признак.
+      yaw: grid + rng.range(-shape.yawJitter, shape.yawJitter),
+      tone: 0,
+    })
+  }
+
+  // Тон и окна считаются вторым проходом: обоим нужен ФАКТИЧЕСКИЙ верх города,
+  // а он известен только когда брошены все высоты. Считать их от расчётного
+  // потолка нельзя — доминанты и башни его перекрывают, и самое высокое здание
+  // получало бы тон единица наравне с десятком соседей.
+  const windows: WindowLight[] = []
+
+  for (const building of buildings) {
+    const tone = top > 0 ? clamp01(building.height / top) : 1
+    building.tone = tone
+    if (tone < WINDOW_MIN_TONE) continue
+
+    // Чем выше здание, тем больше на нём окон, но не больше трёх: дальше это
+    // перестаёт быть точками. Число выводится из тона, а не бросается, — лишний
+    // бросок здесь ничего не добавил бы к разнообразию, зато удлинил бы контракт.
+    const share = (tone - WINDOW_MIN_TONE) / (1 - WINDOW_MIN_TONE)
+    const quota = Math.min(
+      WINDOW_MAX_PER_BUILDING,
+      1 + Math.floor(share * WINDOW_MAX_PER_BUILDING),
+    )
+
+    const size = Math.min(
+      WINDOW_SIZE_MAX,
+      Math.max(
+        WINDOW_SIZE_MIN,
+        Math.min(building.width, building.depth) * WINDOW_SIZE_SHARE,
+      ),
+    )
+    const cos = Math.cos(building.yaw)
+    const sin = Math.sin(building.yaw)
+
+    for (let w = 0; w < quota; w++) {
+      const face = rng.int(0, 3)
+      const up = rng.range(0.3, 0.88)
+      const along = rng.range(-0.34, 0.34)
+
+      // Окно садится НА грань: центр кубика лежит в плоскости фасада, половина
+      // уходит внутрь дома. Утопить целиком значило бы не увидеть его вовсе,
+      // выставить наружу — получить нашлёпку, заметную на ближнем зуме.
+      const localX =
+        face === 0
+          ? building.width / 2
+          : face === 1
+            ? -building.width / 2
+            : along * building.width
+      const localZ =
+        face === 2
+          ? building.depth / 2
+          : face === 3
+            ? -building.depth / 2
+            : along * building.depth
+
+      // Поворот вокруг +Y на yaw — тот же, которым развёрнута сама коробка
+      // (three.js: локальная ось X уходит в (cos, −sin) мировых XZ).
+      windows.push({
+        x: building.x + localX * cos + localZ * sin,
+        z: building.z - localX * sin + localZ * cos,
+        y: layers.buildingBase + building.height * up,
+        yaw: building.yaw,
+        size,
+      })
     }
-  })
+  }
+
+  return { buildings, windows, top }
 }
 
 /**
- * Круглые площадки застройки под городами — одной геометрией на все города.
+ * Эллиптические площадки застройки под городами — одной геометрией на все города.
  *
  * Служат двум целям сразу: отделяют город от рельефа тоном и прячут концы
  * дорожных лент, которые иначе торчали бы из центра города обрубками.
+ *
+ * Эллипс, а не круг: пятно застройки вытянуто (см. aspect в ProfileShape), и
+ * круглая площадка при сильной вытянутости оставляла бы часть домов стоять прямо
+ * на рельефе. Заодно форма земли под транзитным городом сама показывает, вдоль
+ * чего он вырос.
  *
  * Возвращаются сырые массивы, а не готовая BufferGeometry: геометрия собирается
  * из них JSX-элементами, и тогда её удаляет сам R3F. Собери мы объект здесь,
@@ -292,14 +749,32 @@ function buildingsOf(city: City, silhouette: Silhouette): Building[] {
  * площадки молча исчезли бы в режиме разработки.
  */
 function buildPads(
-  spots: readonly { x: number; z: number; radius: number }[],
+  spots: readonly {
+    x: number
+    z: number
+    radiusX: number
+    radiusZ: number
+    yaw: number
+  }[],
 ): { positions: Float32Array; normals: Float32Array } {
   const positions = new Float32Array(spots.length * PAD_SEGMENTS * 9)
   const normals = new Float32Array(spots.length * PAD_SEGMENTS * 9)
   let offset = 0
 
   for (const spot of spots) {
-    const r = spot.radius * PAD_MARGIN
+    const rx = spot.radiusX * PAD_MARGIN
+    const rz = spot.radiusZ * PAD_MARGIN
+    const cos = Math.cos(spot.yaw)
+    const sin = Math.sin(spot.yaw)
+
+    const rim = (angle: number): [number, number] => {
+      const localX = Math.cos(angle) * rx
+      const localZ = Math.sin(angle) * rz
+      return [
+        spot.x + localX * cos - localZ * sin,
+        spot.z + localX * sin + localZ * cos,
+      ]
+    }
 
     for (let s = 0; s < PAD_SEGMENTS; s++) {
       const a0 = (s / PAD_SEGMENTS) * Math.PI * 2
@@ -308,14 +783,9 @@ function buildPads(
       // Порядок вершин — центр, следующая, текущая: только при нём нормаль
       // треугольника смотрит в +Y и площадка не оказывается отбракована как
       // задняя грань.
-      const triangle = [
-        spot.x,
-        spot.z,
-        spot.x + Math.cos(a1) * r,
-        spot.z + Math.sin(a1) * r,
-        spot.x + Math.cos(a0) * r,
-        spot.z + Math.sin(a0) * r,
-      ]
+      const [x1, z1] = rim(a1)
+      const [x0, z0] = rim(a0)
+      const triangle = [spot.x, spot.z, x1, z1, x0, z0]
 
       for (let v = 0; v < 3; v++) {
         positions[offset] = triangle[v * 2]
@@ -342,21 +812,16 @@ export function Cities(): JSX.Element {
 
   const layout = useMemo(() => {
     const items = Object.values(cities).map((city) => {
-      const silhouette = silhouetteOf(city)
+      const form = cityForm(city)
       const at = cityPoint(city)
 
-      return {
-        city,
-        at,
-        silhouette,
-        buildings: buildingsOf(city, silhouette),
-      }
+      return { city, at, form, blocks: blocksOf(form) }
     })
 
     return {
       items,
       buildings: items.flatMap((item) =>
-        item.buildings.map((building) => ({
+        item.blocks.buildings.map((building) => ({
           x: item.at.x + building.x,
           z: item.at.z + building.z,
           width: building.width,
@@ -366,13 +831,24 @@ export function Cities(): JSX.Element {
           // Тон по высоте: высокое — светлее. Один и тот же признак кодируется
           // дважды, силуэтом и тоном, поэтому иерархия читается даже там, где
           // силуэт съеден перспективой или туманом.
-          tone: Math.min(1, building.height / item.silhouette.peak),
+          tone: building.tone,
+        })),
+      ),
+      windows: items.flatMap((item) =>
+        item.blocks.windows.map((light) => ({
+          x: item.at.x + light.x,
+          y: light.y,
+          z: item.at.z + light.z,
+          yaw: light.yaw,
+          size: light.size,
         })),
       ),
       pads: items.map((item) => ({
         x: item.at.x,
         z: item.at.z,
-        radius: item.silhouette.radius,
+        radiusX: item.form.radiusX,
+        radiusZ: item.form.radiusZ,
+        yaw: item.form.grid,
       })),
     }
   }, [cities])
@@ -380,6 +856,8 @@ export function Cities(): JSX.Element {
   const pads = useMemo(() => buildPads(layout.pads), [layout.pads])
 
   const mesh = useRef<THREE.InstancedMesh>(null)
+  const windowMesh = useRef<THREE.InstancedMesh>(null)
+  const windowMaterial = useRef<THREE.MeshBasicMaterial>(null)
 
   useLayoutEffect(() => {
     const target = mesh.current
@@ -413,6 +891,82 @@ export function Cities(): JSX.Element {
     // коробке 1×1×1 в начале координат, и вся застройка исчезает, стоит увести
     // камеру от нуля.
     target.computeBoundingSphere()
+
+    const lights = windowMesh.current
+    if (!lights) return
+
+    layout.windows.forEach((light, index) => {
+      position.set(light.x, light.y, light.z)
+      quaternion.setFromAxisAngle(axis, light.yaw)
+      scale.set(light.size, light.size, light.size)
+      lights.setMatrixAt(index, matrix.compose(position, quaternion, scale))
+    })
+
+    lights.instanceMatrix.needsUpdate = true
+    lights.computeBoundingSphere()
+    // Днём окон нет, и меш обязан стартовать погашенным: иначе первый кадр
+    // партии, которая начинается в полночь 1 января, вспыхнет полным светом
+    // раньше, чем useFrame успеет посчитать час.
+    lights.visible = false
+  }, [layout])
+
+  /**
+   * Единственная работа этого файла в кадре — одно число.
+   *
+   * Ни одного объекта не создаётся: тик читается из стора напрямую, доля суток
+   * считается арифметикой, и результат кладётся в непрозрачность одного
+   * материала. Гасить меш целиком важнее, чем кажется: днём это снимает со сцены
+   * тысячу прозрачных инстансов вместе с их сортировкой и вызовом отрисовки.
+   */
+  useFrame(() => {
+    const material = windowMaterial.current
+    const lights = windowMesh.current
+    if (material === null || lights === null) return
+
+    const raw = clock.alpha
+    const alpha = raw < 0 ? 0 : raw > 1 ? 1 : raw
+    const opacity =
+      windowGlow(useGameStore.getState().state.tick + alpha) * WINDOW_OPACITY
+
+    material.opacity = opacity
+    lights.visible = opacity > GLOW_EPSILON
+  })
+
+  /**
+   * Дев-хук: что НА САМОМ ДЕЛЕ нарисовано, а не что посчитано.
+   *
+   * Числа берутся с живых InstancedMesh, а формы — из разложенного макета. Тот
+   * же довод, что у __plechoBuildings: посчитать матрицы и не смонтировать меш —
+   * ровно тот отказ, которого юнит-тест не видит по устройству. В
+   * продакшен-сборке ветка вырезается целиком: import.meta.env.DEV — константа
+   * этапа сборки.
+   */
+  useEffect(() => {
+    if (!import.meta.env.DEV) return
+
+    const dev = globalThis as unknown as { __plechoCities?: unknown }
+
+    dev.__plechoCities = () => ({
+      cities: layout.items.map((item) => ({
+        id: item.city.id,
+        profile: item.city.profile,
+        population: item.city.population,
+        radiusX: item.form.radiusX,
+        radiusZ: item.form.radiusZ,
+        peak: item.form.peak,
+        top: item.blocks.top,
+        buildings: item.blocks.buildings.length,
+        windows: item.blocks.windows.length,
+      })),
+      boxes: mesh.current?.count ?? 0,
+      windows: windowMesh.current?.count ?? 0,
+      glow: windowMaterial.current?.opacity ?? 0,
+      lit: windowMesh.current?.visible ?? false,
+    })
+
+    return () => {
+      delete dev.__plechoCities
+    }
   }, [layout])
 
   return (
@@ -452,15 +1006,44 @@ export function Cities(): JSX.Element {
         </instancedMesh>
       )}
 
+      {layout.windows.length > 0 && (
+        <instancedMesh
+          ref={windowMesh}
+          args={[null!, null!, layout.windows.length]}
+          // Тени выключены намеренно, обе. Окно — источник света, а не
+          // препятствие ему; кубик в четверть метра всё равно не попал бы в
+          // карту теней, где тексель покрывает около четырёхсот метров, зато
+          // тысяча лишних объектов в проходе тени стоила бы вполне реальных
+          // миллисекунд.
+          castShadow={false}
+          receiveShadow={false}
+        >
+          <boxGeometry args={[1, 1, 1]} />
+          {/*
+            Материал БЕЗ ОСВЕЩЕНИЯ и ровно один на все окна округа. Basic, а не
+            standard с emissive, по двум причинам сразу: свет из окна не должен
+            гаснуть вместе с ночным ключевым светом, и unlit-материал не считает
+            ни одного источника на тысяче инстансов.
+
+            Цвет — акцент палитры, единственный тёплый и единственный, которому
+            позволено светиться. Тот же довод, что у ограды в IndustryMesh: замок
+            ломается не цветом, а ПЛОЩАДЬЮ, и суммарная площадь окон ничтожна,
+            поэтому самым ярким объектом ночной карты остаётся машина.
+          */}
+          <meshBasicMaterial
+            ref={windowMaterial}
+            color={palette.accent}
+            transparent
+            opacity={0}
+          />
+        </instancedMesh>
+      )}
+
       {layout.items.map((item) => (
         <Html
           key={item.city.id}
           center
-          position={[
-            item.at.x,
-            item.silhouette.peak + LABEL_CLEARANCE,
-            item.at.z,
-          ]}
+          position={[item.at.x, item.blocks.top + LABEL_CLEARANCE, item.at.z]}
           // Подпись не должна перехватывать курсор: под ней панорамирование
           // карты, и «мёртвые» пятна вокруг городов ощущаются как поломка.
           pointerEvents="none"

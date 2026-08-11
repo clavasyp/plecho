@@ -520,3 +520,49 @@ describe('разбор ничего не меняет', () => {
     expect(JSON.stringify(state)).toBe(before)
   })
 })
+
+describe('непринятый груз — не очередь', () => {
+  /**
+   * САМЫЙ ДОРОГОЙ ВИД ВРАНЬЯ, КОТОРЫЙ ПАНЕЛЬ УМЕЛА. Машина, которой некуда сдать
+   * груз, стоит так же неподвижно, как машина в очереди на рампу, и зарплата у
+   * неё горит так же. Но лечится это по-разному: очередь расшивается терминалом,
+   * а полный склад получателя — нет, сколько рамп ни построй. Слитые в одно
+   * число, они давали правдоподобный совет купить терминал за 90 000 там, где он
+   * не изменил бы ничего: в замере 12.9 из 13 процентных пунктов очереди узла
+   * были именно мёртвым стоянием.
+   */
+  it('машина с отказом не попадает в окупаемость терминала', () => {
+    const queue = Array.from({ length: BUILDING_SPEC[RELIEF_BUILDING].posts }, () => ({
+      at: LOADING_CITY,
+      queued: 4,
+      service: 0,
+      driver: true,
+    }))
+
+    const waiting = world(queue)
+    const before = cityQueue(waiting, PLAYER_ID, LOADING_CITY)
+    const offer = before.offers.find((o) => o.type === RELIEF_BUILDING)
+    expect(offer, 'терминал предлагается').toBeDefined()
+    expect(offer?.savedPerDay ?? 0, 'и что-то обещает').toBeGreaterThan(0)
+
+    // Тот же узел, но все машины стоят с непринятым грузом.
+    const refused: GameState = {
+      ...waiting,
+      vehicles: Object.fromEntries(
+        Object.entries(waiting.vehicles).map(([id, vehicle]) => [
+          id,
+          { ...vehicle, blockedTicks: 1 },
+        ]),
+      ) as Record<VehicleId, Vehicle>,
+    }
+
+    const after = cityQueue(refused, PLAYER_ID, LOADING_CITY)
+    const offerAfter = after.offers.find((o) => o.type === RELIEF_BUILDING)
+
+    // Очередь никуда не делась — машины по-прежнему стоят и жгут зарплату.
+    expect(after.entries.length).toBe(before.entries.length)
+    expect(after.lostPerDay).toBeCloseTo(before.lostPerDay, 6)
+    // А вот обещать за них возврат терминал больше не имеет права.
+    expect(offerAfter?.savedPerDay ?? 0).toBe(0)
+  })
+})

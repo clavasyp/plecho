@@ -179,6 +179,22 @@ export type QueueEntry = {
 
   /** Что в кузове. null — машина порожняя и ждёт погрузки, а не выгрузки. */
   cargo: CargoType | null
+
+  /**
+   * Машина стоит с грузом, который в этом городе некому принять.
+   *
+   * ЭТО НЕ ОЧЕРЕДЬ, И РАЗНИЦА СТОИТ ДЕНЕГ. Очередь лечится терминалом — постов
+   * станет больше, машины поедут быстрее. Непринятый груз терминалом не лечится
+   * ВООБЩЕ: склад получателя полон, и сколько ни строй рамп, разгружаться всё
+   * равно некуда. Слитые в одно число, эти два случая дают самый дорогой вид
+   * вранья — правдоподобный совет купить терминал за 90 000 там, где он не
+   * изменит ничего.
+   *
+   * Признак — счётчик отказов машины (blockedTicks, разбор у markBlocked в
+   * sim/logistics/loading.ts): он растёт только тогда, когда машина ПОДЪЕХАЛА
+   * сдавать и ей отказали.
+   */
+  refused: boolean
 }
 
 /**
@@ -350,6 +366,7 @@ function entryFor(
     lostPerDay: perTick * TICKS_PER_DAY,
 
     cargo: vehicle.cargo?.type ?? null,
+    refused: vehicle.blockedTicks > 0,
   }
 }
 
@@ -519,16 +536,24 @@ export function cityQueue(
  * Расшиваются ПЕРВЫЕ в очереди — те, кому пост достанется по правилу
  * обслуживания. Больше, чем стоит в очереди, ни один терминал не расшьёт: три
  * поста при одной ждущей машине спасают одну зарплату, а не три.
+ *
+ * МАШИНЫ С НЕПРИНЯТЫМ ГРУЗОМ ИЗ РАСЧЁТА ИСКЛЮЧЕНЫ, и это главное здесь.
+ * Терминал добавляет РАМПЫ, а машина с отказом стоит не из-за рампы — ей
+ * некуда сдать груз, склад получателя полон. Посчитай её в окупаемость, и
+ * панель пообещает игроку возврат девяноста тысяч там, где не изменится
+ * ровно ничего: замер показал узел, где 12.9 процентных пункта очереди из 13
+ * были именно таким мёртвым стоянием.
  */
 function savedPerDayFor(
   entries: readonly QueueEntry[],
   posts: number,
 ): { relieved: number; saved: number } {
   const slots = Number.isFinite(posts) && posts > 0 ? Math.floor(posts) : 0
-  const relieved = Math.min(entries.length, slots)
+  const helped = entries.filter((entry) => !entry.refused)
+  const relieved = Math.min(helped.length, slots)
 
   let saved = 0
-  for (let i = 0; i < relieved; i++) saved += entries[i].lostPerDay
+  for (let i = 0; i < relieved; i++) saved += helped[i].lostPerDay
 
   return { relieved, saved }
 }
