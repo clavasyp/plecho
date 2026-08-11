@@ -95,7 +95,14 @@ function pickCity(cityId: CityId): void {
 }
 
 export function CityPicker(): JSX.Element {
-  const cities = useGameStore((s) => s.state.world.cities)
+  /*
+   * Подписка на СПИСОК ИДЕНТИФИКАТОРОВ: реестр городов пересобирается каждый
+   * тик вместе с состоянием, а мишеням для клика нужны только координаты, и те
+   * не меняются никогда. Голая подписка на объект заставляла пересобирать все
+   * пятьдесят три сферы по несколько раз в секунду.
+   */
+  const roster = useGameStore((s) => Object.keys(s.state.world.cities).join('|'))
+  const cities = useGameStore.getState().state.world.cities
   const selected = useSelection((s) => s.city)
 
   /*
@@ -117,7 +124,8 @@ export function CityPicker(): JSX.Element {
         name: city.name,
         ...cityPoint(city),
       })),
-    [cities],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [roster],
   )
 
   return (

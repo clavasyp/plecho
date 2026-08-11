@@ -222,11 +222,29 @@ function buildRibbons(
 }
 
 export function Roads(): JSX.Element {
-  // Поверхностное сравнение обязательно: реестры пересобираются каждый тик, а
-  // сами города и рёбра неизменны — без него сеть перестраивалась бы по
-  // несколько раз в секунду вместо одного раза за партию.
-  const cities = useGameStore(useShallow((store) => store.state.world.cities))
-  const edges = useGameStore(useShallow((store) => store.state.world.edges))
+  /*
+   * ПОДПИСКА НА СПИСОК ИДЕНТИФИКАТОРОВ, А НЕ НА ОБЪЕКТЫ.
+   *
+   * Здесь стояло поверхностное сравнение по самим объектам City и Edge с
+   * пояснением «сами города и рёбра неизменны». Про рёбра это правда и сейчас,
+   * а вот города МЕНЯЮТСЯ каждый тик: население дрейфует у всех пятидесяти трёх
+   * (рост и сжатие в economy/consumption.ts). Поверхностное сравнение видело
+   * новые объекты и пересобирало ВСЮ дорожную сеть страны по несколько раз в
+   * секунду — 294 буфера вершин за десять секунд по замеру, — выдавая при этом
+   * бит в бит ту же геометрию: дороге от города нужны только координаты, а они
+   * не меняются никогда.
+   *
+   * Ключ — только идентификаторы. Население в него не входит СОЗНАТЕЛЬНО: оно
+   * на форму дороги не влияет.
+   */
+  const roster = useGameStore((store) =>
+    Object.keys(store.state.world.cities).join('|'),
+  )
+  const edgeRoster = useGameStore((store) =>
+    Object.keys(store.state.world.edges).join('|'),
+  )
+  const cities = useGameStore.getState().state.world.cities
+  const edges = useGameStore.getState().state.world.edges
 
   const layers = useMemo(() => {
     const points = new Map<CityId, { x: number; z: number }>()
@@ -263,7 +281,8 @@ export function Roads(): JSX.Element {
         empty: segments.length === 0,
       }
     })
-  }, [cities, edges])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roster, edgeRoster])
 
   const groupRef = useRef<Group>(null)
 
