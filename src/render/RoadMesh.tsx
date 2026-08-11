@@ -57,13 +57,17 @@ import type { JSX } from 'react'
 import { Color } from 'three'
 import type { Group, Mesh, MeshStandardMaterial } from 'three'
 import { useFrame } from '@react-three/fiber'
-import { useShallow } from 'zustand/shallow'
 import { useGameStore } from '../app/store'
 import { cityPoint } from './CityMesh'
 import { layers as sceneLayers } from './layers'
 import { atmosphere } from './sky'
 import { palette } from './palette'
 import { shoulderProfile, surfaceSteps, surfaceTone } from './roadSurface'
+import {
+  attachPixelFloor,
+  PIXEL_FLOOR,
+  WIDEN_ATTRIBUTE,
+} from './pixelFloor'
 import type { CityId, RoadClass } from '../sim/types'
 
 /**
@@ -86,11 +90,26 @@ import type { CityId, RoadClass } from '../sim/types'
  */
 const ROAD_STYLE: Record<
   RoadClass,
-  { width: number; color: string; elevation: number }
+  { width: number; color: string; elevation: number; floorPx: number }
 > = {
-  федеральная: { width: 3.4, color: palette.roadFederal, elevation: sceneLayers.roadFederal },
-  региональная: { width: 2.3, color: palette.roadRegional, elevation: sceneLayers.roadRegional },
-  местная: { width: 1.4, color: palette.roadLocal, elevation: sceneLayers.roadLocal },
+  федеральная: {
+    width: 3.4,
+    color: palette.roadFederal,
+    elevation: sceneLayers.roadFederal,
+    floorPx: PIXEL_FLOOR.roadFederal,
+  },
+  региональная: {
+    width: 2.3,
+    color: palette.roadRegional,
+    elevation: sceneLayers.roadRegional,
+    floorPx: PIXEL_FLOOR.roadRegional,
+  },
+  местная: {
+    width: 1.4,
+    color: palette.roadLocal,
+    elevation: sceneLayers.roadLocal,
+    floorPx: PIXEL_FLOOR.roadLocal,
+  },
 }
 
 /** Порядок отрисовки: мелкие дороги ложатся первыми, крупные поверх. */
@@ -120,6 +139,8 @@ type Ribbons = {
   positions: Float32Array
   normals: Float32Array
   colors: Float32Array
+  /** Смещение вершины от оси ленты — им живёт пиксельный пол, см. pixelFloor.ts. */
+  widen: Float32Array
 }
 
 /** Многоразовый разбор шестнадцатеричного цвета: в сборке буфера аллокаций нет. */
@@ -148,6 +169,10 @@ function buildRibbons(
 ): Ribbons {
   const positions: number[] = []
   const colors: number[] = []
+  // Смещение копится В ТОМ ЖЕ ЦИКЛЕ, что и позиция, и из тех же слагаемых.
+  // Разнести их по двум проходам значило бы завести два описания одной вершины,
+  // которые разъедутся при первой же правке формы кромки.
+  const widen: number[] = []
   const half = width / 2
 
   for (const segment of segments) {
@@ -203,9 +228,22 @@ function buildRibbons(
         bx + nx * bLeft, bz + nz * bLeft,
       ]
 
+      // Ровно те же слагаемые, что и в quad, но без точки на оси: это и есть
+      // «на сколько вершина отъехала вбок». Знак сохраняется — по нему шейдер
+      // раздвигает кромки в РАЗНЫЕ стороны, а не сдвигает ленту целиком.
+      const offsets = [
+        -nx * aRight, -nz * aRight,
+        nx * aLeft, nz * aLeft,
+        -nx * bRight, -nz * bRight,
+        -nx * bRight, -nz * bRight,
+        nx * aLeft, nz * aLeft,
+        nx * bLeft, nz * bLeft,
+      ]
+
       for (let v = 0; v < 6; v++) {
         positions.push(quad[v * 2], elevation, quad[v * 2 + 1])
         colors.push(cr, cg, cb)
+        widen.push(offsets[v * 2], 0, offsets[v * 2 + 1])
       }
     }
   }
@@ -218,6 +256,7 @@ function buildRibbons(
     positions: new Float32Array(positions),
     normals,
     colors: new Float32Array(colors),
+    widen: new Float32Array(widen),
   }
 }
 
@@ -277,6 +316,7 @@ export function Roads(): JSX.Element {
 
       return {
         roadClass,
+        floorPx: style.floorPx,
         ribbons: buildRibbons(segments, style.width, style.elevation, style.color),
         empty: segments.length === 0,
       }
@@ -341,6 +381,19 @@ export function Roads(): JSX.Element {
           tones: tones.size,
           dimmest,
           brightest,
+          /*
+           * СЕЗОННЫЙ МНОЖИТЕЛЬ, СНЯТЫЙ С ЖИВОГО МАТЕРИАЛА.
+           *
+           * Он тут не для полноты картины. Множитель ставится в кадре, по
+           * списку материалов, собранному через ref, — а такой список умеет
+           * оказаться пустым, и тогда зимнее затемнение просто не происходит,
+           * не давая ни ошибки, ни предупреждения. Ровно этим и объясняется
+           * замер, ради которого поле заведено: контраст полотна на снегу
+           * 0.0006 при летних 0.11, то есть зимой дороги на карте нет.
+           */
+          tint: (mesh.material as MeshStandardMaterial).color.r,
+          /** Есть ли у геометрии смещение, без которого пиксельный пол мёртв. */
+          widened: mesh.geometry.getAttribute(WIDEN_ATTRIBUTE) !== undefined,
         }
       })
     }
@@ -369,7 +422,20 @@ export function Roads(): JSX.Element {
    * у части точек полярность уже перевёрнута — дорога светлее фона там, где
    * должна быть темнее.
    */
-  const materials = useRef<MeshStandardMaterial[]>([])
+  /*
+   * МНОЖЕСТВО, А НЕ МАССИВ, и это не вкусовщина.
+   *
+   * Здесь стоял массив, в который ref дописывал материал. Стрелка в ref — новая
+   * функция на каждой перерисовке, а React на смену функции сначала отцепляет
+   * старую, потом цепляет новую; отцепление в массив ничего не возвращало, и
+   * список рос на три материала за перерисовку НАВСЕГДА. Сезонный множитель
+   * после этого выставлялся одному и тому же материалу десятки раз за кадр, а
+   * ссылки на выброшенные материалы держали их в памяти.
+   *
+   * Множество плюс функция очистки из ref (React 19) закрывают обе беды разом:
+   * повторная запись ничего не добавляет, а отцепленный материал уходит сам.
+   */
+  const materials = useRef<Set<MeshStandardMaterial>>(new Set())
 
   useFrame(() => {
     const winter = atmosphere.winter
@@ -398,6 +464,13 @@ export function Roads(): JSX.Element {
                 attach="attributes-color"
                 args={[layer.ribbons.colors, 3]}
               />
+              {/* Смещение от оси ленты. Без него пиксельный пол не сработает
+                  МОЛЧА: драйвер подставит нули, и каждая вершина решит, что она
+                  и так лежит на оси. Разбор — в pixelFloor.ts. */}
+              <bufferAttribute
+                attach={`attributes-${WIDEN_ATTRIBUTE}`}
+                args={[layer.ribbons.widen, 3]}
+              />
             </bufferGeometry>
             {/* Тени лента принимает, но не отбрасывает: плоскость толщиной ноль
                 отбрасывает только артефакты самозатенения.
@@ -407,7 +480,15 @@ export function Roads(): JSX.Element {
                 уходит в тёмное. Разбор — у SEASON_TINT. */}
             <meshStandardMaterial
               ref={(material) => {
-                if (material !== null) materials.current.push(material)
+                if (material === null) return
+                // Пол вешается здесь, а не в свойствах: он правит программу
+                // материала, а не его поля, и ставится ровно один раз на
+                // созданный материал.
+                attachPixelFloor(material, layer.floorPx)
+                materials.current.add(material)
+                return () => {
+                  materials.current.delete(material)
+                }
               }}
               vertexColors
               roughness={0.95}

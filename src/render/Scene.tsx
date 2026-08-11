@@ -46,10 +46,12 @@ import { fogRange, lighting, palette, postFx } from './palette'
 import { atmosphere, atmosphereInto } from './sky'
 import { Buildings, ServicePosts } from './BuildingMesh'
 import { HOME_CITY } from '../sim/state'
-import { Cities, cityPoint } from './CityMesh'
+import { Cities, cityPadReach, cityPoint } from './CityMesh'
 import { CityPicker } from './CityPicker'
 import { Industries } from './IndustryMesh'
+import { layers as sceneLayers } from './layers'
 import { Lines } from './LineMesh'
+import { usePixelFloor } from './pixelFloor'
 import { Roads } from './RoadMesh'
 import { Vehicles } from './VehicleMesh'
 import { Weather } from './Weather'
@@ -68,6 +70,16 @@ const ISO = 1 / Math.sqrt(3)
  * уходит в цвет фона. Отодвинь камеру на 1200 — и вся карта окажется в молоке.
  */
 const CAMERA_DISTANCE = 500
+
+/**
+ * Кадр, под который подбирались числа тумана, км по вертикали экрана.
+ *
+ * Шестьсот километров округа плюс запас на поля — тот вид, на котором fogRange
+ * выглядел правильно. Здесь это ЕДИНИЦА ИЗМЕРЕНИЯ, а не размер карты: туман
+ * растягивается пропорционально тому, во сколько раз нынешний кадр шире этого.
+ * Разбор — там, где значение применяется.
+ */
+const REFERENCE_SPAN_KM = 700
 
 /**
  * Пределы отсечения ортографической камеры, км.
@@ -271,6 +283,15 @@ export function Scene(): JSX.Element {
    */
   const shadowTarget = useMemo(() => new THREE.Object3D(), [])
 
+  /*
+   * ЕДИНСТВЕННОЕ МЕСТО, ГДЕ ПИКСЕЛЬНЫЙ ПОЛ УЗНАЁТ РАЗМЕР КАДРА.
+   *
+   * Уникум общий на все ленты карты (дороги, свои линии, чужие), и обновлять
+   * его из каждой значило бы делать одну и ту же работу трижды за кадр. Разбор
+   * самого приёма — в render/pixelFloor.ts.
+   */
+  usePixelFloor()
+
   useFrame(() => {
     const focus = controls.current?.target
     if (focus === undefined) return
@@ -329,6 +350,14 @@ export function Scene(): JSX.Element {
    * запись — двух десятков полей; экономить тут нечего.
    */
   const scene = useThree((state) => state.scene)
+
+  /*
+   * Камера нужна тут ради ОДНОГО поля — зума: по нему считается, сколько
+   * километров влезло в кадр, а от этого зависит туман. Берётся действующая
+   * камера сцены, а не ссылка на свой <OrthographicCamera>: makeDefault
+   * означает, что рисует именно она, и спрашивать надо того, кто рисует.
+   */
+  const camera = useThree((state) => state.camera) as THREE.OrthographicCamera
 
   const keyRef = useRef<THREE.DirectionalLight>(null)
   const fillRef = useRef<THREE.DirectionalLight>(null)
@@ -394,8 +423,32 @@ export function Scene(): JSX.Element {
     if (fog !== null) {
       fog.color.setRGB(sky.air.r, sky.air.g, sky.air.b, THREE.SRGBColorSpace)
       if (fog instanceof THREE.Fog) {
-        fog.near = sky.fogNear
-        fog.far = sky.fogFar
+        /*
+         * ТУМАН ЕДЕТ ЗА ЗУМОМ, И ЭТО НЕ УКРАШЕНИЕ, А УСЛОВИЕ ЧИТАЕМОСТИ КАРТЫ.
+         *
+         * Числа fogRange (400…1400) подбирались под округ в 600 км, и в шапке
+         * CAMERA_DISTANCE прямо записано: «отодвинь камеру на 1200 — и вся
+         * карта окажется в молоке». Камеру не отодвигали — отодвинули КАРТУ:
+         * страна вчетверо шире округа, и на общем плане дальний край кадра
+         * уходил в туман на 61%, то есть половина России растворялась в дымке
+         * ровно тогда, когда игрок хотел её увидеть. Замер прибором:
+         * федеральная лента давала контраст 0.008 при уровне зерна 0.012 —
+         * дорога была слабее шума.
+         *
+         * Правило простое: ТУМАН МЕРИТСЯ КАДРОМ, А НЕ КИЛОМЕТРАМИ. Ближняя и
+         * дальняя границы отсчитываются от расстояния до цели камеры и
+         * растягиваются вместе с тем, сколько километров влезло в экран.
+         * Тогда перепад дымки от переднего края кадра к дальнему одинаков на
+         * любом зуме — те самые 20%, ради которых туман и заводился, — и он
+         * больше не зависит от того, насколько велика карта.
+         *
+         * Суточная и сезонная часть при этом целиком остаётся за sky.ts: здесь
+         * масштабируется то, что оттуда пришло, а не подменяется.
+         */
+        const span = size.height / camera.zoom
+        const scale = span / REFERENCE_SPAN_KM
+        fog.near = CAMERA_DISTANCE - (CAMERA_DISTANCE - sky.fogNear) * scale
+        fog.far = CAMERA_DISTANCE + (sky.fogFar - CAMERA_DISTANCE) * scale
       }
     }
 
@@ -618,6 +671,269 @@ export function Scene(): JSX.Element {
       delete dev.__plechoLook
     }
   }, [view])
+
+  /**
+   * ДЕВ-ХУК: СКОЛЬКО ПИКСЕЛЕЙ КАДРА ЗАНИМАЕТ ЛЕНТА ДОРОГИ.
+   *
+   * ЗАЧЕМ ОН ВООБЩЕ ЕСТЬ. Это единственный прибор проекта, который спрашивает
+   * НАРИСОВАННЫЙ КАДР, а не состояние и не буферы. Разница принципиальная:
+   * __plechoRoads показывает, что лежит в атрибутах, но ничего не знает о том,
+   * попала ли лента хоть в один пиксель. А именно там проект уже дважды терял
+   * картинку — зимой полотно совпало с землёй до последнего разряда, и на карте
+   * страны лента оказалась тоньше пикселя. Оба раза все тесты были зелёными.
+   *
+   * КАК МЕРИТ. Ширина на полувысоте — то же, чем меряют линию в оптике:
+   *
+   *   1. Середина ребра переводится в пиксели кадрового буфера проекцией самой
+   *      камеры. Это не то, что проверяется, — это то, ГДЕ смотреть.
+   *   2. Строится экранное направление поперёк ленты: та же точка, отодвинутая
+   *      на километр по нормали к ребру, проецируется второй раз. Считать угол
+   *      руками нельзя — изометрия растягивает диагонали по-разному.
+   *   3. Вдоль этого направления снимается профиль яркости, фон берётся
+   *      медианой краёв профиля, и от ОСИ в обе стороны считается, докуда
+   *      отклонение от фона держится выше половины осевого.
+   *
+   * Полувысота, а не «отличается от фона»: край ленты размывается сглаживанием
+   * и постпроцессингом, порог по абсолютной разнице зависел бы от того, на
+   * сколько именно дорога темнее земли, и в разные сезоны мерил бы разное.
+   *
+   * СЧЁТ ИДЁТ НЕПРЕРЫВНЫМ ХОДОМ ОТ ОСИ, А НЕ ПЕРЕБОРОМ ВСЕГО ПРОФИЛЯ, и это
+   * второй заход: первый считал ВСЕ отсчёты, отклонившиеся от фона, и потому
+   * складывал в одно число ленту и всё, что случайно попало в четырнадцать
+   * пикселей вокруг неё — соседнюю дорогу, площадку города, чужой след. На
+   * общем плане, где под Москвой сходится полсети, он давал на отдалённой
+   * камере ЧЕТЫРЕ пикселя против ТРЁХ на приближённой, то есть показывал
+   * ровно обратное правде. Ось ленты по построению лежит в нуле профиля;
+   * непрерывный ход от неё мерит саму ленту и ничего кроме.
+   *
+   * ЧТО ЗНАЧИТ ВОЗВРАТ. `width` — ширина в пикселях буфера, `contrast` — пиковое
+   * отклонение от фона в долях яркости. Ноль в контрасте означает «ленты в этом
+   * месте на экране нет вовсе», и это отдельный, самый важный исход: он не
+   * отличим от «дорога не нарисована» и не должен быть отличим.
+   *
+   * ЧИТАЕТ ХОЛСТ НАПРЯМУЮ, и это возможно только потому, что в разработке
+   * включено сохранение кадрового буфера (App.tsx). В собранной игре ветка
+   * вырезается целиком вместе с флагом.
+   */
+  useEffect(() => {
+    if (!import.meta.env.DEV) return
+
+    const dev = globalThis as unknown as { __plechoRibbonWidth?: unknown }
+
+    /**
+     * Во сколько раз отойти от края городского пятна, прежде чем мерить.
+     *
+     * Два с половиной. Начиналось с полутора, и это оказалось мало: замер
+     * упирался в САМУЮ КРОМКУ московского пятна, где лежат и тень площадки, и
+     * крайние корпуса, и прибор давал контраст 0.0006 там, где на снимке
+     * дорога видна отчётливо. padReach описывает диск застройки, а вокруг него
+     * есть ещё промзона у въезда, площадки терминалов и собственная тень
+     * города; запас должен покрывать их все.
+     */
+    const PAD_CLEARANCE = 2.5
+
+    dev.__plechoRibbonWidth = (
+      edgeId: string,
+      /*
+       * Сколько пикселей профиля снимать в каждую сторону от оси.
+       *
+       * Спрашивается снаружи, потому что зависит от зума: на приближённой
+       * камере лента шире тридцати пикселей, и при коротком размахе за «фон»
+       * взялось бы её же полотно — прибор показал бы ширину, близкую к нулю,
+       * ровно там, где лента крупнее всего. Правило простое: размах должен
+       * быть заметно больше ожидаемой ленты.
+       */
+      REACH = 14,
+    ): {
+      width: number
+      contrast: number
+      at: { x: number; y: number }
+      profile: number[]
+    } | null => {
+      const camera = controls.current?.object as
+        | THREE.OrthographicCamera
+        | undefined
+      if (camera === undefined) return null
+
+      const world = useGameStore.getState().state.world
+      const edge = world.edges[edgeId as keyof typeof world.edges]
+      if (edge === undefined) return null
+
+      const from = world.cities[edge.from]
+      const to = world.cities[edge.to]
+      if (from === undefined || to === undefined) return null
+
+      const a = cityPoint(from)
+      const b = cityPoint(to)
+
+      const dx = b.x - a.x
+      const dz = b.z - a.z
+      const length = Math.hypot(dx, dz)
+      if (length === 0) return null
+
+      // Нормаль к ребру в плоскости карты — то же направление, вдоль которого
+      // лента набирает ширину в RoadMesh.
+      const nx = -dz / length
+      const nz = dx / length
+
+      const y = sceneLayers.roadFederal
+
+      const canvas = gl.domElement
+      const width = canvas.width
+      const height = canvas.height
+
+      /** Мировая точка → пиксель кадрового буфера. */
+      const toPixel = (point: THREE.Vector3): { x: number; y: number } => {
+        const ndc = point.clone().project(camera)
+        return {
+          x: (ndc.x * 0.5 + 0.5) * width,
+          y: (1 - (ndc.y * 0.5 + 0.5)) * height,
+        }
+      }
+
+      /*
+       * МЕРИМ НЕ СЕРЕДИНУ РЕБРА, А ТУ ЕГО ТОЧКУ, ЧТО БЛИЖЕ К ЦЕНТРУ ЭКРАНА И
+       * ПРИ ЭТОМ ЛЕЖИТ ВНЕ ЗАСТРОЙКИ ОБОИХ ГОРОДОВ. Оба условия выяснены
+       * замером, оба стоили красного теста.
+       *
+       * Середина — очевидный выбор и негодный: на приближённой камере она
+       * уезжает за край кадра (у М-2 это 91 км от Москвы, то есть под тысячу
+       * пикселей на предельном зуме), и прибор возвращал «не знаю» ровно там,
+       * где лента крупнее всего.
+       *
+       * Обрезка ДОЛЕЙ («не ближе пятнадцати процентов к городу») тоже негодна:
+       * пятнадцать процентов от М-2 — это 27 км, а пятно Москвы простирается на
+       * 28. Прибор честно наводился на дорогу и мерил городскую площадку,
+       * выдавая на шестнадцатикратном зуме контраст 0.008 — то есть «дороги
+       * нет» там, где она во весь экран. Отступ обязан считаться в километрах и
+       * от РАЗМЕРА КОНКРЕТНОГО ГОРОДА, а он у Москвы и Тобольска отличается
+       * впятеро.
+       */
+      const clearA = cityPadReach(from) * PAD_CLEARANCE
+      const clearB = cityPadReach(to) * PAD_CLEARANCE
+      // Ребро короче суммы двух пятен — мерить негде, дорога целиком под
+      // застройкой. Это не поломка прибора, это свойство карты.
+      if (clearA + clearB >= length) return null
+
+      const pa = toPixel(new THREE.Vector3(a.x, y, a.z))
+      const pb = toPixel(new THREE.Vector3(b.x, y, b.z))
+      const screenSpan =
+        (pb.x - pa.x) * (pb.x - pa.x) + (pb.y - pa.y) * (pb.y - pa.y)
+      const raw =
+        screenSpan === 0
+          ? 0.5
+          : ((width / 2 - pa.x) * (pb.x - pa.x) +
+              (height / 2 - pa.y) * (pb.y - pa.y)) /
+            screenSpan
+      const share = Math.min(
+        1 - clearB / length,
+        Math.max(clearA / length, raw),
+      )
+
+      const at = new THREE.Vector3(a.x + dx * share, y, a.z + dz * share)
+      const side = new THREE.Vector3(at.x + nx, y, at.z + nz)
+
+      const center = toPixel(at)
+      const off = toPixel(side)
+
+      const stepX = off.x - center.x
+      const stepY = off.y - center.y
+      const stepLength = Math.hypot(stepX, stepY)
+      // Километр поперёк ленты не даёт на экране и тысячной пикселя — камера
+      // отодвинута немыслимо далеко или ребро вырождено. Мерить нечего.
+      if (stepLength < 1e-6) return null
+
+      const ux = stepX / stepLength
+      const uy = stepY / stepLength
+
+      // Середина ребра ушла за пределы кадра — прибор обязан сказать «не знаю»,
+      // а не вернуть ноль, который читался бы как «дорога невидима».
+      if (
+        center.x < REACH ||
+        center.y < REACH ||
+        center.x > width - REACH ||
+        center.y > height - REACH
+      ) {
+        return null
+      }
+
+      const scratch = document.createElement('canvas')
+      scratch.width = 2 * REACH + 1
+      scratch.height = 2 * REACH + 1
+      const ctx = scratch.getContext('2d', { willReadFrequently: true })
+      if (ctx === null) return null
+
+      const originX = Math.round(center.x) - REACH
+      const originY = Math.round(center.y) - REACH
+      ctx.drawImage(
+        canvas,
+        originX,
+        originY,
+        scratch.width,
+        scratch.height,
+        0,
+        0,
+        scratch.width,
+        scratch.height,
+      )
+      const image = ctx.getImageData(0, 0, scratch.width, scratch.height).data
+
+      /** Яркость пикселя профиля на отсчёте t от оси, 0..1. */
+      const luminance = (t: number): number => {
+        const px = Math.round(center.x + ux * t) - originX
+        const py = Math.round(center.y + uy * t) - originY
+        const i = (py * scratch.width + px) * 4
+        return (
+          (0.2126 * image[i] + 0.7152 * image[i + 1] + 0.0722 * image[i + 2]) /
+          255
+        )
+      }
+
+      const profile: number[] = []
+      for (let t = -REACH; t <= REACH; t++) profile.push(luminance(t))
+
+      // Фон — медиана дальних четвертей профиля. Медиана, а не среднее: в
+      // дальний край может попасть чужая лента или угол площадки города, и
+      // среднее уехало бы за ней, а медиана нет.
+      const quarter = Math.floor(profile.length / 4)
+      const rim = [
+        ...profile.slice(0, quarter),
+        ...profile.slice(profile.length - quarter),
+      ].sort((p, q) => p - q)
+      const background = rim[Math.floor(rim.length / 2)]
+
+      /** Отклонение отсчёта t от фона. */
+      const deviation = (t: number): number =>
+        Math.abs(profile[t + REACH] - background)
+
+      // Пик берётся НА ОСИ, а не по всему профилю: мерится эта лента, а не
+      // самое тёмное, что оказалось поблизости.
+      const peak = deviation(0)
+
+      // Плёночное зерно в этом проекте даёт около 3/255 ≈ 0.012. Всё, что ниже
+      // удвоенного зерна, — шум, а не лента.
+      // Профиль и точка замера возвращаются наружу нарочно. Прибор, который
+      // отдаёт только вывод, невозможно проверить: когда он показал «ленты
+      // нет», надо уметь отличить исчезнувшую ленту от промаха мимо неё, а для
+      // этого нужны сырые отсчёты и пиксель, в котором они сняты.
+      const at2 = { x: Math.round(center.x), y: Math.round(center.y) }
+
+      if (peak < 0.024) {
+        return { width: 0, contrast: peak, at: at2, profile }
+      }
+
+      const half = peak / 2
+      let covered = 1
+      for (let t = 1; t <= REACH && deviation(t) >= half; t++) covered += 1
+      for (let t = -1; t >= -REACH && deviation(t) >= half; t--) covered += 1
+
+      return { width: covered, contrast: peak, at: at2, profile }
+    }
+
+    return () => {
+      delete dev.__plechoRibbonWidth
+    }
+  }, [gl])
 
   // Тени включаются на самом рендерере, а <Canvas> находится в чужом файле.
   // Операция идемпотентна: если shadows уже заданы на канвасе, это пустое

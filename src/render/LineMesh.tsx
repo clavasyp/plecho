@@ -135,6 +135,7 @@ import { findRoute } from '../sim/world/pathfind'
 import { cityPoint } from './CityMesh'
 import { layers } from './layers'
 import { palette } from './palette'
+import { attachPixelFloor, PIXEL_FLOOR, WIDEN_ATTRIBUTE } from './pixelFloor'
 
 // ─── Размеры, километры ────────────────────────────────────────────────────
 // Все величины — в километрах сцены, как дороги в RoadMesh. Ориентиры для
@@ -329,7 +330,7 @@ function ringCities(graph: RoadGraph, line: Line): CityId[] {
  * считает, а лишний атрибут удваивал бы буфер ни за чем.
  */
 function pushQuad(
-  out: number[],
+  out: RibbonBuffer,
   ax: number,
   az: number,
   bx: number,
@@ -354,10 +355,32 @@ function pushQuad(
     bx + bnx, bz + bnz,
   ]
 
+  // Те же слагаемые без точки на оси: «на сколько вершина отъехала вбок». Из
+  // них живёт пиксельный пол (pixelFloor.ts), и считаются они здесь же, чтобы
+  // форма клина и её смещение не могли разъехаться при следующей правке.
+  const offsets = [
+    -anx, -anz,
+    anx, anz,
+    -bnx, -bnz,
+    -bnx, -bnz,
+    anx, anz,
+    bnx, bnz,
+  ]
+
   for (let v = 0; v < 6; v++) {
-    out.push(quad[v * 2], elevation, quad[v * 2 + 1])
+    out.pos.push(quad[v * 2], elevation, quad[v * 2 + 1])
+    out.widen.push(offsets[v * 2], 0, offsets[v * 2 + 1])
   }
 }
+
+/**
+ * Лента в сборке: позиции и смещения от оси, вершина в вершину.
+ *
+ * Две записи об одной вершине лежат в одной структуре нарочно — так их нельзя
+ * передать порознь и нельзя забыть одну из них: сборка ленты принимает буфер
+ * целиком, а не два массива, которые кто-то однажды перепутает местами.
+ */
+type RibbonBuffer = { pos: number[]; widen: number[] }
 
 type RibbonStyle = {
   halfWidthKm: number
@@ -396,7 +419,7 @@ const RIVAL_STYLE: Omit<RibbonStyle, 'elevation' | 'solid'> = {
  * линию в морзянку. Поэтому пройденный путь копится по всей ломаной, а штрих,
  * попавший на стык, разрезается на два куска с общим клином.
  */
-function pushRibbon(out: number[], ring: Ring, style: RibbonStyle): void {
+function pushRibbon(out: RibbonBuffer, ring: Ring, style: RibbonStyle): void {
   const points = ring.points
   if (points.length < 2) return
 
@@ -631,6 +654,60 @@ const selectLineSets = (store: GameStore): LineSets => {
   return sets
 }
 
+/**
+ * Одна лента: буфер, тон, пиксельный пол.
+ *
+ * Все три ленты файла (чужая, своя, выбранная) отличаются ровно этими тремя
+ * величинами, и повторять вокруг них по десять строк разметки трижды значит
+ * трижды же иметь возможность забыть атрибут смещения — а забытый атрибут
+ * отключает пиксельный пол МОЛЧА, без единой ошибки. Здесь забыть его негде.
+ *
+ * Материал basic, а не standard, и это не экономия. Линия — не асфальт, а
+ * замысел игрока, наложенный на карту: освещать её значит прятать часть кольца
+ * в тени высотной застройки ровно там, где сеть самая плотная. Отключённая
+ * тональная компрессия по той же причине — оттенок линии обязан совпадать с
+ * палитрой, а не зависеть от того, сколько яркого попало в кадр.
+ *
+ * Тени лента не принимает и не отбрасывает: плоскость нулевой толщины
+ * отбрасывает только артефакты самозатенения.
+ *
+ * Отсечение по пирамиде видимости выключено. Буфер пересобирается при каждой
+ * правке линии, а сфера охвата считается по нему лениво и один раз: устаревшая
+ * сфера убрала бы кольцо с экрана целиком, и выглядело бы это как «линия не
+ * сохранилась». Цена отказа — вызов отрисовки на всю сеть, то есть ничто.
+ */
+function Ribbon({
+  buffer,
+  color,
+  floorPx,
+}: {
+  buffer: { positions: Float32Array; widen: Float32Array }
+  color: string
+  floorPx: number
+}): JSX.Element | null {
+  if (buffer.positions.length === 0) return null
+
+  return (
+    <mesh frustumCulled={false}>
+      <bufferGeometry>
+        <bufferAttribute attach="attributes-position" args={[buffer.positions, 3]} />
+        {/* Смещение от оси ленты — им живёт пиксельный пол (pixelFloor.ts). */}
+        <bufferAttribute
+          attach={`attributes-${WIDEN_ATTRIBUTE}`}
+          args={[buffer.widen, 3]}
+        />
+      </bufferGeometry>
+      <meshBasicMaterial
+        ref={(material) => {
+          if (material !== null) attachPixelFloor(material, floorPx)
+        }}
+        color={color}
+        toneMapped={false}
+      />
+    </mesh>
+  )
+}
+
 export function Lines(): JSX.Element | null {
   /*
    * Подписки поверхностные — как в RoadMesh. Реестры пересобираются каждый тик,
@@ -651,9 +728,9 @@ export function Lines(): JSX.Element | null {
   )
 
   const buffers = useMemo(() => {
-    const plain: number[] = []
-    const highlighted: number[] = []
-    const rival: number[] = []
+    const plain: RibbonBuffer = { pos: [], widen: [] }
+    const highlighted: RibbonBuffer = { pos: [], widen: [] }
+    const rival: RibbonBuffer = { pos: [], widen: [] }
 
     for (const ring of rings) {
       if (!ring.own) {
@@ -688,17 +765,22 @@ export function Lines(): JSX.Element | null {
       })
     }
 
+    const freeze = (buffer: RibbonBuffer) => ({
+      positions: new Float32Array(buffer.pos),
+      widen: new Float32Array(buffer.widen),
+    })
+
     return {
-      plain: new Float32Array(plain),
-      highlighted: new Float32Array(highlighted),
-      rival: new Float32Array(rival),
+      plain: freeze(plain),
+      highlighted: freeze(highlighted),
+      rival: freeze(rival),
     }
   }, [rings, selected])
 
   if (
-    buffers.plain.length === 0 &&
-    buffers.highlighted.length === 0 &&
-    buffers.rival.length === 0
+    buffers.plain.positions.length === 0 &&
+    buffers.highlighted.positions.length === 0 &&
+    buffers.rival.positions.length === 0
   ) {
     return null
   }
@@ -716,63 +798,27 @@ export function Lines(): JSX.Element | null {
         рельефа. Он втрое светлее рельефа (чужой след виден на обочине) и впятеро
         темнее своей линии (спорить за внимание ему нечем).
       */}
-      {buffers.rival.length > 0 && (
-        <mesh frustumCulled={false}>
-          <bufferGeometry>
-            <bufferAttribute
-              attach="attributes-position"
-              args={[buffers.rival, 3]}
-            />
-          </bufferGeometry>
-          <meshBasicMaterial color={palette.buildingLow} toneMapped={false} />
-        </mesh>
-      )}
+      <Ribbon
+        buffer={buffers.rival}
+        color={palette.buildingLow}
+        floorPx={PIXEL_FLOOR.lineRival}
+      />
 
-      {/*
-        Материал basic, а не standard, и это не экономия. Линия — не асфальт, а
-        замысел игрока, наложенный на карту: освещать её значит прятать часть
-        кольца в тени высотной застройки ровно там, где сеть самая плотная.
-        Отключённая тональная компрессия по той же причине — оттенок линии
-        обязан совпадать с палитрой, а не зависеть от того, сколько яркого
-        попало в кадр.
+      {/* Светлая застройка: линия обязана читаться поверх полотна (roadFederal
+          заметно темнее) и при этом не перебивать ни машины, ни выбранную
+          линию. Разбор, почему тон опущен с textDim, — в шапке файла; порядок
+          яркостей охраняется проверкой в roadSurface.test.ts. */}
+      <Ribbon
+        buffer={buffers.plain}
+        color={palette.buildingHigh}
+        floorPx={PIXEL_FLOOR.lineOwn}
+      />
 
-        Тени лента не принимает и не отбрасывает: плоскость нулевой толщины
-        отбрасывает только артефакты самозатенения.
-
-        Отсечение по пирамиде видимости выключено. Буфер пересобирается при
-        каждой правке линии, а сфера охвата считается по нему лениво и один раз:
-        устаревшая сфера убрала бы кольцо с экрана целиком, и выглядело бы это
-        как «линия не сохранилась». Цена отказа — два вызова отрисовки на всю
-        сеть, то есть ничто.
-      */}
-      {buffers.plain.length > 0 && (
-        <mesh frustumCulled={false}>
-          <bufferGeometry>
-            <bufferAttribute
-              attach="attributes-position"
-              args={[buffers.plain, 3]}
-            />
-          </bufferGeometry>
-          {/* Светлая застройка: линия обязана читаться поверх полотна
-              (roadFederal заметно темнее) и при этом не перебивать ни машины,
-              ни выбранную линию. Разбор, почему тон опущен с textDim, — в шапке
-              файла; порядок яркостей охраняется проверкой в
-              roadSurface.test.ts. */}
-          <meshBasicMaterial color={palette.buildingHigh} toneMapped={false} />
-        </mesh>
-      )}
-
-      {buffers.highlighted.length > 0 && (
-        <mesh frustumCulled={false}>
-          <bufferGeometry>
-            <bufferAttribute
-              attach="attributes-position"
-              args={[buffers.highlighted, 3]}
-            />
-          </bufferGeometry>
-          <meshBasicMaterial color={palette.accent} toneMapped={false} />
-        </mesh>
-      )}
+      <Ribbon
+        buffer={buffers.highlighted}
+        color={palette.accent}
+        floorPx={PIXEL_FLOOR.lineSelected}
+      />
     </group>
   )
 }
