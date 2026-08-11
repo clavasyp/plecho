@@ -78,7 +78,10 @@ const LONE_EDGE = 'nizhny-kazan'
 const SUMMER_TICKS = 96 * 190
 
 async function boot(page: Page): Promise<void> {
-  await page.goto('/')
+  // `?pixels` включает сохранение кадрового буфера — без него прибор ширины
+  // ленты не может прочитать холст. Флаг стоит только здесь и только в
+  // отладочной сборке: разбор цены — в App.tsx.
+  await page.goto('/?pixels')
   await page.waitForLoadState('networkidle')
   await page.waitForFunction(
     () => (globalThis as Record<string, unknown>).__plechoRibbonWidth !== undefined,
