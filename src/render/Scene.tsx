@@ -292,17 +292,46 @@ export function Scene(): JSX.Element {
    */
   usePixelFloor()
 
+  /*
+   * КАРТА ТЕНЕЙ ПЕРЕСТРАИВАЕТСЯ ТОЛЬКО ТОГДА, КОГДА В НЕЙ ЧТО-ТО МЕНЯЕТСЯ.
+   *
+   * По умолчанию three перерисовывает её КАЖДЫЙ кадр, и это отдельный полный
+   * проход по всей отбрасывающей геометрии: пять вызовов отрисовки, 53 124
+   * треугольника (46.8% всей геометрии кадра) и проход глубины 2048×2048 —
+   * 4.19 мегапикселя, то есть четыре с половиной площади экрана при 720p.
+   * Каждый кадр, включая те, в которых мир стоит на паузе и камера неподвижна.
+   *
+   * ПОЧЕМУ ЗАМОРОЗКА ТОЛЬКО НА ПАУЗЕ, А НЕ ПО ПОЛНОМУ НАБОРУ ПРИЗНАКОВ.
+   * Соблазн велик: следить за солнцем, за целью коробки и за составом
+   * построек — и не трогать карту, пока ни одно из трёх не сдвинулось. Но
+   * машины отбрасывают тень и едут непрерывно, а «состав отбрасывающих» — это
+   * не событие, а множество, за которым пришлось бы следить отдельно. Ошибись
+   * в одном признаке — и на карте останутся тени от машин, которые уже уехали;
+   * дефект при этом появится не сразу и будет выглядеть как порча сохранения.
+   *
+   * На паузе же не движется НИЧЕГО по построению: ни машины, ни солнце (оно
+   * функция тика), ни погода. Остаётся ровно одна причина обновить карту —
+   * панорама и зум, и они здесь же и проверяются. Выигрыш при этом снимается
+   * почти весь: пауза в этой игре не редкость, а рабочий режим — в ней
+   * разбирают узкие места и правят линии.
+   */
   useFrame(() => {
     const focus = controls.current?.target
     if (focus === undefined) return
-    if (
-      shadowTarget.position.x === focus.x &&
-      shadowTarget.position.z === focus.z
-    ) {
-      return
+
+    const moved =
+      shadowTarget.position.x !== focus.x || shadowTarget.position.z !== focus.z
+
+    if (moved) {
+      shadowTarget.position.set(focus.x, 0, focus.z)
+      shadowTarget.updateMatrixWorld()
     }
-    shadowTarget.position.set(focus.x, 0, focus.z)
-    shadowTarget.updateMatrixWorld()
+
+    const running = useGameStore.getState().speed > 0
+    gl.shadowMap.autoUpdate = running
+    // Один кадр после любого движения карта обязана перестроиться, иначе
+    // остановленный игрок увидит тени от предыдущего положения камеры.
+    if (!running && moved) gl.shadowMap.needsUpdate = true
   })
 
   const keyLight = useMemo(() => {
@@ -956,6 +985,111 @@ export function Scene(): JSX.Element {
     if (import.meta.env.DEV) {
       ;(globalThis as unknown as { __plechoRenderer?: unknown }).__plechoRenderer =
         gl
+    }
+  }, [gl])
+
+  /**
+   * ПАСПОРТ МАШИНЫ ИГРОКА — ЕДИНСТВЕННЫЙ ХУК, КОТОРЫЙ ЖИВЁТ И В СОБРАННОЙ ИГРЕ.
+   *
+   * Разбор производительности упёрся в вопрос, на который нельзя ответить
+   * отсюда: игра идёт на двух кадрах в секунду — но НА ЧЁМ. Шесть независимых
+   * замеров сошлись на том, что 76–77% периода кадра линейно зависит от числа
+   * пикселей буфера, а геометрия не стоит ничего (выброс 90% треугольников не
+   * изменил кадр в пределах цены деления). Но мерили всё это на ПРОГРАММНОМ
+   * растеризаторе, где пиксель дороже в сотни раз, чем на настоящей карте.
+   *
+   * Значит две версии, и различить их может только эта строка:
+   *   • у игрока отключено аппаратное ускорение и Chrome сам ушёл на
+   *     программный путь — тогда наши числа буквально равны его числам, и
+   *     лечится это настройками браузера, а не кодом;
+   *   • настоящая видеокарта плюс монитор в 4K без ретины — тогда виноват
+   *     буфер, и его чинит правка плотности в App.tsx.
+   *
+   * Ветка НЕ вырезана из собранной игры сознательно, в отличие от всех
+   * остальных дев-хуков. Жалоба приходит от того, кто открыл игру по ссылке, а
+   * не от того, кто поднял дев-сервер; прибор, недоступный в тот момент, когда
+   * он нужен, бесполезен. Цена — одна строка в консоли и один замер за пять
+   * секунд после запуска.
+   */
+  useEffect(() => {
+    const context = gl.getContext()
+    const info = context.getExtension('WEBGL_debug_renderer_info')
+
+    /** Медиана периода кадра за первые пять секунд, миллисекунды. */
+    let periods: number[] = []
+    let previous = 0
+    let raf = 0
+    let done = false
+
+    const sample = (now: number): void => {
+      if (previous !== 0) periods.push(now - previous)
+      previous = now
+      if (periods.length < 300 && !done) raf = requestAnimationFrame(sample)
+      else report()
+    }
+
+    const median = (values: number[]): number => {
+      if (values.length === 0) return 0
+      const sorted = [...values].sort((a, b) => a - b)
+      return sorted[Math.floor(sorted.length / 2)]
+    }
+
+    const passport = () => ({
+      // Незамаскированная строка карты. Без расширения браузер отдаёт
+      // обезличенное «WebKit WebGL», по которому ничего не понять.
+      видеокарта:
+        info === null
+          ? String(context.getParameter(context.RENDERER))
+          : String(context.getParameter(info.UNMASKED_RENDERER_WEBGL)),
+      буфер: `${context.drawingBufferWidth}×${context.drawingBufferHeight}`,
+      мегапикселей: Number(
+        (
+          (context.drawingBufferWidth * context.drawingBufferHeight) /
+          1e6
+        ).toFixed(2),
+      ),
+      окно: `${globalThis.innerWidth}×${globalThis.innerHeight}`,
+      плотностьЭкрана: globalThis.devicePixelRatio,
+      плотностьРендера: Number(gl.getPixelRatio().toFixed(3)),
+      выборокНаПиксель: context.getParameter(context.SAMPLES) as number,
+      периодКадраМс: Number(median(periods).toFixed(1)),
+      кадровВСекунду:
+        periods.length === 0 ? 0 : Number((1000 / median(periods)).toFixed(1)),
+    })
+
+    const report = (): void => {
+      if (done) return
+      done = true
+      const card = passport()
+      const soft = /swiftshader|llvmpipe|software|basic render/i.test(
+        card.видеокарта,
+      )
+      // eslint-disable-next-line no-console
+      console.info(
+        `[ПЛЕЧО] ${card.видеокарта} · буфер ${card.буфер} (${card.мегапикселей} Мпикс) · ` +
+          `плотность экрана ${card.плотностьЭкрана}, рендера ${card.плотностьРендера} · ` +
+          `выборок ${card.выборокНаПиксель} · ` +
+          `кадр ${card.периодКадраМс} мс (${card.кадровВСекунду} к/с)` +
+          (soft
+            ? '\n[ПЛЕЧО] ВНИМАНИЕ: браузер рисует ПРОГРАММНО, без видеокарты. ' +
+              'Проверьте chrome://gpu и включите аппаратное ускорение — ' +
+              'никакая правка игры этого не заменит.'
+            : ''),
+      )
+    }
+
+    ;(globalThis as unknown as { __plechoDiag?: unknown }).__plechoDiag = () => ({
+      ...passport(),
+      отсчётов: periods.length,
+    })
+
+    raf = requestAnimationFrame(sample)
+
+    return () => {
+      done = true
+      cancelAnimationFrame(raf)
+      periods = []
+      delete (globalThis as unknown as { __plechoDiag?: unknown }).__plechoDiag
     }
   }, [gl])
 
