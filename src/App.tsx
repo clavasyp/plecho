@@ -18,6 +18,7 @@
 
 import { useEffect, useState } from 'react'
 import { Canvas } from '@react-three/fiber'
+import { minDensity, pixelBudget } from './render/quality'
 import { useRivalRunner } from './app/ai/runner'
 import { useGameLoop } from './app/loop'
 import { useSound } from './app/sound'
@@ -74,26 +75,20 @@ import './App.css'
  * один раз при монтировании, поэтому перенос окна на другой монитор оставлял
  * старую плотность. Замер: после 1920×1080 при плотности 2 и последующего
  * сжатия до 1280×720 плотность оставалась 1.4731 вместо 2.0000.
- */
-const PIXEL_BUDGET = 4_500_000
-
-/**
- * Ниже этого плотность не опускается ни при каком экране.
  *
- * 0.72 — не круглое число и взято не на глаз: при нём буфер на мониторе 4K
- * выходит ровно в бюджет (8.29 × 0.72² = 4.30 Мпикс), а лента федеральной
- * дороги на предельном отдалении остаётся выше полутора пикселей буфера, ниже
- * которых растеризатор начинает пропускать её через одну.
+ * ─── БЮДЖЕТ ЗАВИСИТ ОТ ТОГО, ЧТО РИСУЕТ ────────────────────────────────────
+ *
+ * Сами числа живут в render/quality.ts: у машины без видеокарты бюджет и пол
+ * другие, и от того же решения зависят тени, сглаживание и блум. Здесь
+ * остаётся только арифметика.
  */
-const MIN_DENSITY = 0.72
-
 function renderScale(): number {
   const width = globalThis.innerWidth || 1920
   const height = globalThis.innerHeight || 1080
   const density = globalThis.devicePixelRatio || 1
 
-  const fit = Math.sqrt(PIXEL_BUDGET / (width * height))
-  return Math.max(MIN_DENSITY, Math.min(density, fit))
+  const fit = Math.sqrt(pixelBudget / (width * height))
+  return Math.max(minDensity, Math.min(density, fit))
 }
 
 /**
