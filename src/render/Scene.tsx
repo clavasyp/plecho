@@ -308,6 +308,20 @@ export function Scene(): JSX.Element {
     gl.shadowMap.enabled = true
     gl.shadowMap.type = THREE.PCFSoftShadowMap
     gl.shadowMap.needsUpdate = true
+
+    /*
+     * ДЕВ-ХУК НА РЕНДЕРЕР: сколько геометрий, текстур и вызовов отрисовки в
+     * кадре. Только в разработке, как и остальные хуки (см. app/store.ts).
+     *
+     * Расход памяти и число вызовов — единственные величины сцены, которые
+     * нельзя ни вывести из кода, ни проверить юнит-тестом: их видно только в
+     * живом браузере под нагрузкой. Без хука любой разговор о том, «жрёт ли
+     * игра память», остаётся спором о впечатлениях.
+     */
+    if (import.meta.env.DEV) {
+      ;(globalThis as unknown as { __plechoRenderer?: unknown }).__plechoRenderer =
+        gl
+    }
   }, [gl])
 
   return (

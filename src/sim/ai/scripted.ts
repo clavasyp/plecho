@@ -25,16 +25,18 @@
  * бумаге. В настоящем мире игры оно ЗАПИРАЕТ МАШИНУ НАСМЕРТЬ, и это стоит
  * разобрать, потому что ошибка совершенно не видна из формул.
  *
- *   Орёл отгружает 60 тонн зерна в сутки, тульская мельница принимает 50 — плечо
- *   «туда» кормит любой парк. Обратно едет мука, а ест её Орёл в количестве
- *   0.46 тонны в сутки (290 тысяч жителей × CONSUMPTION_PER_1K), при складе
- *   города на тридцать суток потребления — 14 тонн. Один КамАЗ привозит восемь
- *   тонн за оборот в семь часов. Через два оборота город полон, машина стоит с
- *   мукой, которую некому принять, и — поскольку кузов один — не может взять
- *   зерно. Дальше она катается по кольцу с неразгружаемым грузом: одометр
- *   растёт, порожний пробег в отчёте 1%, выручка 150 рублей в сутки при расходах
- *   в двадцать пять тысяч. Замеры первого прогона: банкротство на сороковые
- *   сутки при трёх характерах из трёх.
+ *   Орёл отгружает зерно, тульская мельница его принимает — плечо «туда» кормит
+ *   любой парк. Обратно едет мука, а ест её Орёл около восьми тонн в сутки
+ *   (норма — CONSUMPTION_PER_ROOT_1K в data/recipes.ts), при складе города на
+ *   тридцать суток потребления. Два КамАЗа привозят вдвое больше, чем город
+ *   съедает; через сотню суток склад полон, машина стоит с мукой, которую
+ *   некому принять, и — поскольку кузов один — не может взять зерно. Дальше она
+ *   катается по кольцу с неразгружаемым грузом: одометр растёт, порожний пробег
+ *   в отчёте около процента, а выручка на километр падает вдвое.
+ *
+ *   Числа менялись вместе с миром — в первой версии на этом кольце все три
+ *   характера разорялись к сороковым суткам, — но механизм остался тот же, и
+ *   именно поэтому потребность в парке округляется ВНИЗ (см. fleetForRing).
  *
  * Отсюда ГЛАВНОЕ ПРАВИЛО ПЛАНИРОВЩИКА: каждая точка выгрузки обязана съедать
  * столько, сколько машина туда привозит. Сток считается честно — потребление
@@ -93,7 +95,12 @@ import { deliveryRevenue } from '../economy/finance'
 import { CARGO_LICENSE, MAX_SHIFT_HOURS, REST_HOURS } from '../logistics/driver'
 import { MIN_LINE_STOPS } from '../logistics/line'
 import { canCarry, trailersFor } from '../logistics/trailer'
-import { BREAKDOWN_MTBF_KM, needsService, serviceCost } from '../logistics/wear'
+import {
+  BREAKDOWN_MTBF_KM,
+  needsService,
+  serviceCost,
+  writeOffWear,
+} from '../logistics/wear'
 import { Rng } from '../rng'
 import { dateFromTick } from '../time'
 import { TICKS_PER_DAY, TICKS_PER_HOUR } from '../types'
@@ -152,6 +159,59 @@ export const RESERVE_DAYS: Record<CompetitorPersonality, number> = {
   осторожный: RESERVE_DAYS_BASE * 2,
   нишевый: RESERVE_DAYS_BASE,
   имитатор: RESERVE_DAYS_BASE,
+}
+
+/**
+ * КАКУЮ ДОЛЮ РЕСУРСА ДО ПОРОГА СПИСАНИЯ характер выхаживает, прежде чем менять.
+ *
+ * ЕДИНСТВЕННЫЙ ОТВЕТ НА КРИВУЮ СТАРЕНИЯ, и до сих пор его не было ни у кого.
+ * Обслуживание растёт как 1 + 2w² (MAINTENANCE_WEAR_GAIN в logistics/wear.ts):
+ * у машины с износом 0.7 километр стоит вдвое дороже паспортного, а поломки
+ * приходят чаще. Замер года у нишевого без обновления: обслуживание 4.51 →
+ * 11.87 руб/км, ремонты 0 → 131 824 руб/мес, весь счёт износа 1 110 630 при
+ * годовом убытке 239 507. Контрфакт с заморозкой износа: +731 539 вместо
+ * −214 507. То есть парк умирал целой когортой, потому что менять его было
+ * нечем.
+ *
+ * ПОРОГ НИЗКИЙ, И ЭТО НЕ ОШИБКА. Формула «когда километр перестал окупаться»
+ * даёт 0.70 и забирает меньше половины выигрыша: возврат при продаже — ровно
+ * половина цены класса независимо от износа, то есть замена ЗИЛа с кузовом
+ * стоит 19 000 на ~170 000 км ресурса, это 0.11 руб/км против надбавки за
+ * износ до 7.4 руб/км. Менять выгодно СИЛЬНО раньше, чем машина перестаёт
+ * окупаться. Прогоны: 0.3 → +554 899, 0.2 → +527 560, 0.15 → +512 785; ниже
+ * отдача плавно падает, цикла «продал–купил–продал» не наблюдается.
+ *
+ * РАЗНЫЙ ПО ХАРАКТЕРАМ, иначе все четверо начнут вести парк одинаково — а это
+ * самая заметная часть поведения конторы на длинной дистанции. Агрессивный
+ * гонит технику и меняет рано; осторожный доезжает ресурс, экономя на покупках
+ * и расплачиваясь дорогим километром. Порядок тот же, что у денежного запаса.
+ */
+export const RENEWAL_SHARE: Record<CompetitorPersonality, number> = {
+  агрессивный: 0.6,
+  осторожный: 0.95,
+  нишевый: 0.75,
+  имитатор: 0.75,
+}
+
+/**
+ * Износ, на котором ЭТОТ характер меняет ЭТУ машину.
+ *
+ * Порог списания считает сама симуляция (writeOffWear в logistics/wear.ts) —
+ * тот износ, на котором расходы догоняют потолок выручки. Он свой у каждого
+ * класса: у ЗИЛа около 0.73, у тягача около 0.52, и общего «менять на
+ * семидесяти процентах» не существует. Раньше здесь стояло именно такое общее
+ * число, и оно означало, что конкурент судит о технике не по тому, по чему
+ * судит игра.
+ *
+ * Машина, у которой порога нет вовсе (окупается до конца ресурса), меняется по
+ * полному износу — то есть практически не меняется, и это верно.
+ */
+export function renewalWear(
+  vehicle: Vehicle,
+  personality: CompetitorPersonality,
+): number {
+  const threshold = writeOffWear(vehicle)
+  return (threshold ?? 1) * RENEWAL_SHARE[personality]
 }
 
 /**
@@ -364,7 +424,7 @@ function decide(state: GameState, companyId: CompanyId): Decision {
   }
 
   const personality = company.personality ?? DEFAULT_PERSONALITY
-  const plan = choosePlan(state, company, personality)
+  const { plan, niche } = choosePlan(state, company, personality)
   if (plan === null) {
     return {
       commands: [],
@@ -385,7 +445,7 @@ function decide(state: GameState, companyId: CompanyId): Decision {
           name: plan.name.slice(0, MAX_LINE_NAME_LENGTH),
           stops: copyStops(plan.stops),
         },
-        thought: openingThought(state, plan, personality),
+        thought: openingThought(state, plan, personality, niche),
       },
     ])
   }
@@ -430,7 +490,7 @@ function decide(state: GameState, companyId: CompanyId): Decision {
 
   // Списание и увольнение занимают ход целиком: каждое из них меняет расклад
   // настолько, что следующее решение честнее принять уже по новому состоянию.
-  const writeOff = writeOffStep(company, all, line)
+  const writeOff = writeOffStep(company, all)
   if (writeOff !== null) return toDecision(writeOff)
 
   /*
@@ -509,8 +569,25 @@ function decide(state: GameState, companyId: CompanyId): Decision {
    * разные кузова, а класс потянет оба, — и та поедет порожняком. Сегодня это
    * не стреляет только потому, что ЗИЛ платформу не берёт вовсе.
    */
+  /*
+   * ОБНОВЛЕНИЕ ИДЁТ ПЕРЕД ТО, И ЭТО ИЗМЕРЕННЫЙ ПОРЯДОК, А НЕ ПРЕДПОЧТЕНИЕ.
+   *
+   * Довод у обновления ровно тот же, что у обслуживания: это трата, которая
+   * ЭКОНОМИТ. Замена машины с износом 0.3 стоит 0.11 руб/км ресурса против
+   * надбавки за износ до 7.4 руб/км — то есть окупается почти вдесятеро лучше,
+   * чем очередное ТО той же машины.
+   *
+   * Практика решила спор окончательно. Пока обновление стояло после ТО, оно
+   * почти никогда до себя не доходило: у парка из пятнадцати машин ежедневно
+   * кто-нибудь перехаживает ТО, шаг обслуживания забирает ход, и за год
+   * случалось ТРИ замены при том, что весь парк агрессивного пришёл к износу
+   * 0.92–1.00. Обслуживание при этом не страдает: обновление занимает ход
+   * только когда ему есть что делать — вывести одну машину или продать уже
+   * выведенную, — а в остальные дни возвращает null и пропускает ТО вперёд.
+   */
   const paid =
-    serviceStep(company, fleet, reserve) ??
+    renewalStep(company, crew, plan, personality, reserve) ??
+    serviceStep(company, fleet, reserve, personality) ??
     trailerStep(company, crew, plan, floor) ??
     hireStep(state, company, fleet, plan, floor, fieldable) ??
     terminalStep(state, company, fleet, reserve) ??
@@ -519,14 +596,30 @@ function decide(state: GameState, companyId: CompanyId): Decision {
   const free = staffingSteps(state, company, fleet, plan, line, target)
 
   if (paid === null && free.length === 0) {
-    // Две разные тишины, и путать их в ленте нельзя. Кольцо работает и денег на
-    // рост пока нет — это одно; кольцо есть, а выйти на него не на что — совсем
-    // другое, и игрок обязан видеть разницу.
+    /*
+     * ТРИ РАЗНЫЕ ТИШИНЫ, И ПУТАТЬ ИХ В ЛЕНТЕ НЕЛЬЗЯ.
+     *
+     * Кольцо работает и денег на рост пока нет — это одно. Кольцо есть, а выйти
+     * на него не на что — совсем другое. И третье, которого здесь не было:
+     * ДЕНЬГИ ЕСТЬ, А РАСТИ НЕЗАЧЕМ — парк собран по расчёту, и следующая машина
+     * возила бы воздух.
+     *
+     * Без третьего случая лента врала самым обидным образом: осторожный
+     * конкурент 305 суток подряд писал «не на что выйти», имея 524 032 рубля на
+     * счету. Игрок, читающий ленту, делал из этого ровно противоположный вывод
+     * о состоянии соперника.
+     */
+    const broke =
+      !earning &&
+      !affordable(company, VEHICLE_CLASS_BY_ID[plan.classId]?.price ?? 0, 0)
+
     return {
       commands: [],
       thought: earning
-        ? `Кольцо «${line.name}» укомплектовано. Коплю.`
-        : `Кольцо «${line.name}» стоит: не на что выйти. Жду.`,
+        ? `Кольцо «${line.name}» укомплектовано по расчёту. Больше машин оно не прокормит — коплю.`
+        : broke
+          ? `Кольцо «${line.name}» стоит: не на что выйти. Жду выручки.`
+          : `Кольцо «${line.name}» стоит, но лезть в него сейчас не буду. Жду своего часа.`,
     }
   }
 
@@ -566,9 +659,9 @@ function choosePlan(
   state: GameState,
   company: Company,
   personality: CompetitorPersonality,
-): ScriptedPlan | null {
-  const ranked = rankedPlans(state, company, personality)
-  if (ranked.length === 0) return null
+): { plan: ScriptedPlan | null; niche: CargoType | null } {
+  const { plans: ranked, niche } = rankedPlans(state, company, personality)
+  if (ranked.length === 0) return { plan: null, niche }
 
   /*
    * СЧИТАЮТСЯ МАШИНЫ С ВОДИТЕЛЕМ, А НЕ ЗАПИСИ В СПИСКЕ ЛИНИИ.
@@ -588,7 +681,7 @@ function choosePlan(
     )
     return manned.length < fleetTarget(plan, personality)
   })
-  if (started !== undefined) return started
+  if (started !== undefined) return { plan: started, niche }
 
   // Потолок линий: сеть шире характера не растёт. Считаются СВОИ линии, а не
   // планы: линия, оставшаяся от прежнего замысла, тоже занимает место и тоже
@@ -596,7 +689,10 @@ function choosePlan(
   const lines = Object.keys(company.lines ?? {}).length
   if (lines >= MAX_LINES[personality]) {
     // Место кончилось — работаем по тому кольцу, которое уже есть.
-    return ranked.find((plan) => findLine(company, plan) !== undefined) ?? null
+    return {
+      plan: ranked.find((plan) => findLine(company, plan) !== undefined) ?? null,
+      niche,
+    }
   }
 
   /*
@@ -632,9 +728,12 @@ function choosePlan(
     (plan) =>
       findLine(company, plan) === undefined && canField(company, fleet, plan),
   )
-  if (fresh !== undefined) return fresh
+  if (fresh !== undefined) return { plan: fresh, niche }
 
-  return ranked.find((plan) => findLine(company, plan) !== undefined) ?? ranked[0]
+  return {
+    plan: ranked.find((plan) => findLine(company, plan) !== undefined) ?? ranked[0],
+    niche,
+  }
 }
 
 /**
@@ -703,7 +802,7 @@ function rankedPlans(
   state: GameState,
   company: Company,
   personality: CompetitorPersonality,
-): ScriptedPlan[] {
+): { plans: ScriptedPlan[]; niche: CargoType | null } {
   const playerCities = citiesOf(state, state.playerId)
   const takenCities = new Set<CityId>()
   for (const id of Object.keys(state.companies) as CompanyId[]) {
@@ -718,7 +817,7 @@ function rankedPlans(
     ...plan,
     rival: plan.claimCities.some((city) => takenCities.has(city)),
   }))
-  if (plans.length === 0) return []
+  if (plans.length === 0) return { plans: [], niche: null }
 
   const niche =
     personality === 'нишевый' ? nicheCargo(company.id, plans) : null
@@ -742,7 +841,7 @@ function rankedPlans(
     return a.plan.key < b.plan.key ? -1 : a.plan.key > b.plan.key ? 1 : 0
   })
 
-  return keyed.map((item) => item.plan)
+  return { plans: keyed.map((item) => item.plan), niche }
 }
 
 /**
@@ -1586,13 +1685,24 @@ function staffingSteps(
  * расчёте интервала и запирает всех позади себя.
  */
 function writeOffStep(
-  _company: Company,
+  company: Company,
   fleet: readonly Vehicle[],
-  line: Line,
 ): Step[] | null {
   for (const vehicle of fleet) {
     if (!vehicle.brokenDown) continue
     if (vehicle.lineId === null) continue
+
+    /*
+     * НАЗЫВАЕТСЯ ЛИНИЯ СЛОМАВШЕЙСЯ МАШИНЫ, А НЕ ЛИНИЯ ТЕКУЩЕГО ПЛАНА.
+     *
+     * Первым параметром здесь стояло `_company` — подчёркивание означало «не
+     * нужен», — а имя линии бралось из плана, который контора обдумывает
+     * СЕЙЧАС. У конторы с двумя кольцами это разные линии, и за игровой год
+     * фраза оказывалась неверной 18 раз из 18: игрок читал, что встало одно
+     * кольцо, а вставало другое.
+     */
+    const broken = company.lines?.[vehicle.lineId]
+    const where = broken?.name ?? String(vehicle.lineId)
 
     // Один шаг, а не снятие с линии и возврат. Ремонт снимает флаг сразу, и
     // машина продолжает работать на том же кольце. Промежуточное снятие
@@ -1602,7 +1712,7 @@ function writeOffStep(
     const steps: Step[] = [
       {
         command: { kind: 'починить', vehicleId: vehicle.id },
-        thought: `${vehicleTitle(vehicle)} стоит сломанный и держит кольцо «${line.name}». В ремонт: простой дороже работ.`,
+        thought: `${vehicleTitle(vehicle)} стоит сломанный и держит кольцо «${where}». В ремонт: простой дороже работ.`,
       },
     ]
 
@@ -1610,6 +1720,84 @@ function writeOffStep(
   }
 
   return null
+}
+
+/**
+ * Обновление парка: вывести изношенную машину из работы, продать, купить новую.
+ *
+ * ТРИ ОГОВОРКИ, КАЖДАЯ ИЗМЕРЕНА, И БЕЗ КАЖДОЙ ШАГ НЕ РАБОТАЕТ.
+ *
+ * ОКНО. Продажа законна только в узле и с пустым кузовом (isLegal в
+ * ai/commands.ts). На работающем кольце такое совпадение случается около двух
+ * машино-тиков В МЕСЯЦ, а контора думает раз в сутки — прогон наивного шага
+ * «продать при износе выше порога» дал РОВНО НОЛЬ продаж за год при любом
+ * пороге. Поэтому обновление выражено НАМЕРЕНИЕМ, а не выстрелом: сначала
+ * машина снимается с линии (это законно всегда), доезжает и разгружается сама,
+ * и только потом продаётся. Снятая с линии машина ждёт сколько нужно — она
+ * больше не диспетчеризуется и никого не держит.
+ *
+ * ПАРНОСТЬ. Продажа без покупки — это не обновление, а сжатие: прогон дал
+ * +43 189 вместо −214 507, но контора превратилась в декорацию на одну машину.
+ * Поэтому вывод из работы начинается только при деньгах на ЗАМЕНУ — машину
+ * нужного класса вместе с кузовом, сверх запаса наличности.
+ *
+ * ОЧЕРЕДЬ ПО ОДНОЙ. Выводится не более одной машины разом: пока замена не
+ * куплена, кольцо и так работает не в полную силу, а две снятые машины сразу
+ * означают линию, вставшую наполовину.
+ */
+function renewalStep(
+  company: Company,
+  crew: readonly Vehicle[],
+  plan: ScriptedPlan,
+  personality: CompetitorPersonality,
+  reserve: number,
+): Step | null {
+
+  // Уже выведенная машина: доехала, разгрузилась — продаём. Это продолжение
+  // намерения, поэтому идёт ПЕРВЫМ: начатое доводится до конца.
+  const retired = crew.find(
+    (vehicle) =>
+      vehicle.lineId === null &&
+      vehicle.wear >= renewalWear(vehicle, personality) &&
+      vehicle.position.kind === 'узел' &&
+      vehicle.cargo === null,
+  )
+  if (retired !== undefined) {
+    return {
+      command: { kind: 'продать-машину', vehicleId: retired.id },
+      thought: `${vehicleTitle(retired)} отходил своё — продаю, пока за неё дают половину цены.`,
+    }
+  }
+
+  // Уже кого-то выводим — второго не трогаем.
+  if (
+    crew.some(
+      (vehicle) =>
+        vehicle.lineId === null &&
+        vehicle.wear >= renewalWear(vehicle, personality),
+    )
+  ) {
+    return null
+  }
+
+  const replacement = VEHICLE_CLASS_BY_ID[plan.classId]
+  const trailerPrice = TRAILER_PRICE[plan.trailer]
+  if (replacement === undefined || trailerPrice === undefined) return null
+  if (!affordable(company, replacement.price + trailerPrice, reserve)) return null
+
+  // Самая изношенная из работающих: менять по одной и начиная с худшей.
+  let worst: Vehicle | null = null
+  for (const vehicle of crew) {
+    if (vehicle.lineId === null) continue
+    if (vehicle.wear < renewalWear(vehicle, personality)) continue
+    if (worst === null || vehicle.wear > worst.wear) worst = vehicle
+  }
+  if (worst === null) return null
+
+  return {
+    command: { kind: 'назначить-машину', vehicleId: worst.id, lineId: null },
+    thought: `${vehicleTitle(worst)} износилась на ${Math.round(worst.wear * 100)}% — снимаю с кольца под замену.`,
+  }
 }
 
 /**
@@ -1624,9 +1812,18 @@ function serviceStep(
   company: Company,
   fleet: readonly Vehicle[],
   reserve: number,
+  personality: CompetitorPersonality,
 ): Step | null {
   for (const vehicle of fleet) {
     if (!needsService(vehicle)) continue
+
+    // Машину, снятую под замену, не обслуживают: она ждёт покупателя, а не
+    // рейса. ТО ей — деньги, выброшенные ровно перед продажей, и разница не
+    // теоретическая: пока обновление стояло позади обслуживания, контора
+    // исправно платила за ТО техники, которую сама же собиралась продать.
+    if (vehicle.lineId === null && vehicle.wear >= renewalWear(vehicle, personality)) {
+      continue
+    }
 
     const price = serviceCost(vehicle)
     if (!affordable(company, price, reserve)) continue
@@ -2083,6 +2280,7 @@ function openingThought(
   state: GameState,
   plan: ScriptedPlan,
   personality: CompetitorPersonality,
+  niche: CargoType | null,
 ): string {
   const [a, b] = plan.claimCities
   const from = cityName(state, a)
@@ -2107,8 +2305,17 @@ function openingThought(
         : `Замыкаю ${from} — ${to}: туда ${there}, обратно ${back} в ${sale}.`
     case 'осторожный':
       return `Беру свободное направление ${from} — ${to}: туда ${there}, обратно ${back} в ${sale}. Оба плеча гружёные.`
+    /*
+     * НИША БЕРЁТСЯ ИЗ РЕЙТИНГА, А НЕ ИЗ ВЫБРАННОГО КОЛЬЦА, и разница видна
+     * игроку. Прежде здесь печатался продукт кольца — и нишевый конкурент в
+     * один и тот же день писал «Моё дело — мука», а через три недели «Моё дело —
+     * пиломатериалы», причём обе фразы висели в ленте одновременно. Ниша у
+     * характера ровно одна на всю партию (nicheCargo от имени компании), и
+     * пересчитывать её здесь заново нельзя: другой список планов дал бы другой
+     * ответ.
+     */
     case 'нишевый':
-      return `Моё дело — ${back}. Ставлю кольцо ${from} — ${to} и не разбрасываюсь.`
+      return `Моё дело — ${niche ?? back}. Ставлю кольцо ${from} — ${to} и не разбрасываюсь.`
     case 'имитатор':
       return `Копировать пока нечего, начинаю своё: ${from} — ${to}, туда ${there}, обратно ${back}.`
   }

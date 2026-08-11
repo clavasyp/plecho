@@ -64,11 +64,12 @@ import {
   fleetRows,
   fleetSummary,
   payrollPerDay,
-  revenuePerKm,
   trailerOffers,
-  writeOffWear,
   type FleetContext,
 } from './fleetReadout'
+// Порог списания и потолок выручки переехали в симуляцию: по ним принимает
+// решение и панель, и конкурент, поэтому число обязано быть одно.
+import { revenuePerKm, writeOffWear } from '../sim/logistics/wear'
 
 const PLAYER = companyId('player')
 

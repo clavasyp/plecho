@@ -979,7 +979,13 @@ describe('sellVehicle', () => {
     store().sellVehicle(STARTER_VEHICLE_ID)
 
     expect(game().vehicles[STARTER_VEHICLE_ID]).toBeUndefined()
-    expect(player().money).toBe(before + Math.round(STARTER_CLASS.price / 2))
+    // Возврат идёт за СЦЕПКУ: машина вместе с тем, что к ней прицеплено.
+    // Иначе замена техники стоила бы половину машины плюс целый новый кузов, и
+    // обновление парка было бы убыточным по построению.
+    expect(player().money).toBe(
+      before +
+        Math.round((STARTER_CLASS.price + TRAILER_PRICE[STARTER_TRAILER]) / 2),
+    )
   })
 
   it('водитель возвращается в резерв, а не увольняется', () => {

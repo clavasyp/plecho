@@ -942,8 +942,28 @@ function sellVehicle(
   const company = state.companies[companyId]
   if (vehicle === undefined || company === undefined) return state
 
+  /*
+   * ВОЗВРАТ СЧИТАЕТСЯ ЗА СЦЕПКУ ЦЕЛИКОМ — машину И прицеп.
+   *
+   * Прежде возвращали половину цены только машины, а прицеп исчезал бесследно.
+   * Экономически это означало, что замена техники стоит половину машины ПЛЮС
+   * целый новый кузов: у КамАЗа с цистерной — 23 000 возврата против 46 000
+   * расхода на замену. Обновление парка становилось убыточным по построению, и
+   * замер это подтвердил: контора, честно менявшая изношенные машины,
+   * разорялась на 22 покупках за год, потеряв около миллиона на одних кузовах.
+   *
+   * Продаётся именно сцепка: покупатель забирает машину вместе с тем, что к ней
+   * прицеплено, и платит за то и другое. Половина — та же ставка, что и была, и
+   * она по-прежнему не зависит от износа (разбор — у действия продажи в
+   * app/store.ts).
+   */
   const vehicleClass = VEHICLE_CLASS_BY_ID[vehicle.classId]
-  const refund = vehicleClass === undefined ? 0 : Math.round(vehicleClass.price / 2)
+  const trailerPrice =
+    vehicle.trailer === null ? 0 : (TRAILER_PRICE[vehicle.trailer] ?? 0)
+  const refund =
+    vehicleClass === undefined
+      ? 0
+      : Math.round((vehicleClass.price + trailerPrice) / 2)
 
   const vehicles = { ...state.vehicles }
   delete vehicles[vehicleId]
