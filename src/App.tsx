@@ -19,6 +19,7 @@
 import { Canvas } from '@react-three/fiber'
 import { useRivalRunner } from './app/ai/runner'
 import { useGameLoop } from './app/loop'
+import { useSound } from './app/sound'
 import { Scene } from './render/Scene'
 import { BottleneckPanel } from './ui/BottleneckPanel'
 import { CityPanel } from './ui/CityPanel'
@@ -88,6 +89,21 @@ export default function App() {
    * вокруг этой строки означало бы ровно обратное.
    */
   useRivalRunner()
+
+  /*
+   * ТРЕТИЙ ЦИКЛ — ЗВУК, И ЭТО ЕДИНСТВЕННОЕ МЕСТО, ГДЕ ИГРА ВООБЩЕ ЗВУЧИТ.
+   *
+   * Хук, а не компонент, по той же причине, что и раннер конкурентов: рисовать
+   * ему нечего. Он подписывается на стор, сравнивает соседние снимки и на
+   * разнице между ними синтезирует отклик — симуляция про звук не знает и знать
+   * не должна, граница src/sim здесь не пересекается ни разу.
+   *
+   * ПО УМОЛЧАНИЮ ЗВУКА НЕТ, и выключенный он не стоит ничего: подписка выходит
+   * до разбора состояния. Включает его кнопка в панели времени — единственная,
+   * и это требование браузера, а не вкус: Web Audio не запускается без жеста
+   * пользователя.
+   */
+  useSound()
 
   return (
     <>

@@ -29,7 +29,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import type { ComponentRef, JSX } from 'react'
 import * as THREE from 'three'
-import { useThree } from '@react-three/fiber'
+import { useFrame, useThree } from '@react-three/fiber'
 import { MapControls, OrthographicCamera } from '@react-three/drei'
 import {
   Bloom,
@@ -38,17 +38,21 @@ import {
   ToneMapping,
   Vignette,
 } from '@react-three/postprocessing'
-import { BlendFunction, ToneMappingMode } from 'postprocessing'
+import { BlendFunction, HueSaturationEffect, ToneMappingMode } from 'postprocessing'
+import { clock } from '../app/loop'
 import { useGameStore } from '../app/store'
 import type { CityId } from '../sim/types'
 import { fogRange, lighting, palette, postFx } from './palette'
+import { atmosphere, atmosphereInto } from './sky'
 import { Buildings, ServicePosts } from './BuildingMesh'
+import { HOME_CITY } from '../sim/state'
 import { Cities, cityPoint } from './CityMesh'
 import { CityPicker } from './CityPicker'
 import { Industries } from './IndustryMesh'
 import { Lines } from './LineMesh'
 import { Roads } from './RoadMesh'
 import { Vehicles } from './VehicleMesh'
+import { Weather } from './Weather'
 
 /** Единичный вектор изометрической диагонали. */
 const ISO = 1 / Math.sqrt(3)
@@ -80,9 +84,33 @@ const CAMERA_FAR = 5000
 /** Запас вокруг карты при вписывании в кадр. */
 const FRAME_MARGIN = 1.15
 
-/** Насколько можно отдалиться и приблизиться относительно вписанного кадра. */
-const ZOOM_OUT_LIMIT = 0.65
+/**
+ * Насколько можно отдалиться и приблизиться относительно СТАРТОВОГО кадра.
+ *
+ * Отдаление считается от стартового вида, а тот показывает край игрока, а не
+ * всю страну (разбор — у START_SPAN_KM). Значит запаса на отдаление нужно
+ * столько, чтобы с него можно было выйти на карту целиком и ещё немного:
+ * страна впятеро шире стартового кадра.
+ */
+const ZOOM_OUT_LIMIT = 0.12
 const ZOOM_IN_LIMIT = 16
+
+/**
+ * Что видно в первом кадре партии, километров поперёк.
+ *
+ * КАМЕРА ОТКРЫВАЕТСЯ НА КРАЕ ИГРОКА, А НЕ НА ВСЕЙ СТРАНЕ, и это решение, а не
+ * настройка. Карта стала пять тысяч километров поперёк; вписанная в кадр
+ * целиком, она даёт четыре километра на пиксель — дорога шириной в полкилометра
+ * становится тоньше пикселя и исчезает вовсе, город в двадцать километров
+ * превращается в пять точек. Первый кадр игры оказывался списком подписей на
+ * пустом фоне, и ровно так он и выглядел на снимке.
+ *
+ * Тысяча двести километров — это ЦФО с запасом на соседей: Петербург и Казань
+ * на краях, Москва в середине. Ровно тот мир, в котором игрок проводит первые
+ * часы с одной машиной. Вся страна никуда не девается — до неё можно отдалиться
+ * колесом, и это становится наградой за рост, а не стартовым экраном.
+ */
+const START_SPAN_KM = 1200
 
 /** Насколько можно увести центр обзора за пределы карты, км. */
 const PAN_MARGIN = 140
@@ -112,10 +140,24 @@ const SHADOW_EXTENT = 420
 /** Размер карты теней. */
 const SHADOW_MAP = 2048
 
+/**
+ * Дев-подмена игрового времени для сцены. null — время идёт своим ходом.
+ *
+ * Модульная переменная, а не состояние React: её читает useFrame, и любая
+ * запись в состояние перерисовывала бы дерево ради одного числа — тот же довод,
+ * что у `clock.alpha` в app/loop.ts. Хук, который её ставит, заводится только в
+ * разработке; в продакшене значение навсегда остаётся null.
+ */
+const timeOverride: { tick: number | null } = { tick: null }
+
+/** Очередь обновления атмосферы в кадре. Разбор — у самого useFrame. */
+const SKY_PRIORITY = -1
+
 type Framing = {
   center: { x: number; z: number }
-  /** Половина стороны квадрата, в который вписаны все города, км. */
-  extent: number
+  /** Размах карты по осям мира, км. */
+  width: number
+  depth: number
 }
 
 /** Прямоугольник, в который укладывается вся карта. */
@@ -123,7 +165,7 @@ function frameCities(): Framing {
   const cities = Object.values(useGameStore.getState().state.world.cities)
 
   if (cities.length === 0) {
-    return { center: { x: 0, z: 0 }, extent: 300 }
+    return { center: { x: 0, z: 0 }, width: 600, depth: 600 }
   }
 
   let minX = Infinity
@@ -141,9 +183,20 @@ function frameCities(): Framing {
 
   return {
     center: { x: (minX + maxX) / 2, z: (minZ + maxZ) / 2 },
-    // Квадрат, а не прямоугольник: при повороте на 45° карта всё равно
-    // разворачивается в ромб, и считать по одной стороне проще и честнее.
-    extent: Math.max(maxX - minX, maxZ - minZ) / 2,
+    /*
+     * ПРЯМОУГОЛЬНИК, А НЕ КВАДРАТ, и это пришлось переделать при переходе на
+     * карту страны.
+     *
+     * Прежде здесь бралась бо́льшая из сторон: «при повороте на 45° карта всё
+     * равно разворачивается в ромб, и считать по одной стороне проще». На карте
+     * округа это было почти правдой — ЦФО укладывается в квадрат. Страна не
+     * укладывается: от Пскова до Кемерова 3600 км по долготе против 1900 по
+     * широте. Квадрат по большей стороне вписывал в кадр вдвое больше пустоты,
+     * чем карты, города сбивались в угол, а половина экрана оставалась голой
+     * подложкой — ровно то, что видно на первом же снимке.
+     */
+    width: maxX - minX,
+    depth: maxZ - minZ,
   }
 }
 
@@ -153,14 +206,30 @@ export function Scene(): JSX.Element {
 
   const framing = useMemo(frameCities, [])
 
+  /** Где игрок начинает партию — центр стартового кадра. */
+  const home = useMemo(() => {
+    const city = useGameStore.getState().state.world.cities[HOME_CITY]
+    return city === undefined
+      ? framing.center
+      : (({ x, z }) => ({ x, z }))(cityPoint(city))
+  }, [framing])
+
   const view = useMemo(() => {
-    // Квадрат со стороной S, повёрнутый на 45° и наклонённый на 35.264°,
-    // занимает на экране ромб шириной S·√2 и высотой S·√2/√3. Считать нужно
-    // именно так: по стороне квадрата карта оставила бы половину кадра пустой,
-    // а по диагонали — вылезла бы за края.
-    const side = framing.extent * 2
-    const spanX = side * Math.SQRT2
-    const spanY = (side * Math.SQRT2) / Math.sqrt(3)
+    /*
+     * РАЗМАХ РОМБА НА ЭКРАНЕ, точно.
+     *
+     * Изометрия отображает точку мира как screen_x = (x − z)/√2 и
+     * screen_y = (x + z)/√6. Значит прямоугольник W×Д превращается в ромб
+     * шириной (W + Д)/√2 и высотой (W + Д)/√6 — обе стороны зависят от СУММЫ,
+     * а не от большей из них. Прежняя формула брала квадрат по большей стороне
+     * и потому на вытянутой карте промахивалась вдвое.
+     */
+    const spread = Math.min(
+      framing.width + framing.depth,
+      START_SPAN_KM * 2,
+    )
+    const spanX = spread / Math.SQRT2
+    const spanY = spread / Math.sqrt(6)
 
     const zoom =
       Math.min(size.width / spanX, size.height / spanY) / FRAME_MARGIN
@@ -170,19 +239,19 @@ export function Scene(): JSX.Element {
       minZoom: zoom * ZOOM_OUT_LIMIT,
       maxZoom: zoom * ZOOM_IN_LIMIT,
       position: [
-        framing.center.x + CAMERA_DISTANCE * ISO,
+        home.x + CAMERA_DISTANCE * ISO,
         CAMERA_DISTANCE * ISO,
-        framing.center.z + CAMERA_DISTANCE * ISO,
+        home.z + CAMERA_DISTANCE * ISO,
       ] as [number, number, number],
     }
-  }, [framing, size.width, size.height])
+  }, [framing, home, size.width, size.height])
 
   // Vector3, а не литерал массива: новый массив на каждом рендере R3F считает
   // изменившимся значением и сбрасывал бы панораму пользователя при каждом
   // изменении размера окна.
   const target = useMemo(
-    () => new THREE.Vector3(framing.center.x, 0, framing.center.z),
-    [framing],
+    () => new THREE.Vector3(home.x, 0, home.z),
+    [home],
   )
 
   const keyLight = useMemo(() => {
@@ -209,6 +278,224 @@ export function Scene(): JSX.Element {
 
   const controls = useRef<ComponentRef<typeof MapControls>>(null)
 
+  /*
+   * ─── СВЕТ ВЕДЁТ ВРЕМЯ ────────────────────────────────────────────────────
+   *
+   * Всё, что ниже, служит одному: время в игре должно быть ВИДНО. Расчёт
+   * лежит в render/sky.ts и от сцены не зависит вовсе; здесь только раздача
+   * посчитанных чисел по объектам Three.
+   *
+   * ПОЧЕМУ ЭТО useFrame, А НЕ ПОДПИСКА НА СОСТОЯНИЕ. Scene намеренно не
+   * подписан на игру (шапка файла): подписка на тик тянула бы за собой
+   * перестройку всех слоёв карты по нескольку раз в секунду. Вдобавок свет
+   * обязан ехать ПЛАВНО, а тик — это пятнадцать игровых минут разом; между
+   * тиками цвет доводит та же доля `clock.alpha`, по которой едут машины.
+   *
+   * ПОЧЕМУ ЗНАЧЕНИЯ ПИШУТСЯ КАЖДЫЙ КАДР, А НЕ ТОЛЬКО ПРИ ИЗМЕНЕНИИ ТИКА.
+   * Свойства в JSX ниже остаются на месте, и R3F возвращает их при любой
+   * перерисовке компонента — например, при изменении размера окна. Пропусти
+   * кадр «потому что время не изменилось» — и на паузе в полночь сцена
+   * молча вернулась бы к полудню из палитры. Расчёт стоит десятков операций,
+   * запись — двух десятков полей; экономить тут нечего.
+   */
+  const scene = useThree((state) => state.scene)
+
+  const keyRef = useRef<THREE.DirectionalLight>(null)
+  const fillRef = useRef<THREE.DirectionalLight>(null)
+  const ambientRef = useRef<THREE.AmbientLight>(null)
+  const groundRef = useRef<THREE.MeshStandardMaterial>(null)
+
+  /**
+   * Грейд эпохи: 1994 выцветшее, 2030 насыщенное.
+   *
+   * Эффект создаётся руками и вставляется в цепочку через <primitive>, а не
+   * обёрткой <HueSaturation/>. Причина не в красоте: обёртки из
+   * @react-three/postprocessing собирают аргументы конструктора через
+   * JSON.stringify своих пропсов, и ref на живой эффект попал бы в эту
+   * сериализацию вместе со всем графом рендерера. Свой экземпляр даёт прямой
+   * доступ к насыщенности из кадра и не зависит от внутренностей обёртки.
+   */
+  const grade = useMemo(
+    () => new HueSaturationEffect({ saturation: atmosphere.saturation }),
+    [],
+  )
+
+  useEffect(() => () => grade.dispose(), [grade])
+
+  /*
+   * ПРИОРИТЕТ −1 — ЭТО ПОРЯДОК ЧТЕНИЯ, А НЕ УСКОРЕНИЕ.
+   *
+   * Буфер `atmosphere` читают и другие слои карты — ночные окна городов
+   * (CityMesh) и фары (VehicleMesh) — из своих useFrame. R3F вызывает
+   * подписчиков по возрастанию приоритета, а при равном — в порядке подписки,
+   * то есть СНАЧАЛА ДЕТЕЙ: layout-эффекты в React срабатывают снизу вверх.
+   * С приоритетом по умолчанию слои света читали бы прошлый кадр — расхождение
+   * невидимое, но ровно того сорта, что потом полдня ищут. Отрицательное
+   * значение ставит хозяина буфера первым и не включает ручную отрисовку:
+   * счётчик ручного режима в R3F поднимают только положительные приоритеты
+   * (`priority > 0` в его subscribe), и рендером по-прежнему командует
+   * EffectComposer.
+   */
+  useFrame(() => {
+    const { state, prev } = useGameStore.getState()
+
+    // Тик берётся ровно тот же, по которому интерполируются машины
+    // (VehicleMesh.tsx): рассвет обязан идти вместе с миром, а не ступеньками
+    // по пятнадцать игровых минут.
+    const raw = clock.alpha
+    const alpha = raw < 0 ? 0 : raw > 1 ? 1 : raw
+    const played = prev.tick + (state.tick - prev.tick) * alpha
+
+    const sky = atmosphereInto(
+      atmosphere,
+      timeOverride.tick ?? played,
+      state.startYear,
+    )
+
+    // Фон канваса и туман — из ОДНОГО значения. Разъехаться они не могут по
+    // построению (см. поле `air` в sky.ts), и это ровно та ошибка, о которой
+    // предупреждает комментарий у <color attach="background"> ниже.
+    const background = scene.background
+    if (background instanceof THREE.Color) {
+      background.setRGB(sky.air.r, sky.air.g, sky.air.b, THREE.SRGBColorSpace)
+    }
+
+    const fog = scene.fog
+    if (fog !== null) {
+      fog.color.setRGB(sky.air.r, sky.air.g, sky.air.b, THREE.SRGBColorSpace)
+      if (fog instanceof THREE.Fog) {
+        fog.near = sky.fogNear
+        fog.far = sky.fogFar
+      }
+    }
+
+    const key = keyRef.current
+    if (key !== null) {
+      key.color.setRGB(sky.key.r, sky.key.g, sky.key.b, THREE.SRGBColorSpace)
+      key.intensity = sky.keyIntensity
+      // Направление единичное, вынос прежний: карта теней строится вокруг
+      // позиции источника, и менять её длину значило бы менять охват теней.
+      key.position.set(
+        sky.keyDirection.x * KEY_LIGHT_DISTANCE,
+        sky.keyDirection.y * KEY_LIGHT_DISTANCE,
+        sky.keyDirection.z * KEY_LIGHT_DISTANCE,
+      )
+    }
+
+    const fill = fillRef.current
+    if (fill !== null) {
+      fill.color.setRGB(sky.fill.r, sky.fill.g, sky.fill.b, THREE.SRGBColorSpace)
+      fill.intensity = sky.fillIntensity
+      fill.position.set(
+        sky.fillDirection.x * KEY_LIGHT_DISTANCE,
+        sky.fillDirection.y * KEY_LIGHT_DISTANCE,
+        sky.fillDirection.z * KEY_LIGHT_DISTANCE,
+      )
+    }
+
+    const ambient = ambientRef.current
+    if (ambient !== null) {
+      ambient.color.setRGB(
+        sky.ambient.r,
+        sky.ambient.g,
+        sky.ambient.b,
+        THREE.SRGBColorSpace,
+      )
+      ambient.intensity = sky.ambientIntensity
+    }
+
+    const ground = groundRef.current
+    if (ground !== null) {
+      ground.color.setRGB(
+        sky.ground.r,
+        sky.ground.g,
+        sky.ground.b,
+        THREE.SRGBColorSpace,
+      )
+    }
+
+    grade.saturation = sky.saturation
+  }, SKY_PRIORITY)
+
+  /**
+   * Подмена игрового времени и снятие показаний со сцены — только в разработке.
+   *
+   * НУЖНО РОВНО ДЛЯ ОДНОГО, как и наводка камеры выше: доказать сквозным
+   * тестом, что время ВИДНО. Проверить это иначе нечем. Юнит-тест доказывает
+   * форму кривой, но не то, что кривая куда-то подключена, — а именно так
+   * дважды и терялись целые слои (см. шапку файла). Скриншот же полудня и
+   * полуночи требует дождаться нужного часа: партия начинается 1 января в
+   * 00:00, и до июльского полудня симуляции пришлось бы отработать
+   * семнадцать тысяч тиков.
+   *
+   * Подмена живёт ТОЛЬКО в рендере и в состояние не пишет ничего: игра при
+   * ней идёт своим ходом, меняется лишь то, какое время рисует сцена.
+   *
+   * __plechoSky читает ЖИВЫЕ объекты Three, а не результат расчёта. Это
+   * принципиально: тест обязан подтверждать, что числа доехали до света,
+   * тумана и материала подложки, — повторный вызов чистой функции подтвердил
+   * бы только сам себя.
+   */
+  useEffect(() => {
+    if (!import.meta.env.DEV) return
+
+    const dev = globalThis as unknown as {
+      __plechoSky?: unknown
+      __plechoTime?: unknown
+    }
+
+    dev.__plechoTime = (tick: number | null): void => {
+      timeOverride.tick = tick
+    }
+
+    dev.__plechoSky = () => {
+      const background = scene.background
+      const fog = scene.fog
+      const key = keyRef.current
+      const fill = fillRef.current
+      const ambient = ambientRef.current
+      const ground = groundRef.current
+
+      return {
+        background:
+          background instanceof THREE.Color ? background.getHexString() : null,
+        fog: fog === null ? null : fog.color.getHexString(),
+        fogFar: fog instanceof THREE.Fog ? fog.far : null,
+
+        key: key === null ? null : key.color.getHexString(),
+        keyIntensity: key === null ? null : key.intensity,
+        keyDirection:
+          key === null
+            ? null
+            : {
+                x: key.position.x / KEY_LIGHT_DISTANCE,
+                y: key.position.y / KEY_LIGHT_DISTANCE,
+                z: key.position.z / KEY_LIGHT_DISTANCE,
+              },
+
+        fill: fill === null ? null : fill.color.getHexString(),
+        fillIntensity: fill === null ? null : fill.intensity,
+
+        ambient: ambient === null ? null : ambient.color.getHexString(),
+        ambientIntensity: ambient === null ? null : ambient.intensity,
+
+        ground: ground === null ? null : ground.color.getHexString(),
+        saturation: grade.saturation,
+
+        sun: atmosphere.sun,
+        daylight: atmosphere.daylight,
+        twilight: atmosphere.twilight,
+        winter: atmosphere.winter,
+      }
+    }
+
+    return () => {
+      timeOverride.tick = null
+      delete dev.__plechoSky
+      delete dev.__plechoTime
+    }
+  }, [grade, scene])
+
   /**
    * Ограничение панорамирования.
    *
@@ -222,7 +509,9 @@ export function Scene(): JSX.Element {
     const orbit = controls.current
     if (!orbit) return
 
-    const limit = framing.extent + PAN_MARGIN
+    // Полуразмах по большей оси: панорама ограничивается одинаково по обеим,
+    // и брать надо ту сторону, по которой карта длиннее.
+    const limit = Math.max(framing.width, framing.depth) / 2 + PAN_MARGIN
 
     const x = THREE.MathUtils.clamp(
       orbit.target.x,
@@ -363,12 +652,18 @@ export function Scene(): JSX.Element {
         rotateSpeed={0.35}
       />
 
+      {/* Значения в свойствах — ПОЛДЕНЬ И ЗАПАСНОЙ ВАРИАНТ, а не то, что видит
+          игрок: цвет, силу и направление всех трёх источников каждый кадр
+          задаёт время суток (useFrame выше). Оставлены они затем, чтобы свет
+          был осмысленным на самом первом кадре и в тесте, где кадров нет. */}
       <ambientLight
+        ref={ambientRef}
         color={lighting.ambientColor}
         intensity={lighting.ambientIntensity}
       />
 
       <directionalLight
+        ref={keyRef}
         color={lighting.keyColor}
         intensity={lighting.keyIntensity}
         position={keyLight}
@@ -394,6 +689,7 @@ export function Scene(): JSX.Element {
       {/* Заливка теней не отбрасывает: вторая карта теней стоила бы столько же,
           сколько ключевая, а дала бы только конфликтующие полутени. */}
       <directionalLight
+        ref={fillRef}
         color={lighting.fillColor}
         intensity={lighting.fillIntensity}
         position={fillLight}
@@ -408,7 +704,11 @@ export function Scene(): JSX.Element {
         receiveShadow
       >
         <planeGeometry args={[GROUND_SIZE, GROUND_SIZE]} />
+        {/* Цвет ведёт сезон: подложка — самая большая поверхность кадра, и
+            белеющая зима читается прежде всего по ней (seasonGround в
+            palette.ts). palette.terrain здесь — начальное значение. */}
         <meshStandardMaterial
+          ref={groundRef}
           color={palette.terrain}
           roughness={1}
           metalness={0}
@@ -450,6 +750,7 @@ export function Scene(): JSX.Element {
       <ServicePosts />
 
       <Vehicles />
+      <Weather />
       <CityPicker />
 
       {/*
@@ -503,6 +804,22 @@ export function Scene(): JSX.Element {
           выглядела выцветшей.
         */}
         <ToneMapping mode={ToneMappingMode.ACES_FILMIC} />
+
+        {/*
+          Грейд эпохи: девяностые выцветшие, двадцатые насыщенные.
+
+          ПОЧЕМУ ЭПОХА — ЭФФЕКТ, А НЕ ПЕРЕКРАСКА ПАЛИТРЫ. Цвета лежат в одном
+          файле и читаются восемью компонентами; пересчитывать каждый из них по
+          году значило бы завести второй источник цвета — ту самую ошибку, от
+          которой palette.ts и защищает. Сдвиг насыщенности всего кадра делает
+          то же самое одним проходом и одинаково двигает и застройку, и акцент.
+
+          Место в цепочке — после тональной компрессии и до виньетки. Насыщенность
+          осмысленна только на приведённом к экрану изображении: до компрессии
+          яркость линейная и не ограничена сверху, а виньетка и зерно — уже
+          свойства объектива, они ложатся на готовый кадр последними.
+        */}
+        <primitive object={grade} />
 
         <Vignette
           offset={postFx.vignetteOffset}

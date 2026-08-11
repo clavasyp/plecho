@@ -384,8 +384,20 @@ const lastPlayed: Record<SoundEvent, number | null> = {
   погрузка: null,
 }
 
+/**
+ * Тишина как «ничего не применено».
+ *
+ * Отдельное значение, а не AMBIENT_NIGHT, и это не мелочь: включённый ночью
+ * звук сравнил бы ночь с ночью, решил, что менять нечего, и оставил бы
+ * громкость на нуле, с которого граф стартует. Гула бы просто не было — до
+ * первого рассвета. Ноль не совпадает ни с одним настоящим состоянием гула
+ * (самое тихое — 0.016 при срезе 180 Гц), поэтому первый расчёт после
+ * включения проходит всегда.
+ */
+const AMBIENT_SILENT: Ambient = { gain: 0, cutoff: 0 }
+
 /** Что уже отправлено в граф — чтобы не дёргать AudioParam впустую. */
-let appliedAmbient: Ambient = AMBIENT_NIGHT
+let appliedAmbient: Ambient = AMBIENT_SILENT
 
 /** Отложенная остановка контекста после затухания гула. */
 let suspendTimer: ReturnType<typeof setTimeout> | null = null
@@ -482,7 +494,7 @@ function createEngine(): Engine | null {
       running.push(osc)
     }
 
-    appliedAmbient = AMBIENT_NIGHT
+    appliedAmbient = AMBIENT_SILENT
     return { ctx, master, ambient, filter, cues, running }
   } catch {
     // Контекстов у вкладки конечное число, и создание падает, когда лимит
@@ -583,8 +595,11 @@ function startSound(): void {
   // сломать нажатие кнопки, а не звук.
   void engine.ctx.resume().catch(() => {})
 
-  // Гул сразу берёт время суток, а не выезжает из ночи посреди дня.
-  appliedAmbient = AMBIENT_NIGHT
+  // Гул сразу берёт время суток, а не выезжает из ночи посреди дня. Сброс в
+  // «ничего не применено» обязателен: без него включение в тот же час, в
+  // котором выключили, не подняло бы громкость с нуля вовсе — разбор у
+  // AMBIENT_SILENT.
+  appliedAmbient = AMBIENT_SILENT
   applyAmbient(dayProgress(useGameStore.getState().state.tick))
 }
 
@@ -594,7 +609,7 @@ function stopSound(): void {
 
   const ctx = engine.ctx
   engine.ambient.gain.setTargetAtTime(0, ctx.currentTime, 0.12)
-  appliedAmbient = AMBIENT_NIGHT
+  appliedAmbient = AMBIENT_SILENT
 
   // Контекст усыпляется ПОСЛЕ затухания: suspend мгновенно обрывает звук, и
   // выключение щёлкало бы. Полсекунды хватает на затухание с запасом.
@@ -710,6 +725,13 @@ export function useSound(): void {
  * включился ли контекст, сколько откликов ушло в граф, какой был последним.
  * В продакшен-сборке ветка вырезается целиком — import.meta.env.DEV константа
  * на этапе сборки.
+ *
+ * ГРОМКОСТЕЙ ДВЕ, И ЭТО НЕ ИЗБЫТОК. `ambientGain` — что модуль ПОСЧИТАЛ и
+ * отправил в граф, `ambientLive` — что в графе НА САМОМ ДЕЛЕ звучит сейчас.
+ * Разойтись они могут ровно в одном случае — когда расчёт решил, что менять
+ * нечего, а менять было что; именно так однажды и вышло: звук, включённый в
+ * четыре утра, считал ночь равной ночи и оставлял громкость на нуле, с которого
+ * граф стартует. По одному числу такую поломку не видно вовсе.
  */
 if (import.meta.env.DEV) {
   ;(globalThis as unknown as { __plechoSound?: unknown }).__plechoSound =
@@ -721,5 +743,6 @@ if (import.meta.env.DEV) {
       lastEvent: probe.lastEvent,
       ambientGain: appliedAmbient.gain,
       ambientCutoff: appliedAmbient.cutoff,
+      ambientLive: engine === null ? 0 : engine.ambient.gain.value,
     })
 }

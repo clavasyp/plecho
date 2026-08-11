@@ -1011,8 +1011,53 @@ function staffed(company: Company, plan: ScriptedPlan): boolean {
  *   • точка выгрузки не съедает то, что машина привозит, — кольцо запрёт машину;
  *   • оборот не окупает пробег — то есть нарушен главный инвариант игры.
  */
+/**
+ * Перебор колец считается ОДИН РАЗ НА СНИМОК СОСТОЯНИЯ.
+ *
+ * За один решенческий тик планировщик зовут шесть раз: по два раза на каждого
+ * из трёх конкурентов (само решение и фраза для ленты). Мир между этими шестью
+ * вызовами не меняется ни на тонну — они разбирают один и тот же снимок, — а
+ * результат зависит только от размещения предприятий, графа дорог и населения
+ * городов. Значит пересчитывать его шестикратно незачем.
+ *
+ * Ключ — сам объект состояния. Тик возвращает НОВЫЙ объект (все фазы чистые),
+ * поэтому запись живёт ровно один тик и уходит со сборкой мусора вместе со
+ * снимком: WeakMap не держит ни состояние, ни планы.
+ *
+ * На карте округа это экономило 11 мс в сутки и было не нужно. На карте страны
+ * — 235 мс из 282, то есть разницу между заметной и незаметной паузой.
+ */
+const plansCache = new WeakMap<GameState, ScriptedPlan[]>()
+
 export function ringPlans(state: GameState): ScriptedPlan[] {
+  const cached = plansCache.get(state)
+  if (cached !== undefined) return cached
+
+  const plans = computeRingPlans(state)
+  plansCache.set(state, plans)
+  return plans
+}
+
+function computeRingPlans(state: GameState): ScriptedPlan[] {
   const graph = buildGraph(state.world.edges)
+
+  /*
+   * СТОК СПРАШИВАЕТСЯ ЧЕРЕЗ ПАМЯТЬ НА ОДИН ПЕРЕБОР.
+   *
+   * sinkPerDay проходит по ВСЕМУ списку предприятий, а перебор колец
+   * спрашивает его для каждой пары «город × груз» многократно. На карте округа
+   * это тысяча проходов, на карте страны — больше миллиона. Ответ при этом от
+   * перебора не зависит: за время одного вызова ringPlans мир не меняется.
+   */
+  const sinkMemo = new Map<string, number>()
+  const sink = (cityId: CityId, cargo: CargoType): number => {
+    const key = `${cityId}/${cargo}`
+    const known = sinkMemo.get(key)
+    if (known !== undefined) return known
+    const value = sinkPerDay(state, cityId, cargo)
+    sinkMemo.set(key, value)
+    return value
+  }
   const industries = Object.values(state.world.industries)
   const cityIds = Object.keys(state.world.cities) as CityId[]
   const plans: ScriptedPlan[] = []
@@ -1031,7 +1076,30 @@ export function ringPlans(state: GameState): ScriptedPlan[] {
       if (trailer === null) continue
 
       // Сколько сырья кольцо может увозить и сколько его примут на месте.
-      const rawSink = sinkPerDay(state, works.cityId, raw)
+      const rawSink = sink(works.cityId, raw)
+
+      /*
+       * СТОК ПО ПРОДУКЦИИ СЧИТАЕТСЯ ОДИН РАЗ НА ВСЕ ИСТОЧНИКИ, а не заново под
+       * каждый. От источника он не зависит вовсе — это свойство города сбыта.
+       * Внутри цикла по источникам он пересчитывался по числу источников раз, и
+       * на карте страны это давало миллион с лишним лишних проходов по списку
+       * предприятий за один перебор.
+       */
+      const sales: { city: CityId; sink: number; km: number }[] = []
+      for (const sale of cityIds) {
+        // Сдавать продукцию там же, где её взяли, бессмысленно: плечо нулевое,
+        // выручки за него нет (deliveryRevenue не платит за нулевой путь).
+        if (sale === works.cityId) continue
+
+        const productSink = sink(sale, product)
+        if (!(productSink > 0)) continue
+
+        const legProduct = shortestKm(graph, works.cityId, sale)
+        if (!Number.isFinite(legProduct) || legProduct <= 0) continue
+
+        sales.push({ city: sale, sink: productSink, km: legProduct })
+      }
+      if (sales.length === 0) continue
 
       for (const source of industries) {
         const sourceRecipe = RECIPE_BY_INDUSTRY[source.type]
@@ -1042,17 +1110,7 @@ export function ringPlans(state: GameState): ScriptedPlan[] {
         const legRaw = shortestKm(graph, source.cityId, works.cityId)
         if (!Number.isFinite(legRaw) || legRaw <= 0) continue
 
-        for (const sale of cityIds) {
-          // Сдавать продукцию там же, где её взяли, бессмысленно: плечо нулевое,
-          // выручки за него нет (deliveryRevenue не платит за нулевой путь).
-          if (sale === works.cityId) continue
-
-          const productSink = sinkPerDay(state, sale, product)
-          if (!(productSink > 0)) continue
-
-          const legProduct = shortestKm(graph, works.cityId, sale)
-          if (!Number.isFinite(legProduct) || legProduct <= 0) continue
-
+        for (const { city: sale, sink: productSink, km: legProduct } of sales) {
           // Порожнее плечо домой. Ноль — сбыт совпал с источником, и кольцо
           // получилось из двух остановок.
           const legHome =
@@ -1060,6 +1118,26 @@ export function ringPlans(state: GameState): ScriptedPlan[] {
               ? 0
               : shortestKm(graph, sale, source.cityId)
           if (!Number.isFinite(legHome)) continue
+
+          /*
+           * ОТСЕВ ПО ГЕОМЕТРИИ — ДО ВСЯКОЙ ЭКОНОМИКИ, и он ТОЧНЫЙ, а не
+           * приблизительный: выбрасывается только то, что всё равно не прошло
+           * бы проверку маржи ниже.
+           *
+           * Главный инвариант игры (шапка data/operating.ts) гарантирует
+           * m·t·p < 2c для каждого класса. Значит выручка кольца не больше
+           * 2c × гружёные_км, а расходы равны c × все_км, и маржа может быть
+           * положительной только при гружёные_км > все_км / 2 — то есть когда
+           * порожнее плечо домой КОРОЧЕ суммы двух гружёных.
+           *
+           * ЗАЧЕМ ЭТО НУЖНО. На карте округа перебор стоил 2.2 мс и оптимизации
+           * не требовал вовсе. На карте страны кандидатов становится 190 тысяч,
+           * и на каждого приходится четыре расчёта экономики (три класса плюс
+           * итоговый) — полмиллиарда операций и полсекунды на вызов, при том
+           * что решенческий тик зовёт планировщик шесть раз. Эта одна строка
+           * снимает большую часть кандидатов, ничего не меняя в результате.
+           */
+          if (legHome >= legRaw + legProduct) continue
 
           /*
            * ОБРАТНОЕ ПЛЕЧО ВЕЗЁТ РОВНО СТОЛЬКО, СКОЛЬКО ВЫШЛО ИЗ ПРИВЕЗЁННОГО.

@@ -57,6 +57,8 @@ import { MIN_LINE_STOPS } from '../../sim/logistics/line'
 import { trailersFor } from '../../sim/logistics/trailer'
 import { THINKING_LIMIT } from '../../sim/tick'
 import { dateFromTick, formatDate } from '../../sim/time'
+import { buildGraph } from '../../sim/world/graph'
+import { shortestKm } from '../../sim/world/pathfind'
 import { TICKS_PER_HOUR } from '../../sim/types'
 import type {
   BuildingId,
@@ -99,12 +101,32 @@ export const MAX_RESPONSE_CHARS = 32_000
  * усталости, ищет ответ в них.
  *
  * Шестнадцать тысяч символов — это около четырёх тысяч токенов: втрое больше
- * нынешнего снимка (примерно шесть тысяч символов на десять городов) и с запасом
- * на разросшийся парк. Полное состояние партии проходит эту границу на первом же
- * игровом месяце и дальше растёт всю партию — снимок не растёт вовсе, и тест
- * проверяет именно это.
+ * нынешнего снимка и с запасом на разросшийся парк. Полное состояние партии
+ * проходит эту границу на первом же игровом месяце и дальше растёт всю партию —
+ * снимок не растёт вовсе, и тест проверяет именно это.
  */
 export const SNAPSHOT_BUDGET_CHARS = 16_000
+
+/**
+ * Сколько городов попадает в снимок.
+ *
+ * СНИМОК ПОКАЗЫВАЕТ КРАЙ, А НЕ СТРАНУ, и это решение, а не экономия.
+ *
+ * Пока карта была округом, весь мир умещался в бюджет целиком, и вопрос не
+ * стоял. На карте страны — 53 города, 100 дорог и 60 предприятий — полный
+ * снимок вырос до 22 тысяч символов, то есть вылез за бюджет в полтора раза. И
+ * дело не только в токенах: перевозчик, которому показали Мурманск, Краснодар и
+ * Новосибирск разом, ищет решение среди трёх тысяч колец, из которых для него
+ * осмысленны единицы. Лишние данные не просто оплачиваются — они РАЗБАВЛЯЮТ то,
+ * из чего решение выводится, и это записано абзацем выше как главный довод
+ * бюджета.
+ *
+ * Двадцать узлов — это примерно размер прежней карты плюс половина: край, по
+ * которому контора реально ездит, с запасом на соседние направления. Города, где
+ * у компании уже есть линии, машины или постройки, входят ВСЕГДА, остальные
+ * добираются по близости к её делам.
+ */
+const SNAPSHOT_CITIES = 20
 
 /**
  * Предел длины идентификатора, символов.
@@ -502,26 +524,68 @@ export function snapshotFor(
     type: building.type,
   }))
 
-  const cities: SnapshotCity[] = Object.values(state.world.cities).map(
-    (city) => ({
+  /*
+   * ГОРИЗОНТ КОМПАНИИ: что вообще попадёт в снимок.
+   *
+   * Сначала — города, где у конторы уже есть дела: остановки её линий, стоянки
+   * её машин, её постройки. Эти входят безусловно, сколько бы их ни было: снимок,
+   * умолчавший о городе, в котором стоит своя же машина, хуже отсутствующего.
+   *
+   * Дальше список добирается ближайшими по дорогам — до SNAPSHOT_CITIES. Близость
+   * считается от ЯКОРЯ: первой остановки первой линии, а если линий нет — от
+   * домашнего города, в котором контора начинает партию.
+   */
+  const graph = buildGraph(state.world.edges)
+
+  const anchored = new Set<CityId>()
+  for (const line of Object.values(company.lines ?? {})) {
+    for (const stop of line.stops) anchored.add(stop.nodeId)
+  }
+  for (const vehicle of own) {
+    if (vehicle.position.kind === 'узел') anchored.add(vehicle.position.nodeId)
+  }
+  for (const building of Object.values(company.buildings ?? {})) {
+    anchored.add(building.cityId)
+  }
+
+  const anchor: CityId =
+    [...anchored][0] ?? (Object.keys(state.world.cities)[0] as CityId)
+
+  const nearby = Object.values(state.world.cities)
+    .filter((city) => !anchored.has(city.id))
+    .map((city) => ({ city, km: shortestKm(graph, anchor, city.id) }))
+    .sort((a, b) => a.km - b.km || (a.city.id < b.city.id ? -1 : 1))
+
+  const shown = new Set<CityId>(anchored)
+  for (const { city } of nearby) {
+    if (shown.size >= SNAPSHOT_CITIES) break
+    shown.add(city.id)
+  }
+
+  const cities: SnapshotCity[] = Object.values(state.world.cities)
+    .filter((city) => shown.has(city.id))
+    .map((city) => ({
       id: city.id,
       name: city.name,
       people: round(city.population / 1000),
       demand: demandOf(city.population),
       stock: tons(city.stock),
-    }),
-  )
+    }))
 
-  const roads: SnapshotRoad[] = Object.values(state.world.edges).map((edge) => ({
-    from: edge.from,
-    to: edge.to,
-    km: edge.km,
-    quality: edge.quality,
-  }))
+  // Дорога попадает в снимок, только если ОБА её конца показаны: ребро в
+  // невидимый город — это приглашение построить линию в никуда.
+  const roads: SnapshotRoad[] = Object.values(state.world.edges)
+    .filter((edge) => shown.has(edge.from) && shown.has(edge.to))
+    .map((edge) => ({
+      from: edge.from,
+      to: edge.to,
+      km: edge.km,
+      quality: edge.quality,
+    }))
 
-  const industries: SnapshotIndustry[] = Object.values(
-    state.world.industries,
-  ).map((industry) => {
+  const industries: SnapshotIndustry[] = Object.values(state.world.industries)
+    .filter((industry) => shown.has(industry.cityId))
+    .map((industry) => {
     const recipe = RECIPE_BY_INDUSTRY[industry.type]
     return {
       city: industry.cityId,

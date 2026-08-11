@@ -25,6 +25,49 @@ const EXPECTED_IDS = [
   'smolensk',
   'bryansk',
   'orel',
+  'peterburg',
+  'novgorod',
+  'pskov',
+  'petrozavodsk',
+  'vologda',
+  'cherepovets',
+  'arkhangelsk',
+  'murmansk',
+  'nizhny',
+  'kazan',
+  'izhevsk',
+  'ulyanovsk',
+  'tolyatti',
+  'samara',
+  'penza',
+  'saratov',
+  'volgograd',
+  'ekaterinburg',
+  'chelyabinsk',
+  'ufa',
+  'perm',
+  'magnitogorsk',
+  'tagil',
+  'orenburg',
+  'kurgan',
+  'voronezh',
+  'lipetsk',
+  'oskol',
+  'kursk',
+  'belgorod',
+  'tambov',
+  'rostov',
+  'krasnodar',
+  'stavropol',
+  'tyumen',
+  'tobolsk',
+  'surgut',
+  'omsk',
+  'novosibirsk',
+  'tomsk',
+  'kemerovo',
+  'novokuznetsk',
+  'barnaul',
 ]
 
 const PROFILES: CityProfile[] = [
@@ -46,14 +89,18 @@ describe('города ЦФО', () => {
     expect(new Set(CITIES.map((city) => city.id))).toEqual(new Set(EXPECTED_IDS))
   })
 
-  it('координаты лежат в границах ЦФО', () => {
+  it('координаты лежат в границах охваченной части России', () => {
+    /*
+     * Рамка выросла вместе с картой: от Краснодара (45.0) до Мурманска (69.0)
+     * по широте и от Пскова (28.3) до Кемерова (86.1) по долготе. Смысл
+     * проверки прежний — она ловит промах в знаке и перепутанные местами
+     * широту с долготой: 37.6 широты в России уже не бывает нигде.
+     */
     for (const city of CITIES) {
-      // Промах в знаке или перепутанные местами широта с долготой вылезают
-      // именно здесь: 37.6 широты — это уже не Россия.
-      expect(city.coord.lat, city.name).toBeGreaterThanOrEqual(50)
-      expect(city.coord.lat, city.name).toBeLessThanOrEqual(60)
-      expect(city.coord.lon, city.name).toBeGreaterThanOrEqual(30)
-      expect(city.coord.lon, city.name).toBeLessThanOrEqual(45)
+      expect(city.coord.lat, city.name).toBeGreaterThanOrEqual(43)
+      expect(city.coord.lat, city.name).toBeLessThanOrEqual(70)
+      expect(city.coord.lon, city.name).toBeGreaterThanOrEqual(27)
+      expect(city.coord.lon, city.name).toBeLessThanOrEqual(88)
     }
   })
 
@@ -70,25 +117,43 @@ describe('города ЦФО', () => {
     }
   })
 
-  it('Москва крупнейшая и с большим отрывом', () => {
+  it('Москва крупнейшая, но уже не единственная', () => {
     const moscow = CITIES_BY_ID[cityId('moscow')]
     const others = CITIES.filter((city) => city !== moscow)
     for (const city of others) {
       expect(moscow.population, city.name).toBeGreaterThan(city.population)
     }
-    // Отрыв на порядок — это факт про ЦФО, а не случайность выборки.
-    // Если проверка упадёт, значит население перепутали, а не Москва усохла.
+
+    /*
+     * ОТРЫВ СОКРАТИЛСЯ, И ЭТО ГЛАВНОЕ, ЧТО СДЕЛАЛА КАРТА СТРАНЫ.
+     *
+     * На карте округа Москва была больше следующего города в 24 раза, и это
+     * означало мир с ОДНИМ потребителем: каждое кольцо обязано было кончаться в
+     * столице и возвращаться оттуда порожняком через всю карту. С Петербургом
+     * отрыв стал 2.35 раза, а по СПРОСУ — всего 1.5, потому что спрос считается
+     * от корня населения.
+     *
+     * Проверка теперь двусторонняя: Москва обязана остаться крупнейшей (иначе
+     * перепутали население), но отрыв обязан быть меньше пятикратного — иначе
+     * второй город потерялся, и мир снова выродился в один сток.
+     */
     const largestOther = Math.max(...others.map((city) => city.population))
-    expect(moscow.population).toBeGreaterThan(largestOther * 10)
+    expect(moscow.population).toBeGreaterThan(largestOther)
+    expect(moscow.population).toBeLessThan(largestOther * 5)
   })
 
-  it('население правдоподобно для областного центра', () => {
+  it('население правдоподобно для города на карте страны', () => {
+    /*
+     * Верхняя граница поднялась с миллиона до семи вместе с картой: на карте
+     * округа миллионников, кроме Москвы, не было вовсе, а на карте страны их
+     * пять — Петербург, Новосибирск, Екатеринбург, Казань, Нижний Новгород.
+     * Нижняя осталась прежней: город меньше ста тысяч — это уже не узел
+     * федеральной сети, а посёлок, и в графе ему делать нечего.
+     */
     for (const city of CITIES) {
       if (city.profile === 'столица') continue
-      // Все девять — областные центры: меньше 100 тысяч не бывает,
-      // больше миллиона в ЦФО, кроме Москвы, тоже нет.
       expect(city.population, city.name).toBeGreaterThan(100_000)
-      expect(city.population, city.name).toBeLessThan(1_000_000)
+      expect(city.population, city.name).toBeLessThan(7_000_000)
     }
   })
 

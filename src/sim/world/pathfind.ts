@@ -71,6 +71,7 @@ let routeCache = new WeakMap<RoadGraph, Map<string, Route>>()
 /** Сбросить кэш целиком. См. рассуждение выше о том, когда это нужно. */
 export function clearRouteCache(): void {
   routeCache = new WeakMap()
+  distanceCache = new WeakMap()
 }
 
 // ─── Поиск ─────────────────────────────────────────────────────────────────
@@ -249,11 +250,35 @@ export function routeCost(
  *
  * Бесконечность — города не связаны. Ноль — это один и тот же город.
  */
-export function shortestKm(graph: RoadGraph, from: CityId, to: CityId): number {
-  if (!hasCity(graph, from) || !hasCity(graph, to)) {
-    return Number.POSITIVE_INFINITY
+/**
+ * Таблица кратчайших расстояний от одного города до всех остальных.
+ *
+ * КЭШ ЗДЕСЬ НЕ УСКОРЕНИЕ, А УСЛОВИЕ РАБОТОСПОСОБНОСТИ, и это стоит числа.
+ * Планировщик конкурента перебирает кольца как «переработка × сырьё × источник
+ * × ВСЕ города» и на каждое кольцо спрашивает три расстояния. На карте округа
+ * это 216 Дейкстр за вызов и 2.2 мс — незаметно. На карте страны (53 города,
+ * 70 предприятий) это 32 760 Дейкстр и 478 мс, а решенческий тик зовёт
+ * планировщик шесть раз: ТРИ СЕКУНДЫ синхронной заморозки раз в игровые сутки,
+ * то есть каждые четыре реальные секунды на пятикратной скорости.
+ *
+ * Одна Дейкстра даёт расстояния до ВСЕХ городов сразу — ровно та же работа,
+ * что и до одного. Поэтому кэшируется строка таблицы: 53 обхода вместо 32 760,
+ * и дальше любой вопрос стоит поиска по словарю.
+ *
+ * Привязка к графу через WeakMap — тот же приём и та же оговорка, что у кэша
+ * маршрутов выше: изменил Edge — позови clearRouteCache().
+ */
+let distanceCache = new WeakMap<RoadGraph, Map<CityId, Map<CityId, number>>>()
+
+function distancesFrom(graph: RoadGraph, from: CityId): Map<CityId, number> {
+  let rows = distanceCache.get(graph)
+  if (rows === undefined) {
+    rows = new Map()
+    distanceCache.set(graph, rows)
   }
-  if (from === to) return 0
+
+  const known = rows.get(from)
+  if (known !== undefined) return known
 
   const best = new Map<CityId, number>([[from, 0]])
   const settled = new Set<CityId>()
@@ -269,19 +294,27 @@ export function shortestKm(graph: RoadGraph, from: CityId, to: CityId): number {
     }
 
     if (current === undefined) break
-    if (current === to) return currentKm
-
     settled.add(current)
 
     for (const neighbor of neighbors(graph, current)) {
       if (settled.has(neighbor.cityId)) continue
       const candidate = currentKm + neighbor.edge.km
-      const known = best.get(neighbor.cityId)
-      if (known === undefined || candidate < known) {
+      const previous = best.get(neighbor.cityId)
+      if (previous === undefined || candidate < previous) {
         best.set(neighbor.cityId, candidate)
       }
     }
   }
 
-  return best.get(to) ?? Number.POSITIVE_INFINITY
+  rows.set(from, best)
+  return best
+}
+
+export function shortestKm(graph: RoadGraph, from: CityId, to: CityId): number {
+  if (!hasCity(graph, from) || !hasCity(graph, to)) {
+    return Number.POSITIVE_INFINITY
+  }
+  if (from === to) return 0
+
+  return distancesFrom(graph, from).get(to) ?? Number.POSITIVE_INFINITY
 }

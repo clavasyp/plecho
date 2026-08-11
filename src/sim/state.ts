@@ -39,7 +39,9 @@ import { EDGES } from '../data/roads'
 import { TRAILER_PRICE, VEHICLE_CLASS_BY_ID } from '../data/vehicles'
 import { wageFor } from './logistics/driver'
 import { Rng } from './rng'
-import { cityId, companyId, driverId, vehicleId } from './types'
+import { cityId, companyId, driverId, vehicleId,
+  TICKS_PER_HOUR,
+} from './types'
 import type {
   City,
   CityId,
@@ -813,7 +815,22 @@ export function createInitialState(seed: number): GameState {
     // приводит число к 32 битам, и сиды 1 и 2^32+1 дают одинаковое состояние —
     // а значит и одинаковый JSON, на который опираются тесты детерминизма.
     rngState: Rng.from(seed).seed,
-    tick: 0,
+    /*
+     * ПАРТИЯ НАЧИНАЕТСЯ УТРОМ, А НЕ В ПОЛНОЧЬ.
+     *
+     * Ноль означал первое января в 00:00 — то есть зимнюю полночь, самый тёмный
+     * кадр из всех возможных. С появлением света суток (render/sky.ts) это
+     * перестало быть безобидным: игра открывалась чёрным экраном с подписями
+     * городов, на котором не видно ни дорог, ни застройки, и первое впечатление
+     * от неё было «ничего не нарисовано».
+     *
+     * Девять утра — зимний рассвет: солнце низкое, тени длинные, тёплый свет
+     * скользит по карте. Тот самый кадр, ради которого свет суток и делался.
+     *
+     * Величина выражена через TICKS_PER_HOUR, а не числом: ритм тика уже менялся
+     * однажды, и вписанное «36» разъехалось бы с ним молча.
+     */
+    tick: 9 * TICKS_PER_HOUR,
     startYear: START_YEAR,
     world: { cities, edges, industries },
     companies,

@@ -108,11 +108,11 @@ const areAdjacent = (a: CityId, b: CityId): boolean =>
   )
 
 /** Кратчайшее плечо цепочки: от ближайшего источника до ближайшей переработки. */
-function shortestLeg(chain: Chain): number {
-  const legs = citiesOf(chain.sourceType).flatMap((source) =>
+/** Все плечи «источник → завод» одной цепочки, километры. */
+function legsOf(chain: Chain): number[] {
+  return citiesOf(chain.sourceType).flatMap((source) =>
     citiesOf(chain.processingType).map((plant) => roadDistance(source, plant)),
   )
-  return Math.min(...legs)
 }
 
 // ─── Тесты ─────────────────────────────────────────────────────────────────
@@ -260,27 +260,55 @@ describe('предприятия ЦФО', () => {
     expect(inCapital).toEqual([])
   })
 
-  it('не все цепочки замыкаются одним ребром', () => {
-    // Если бы каждая цепочка укладывалась в одну дорогу между соседями, все
-    // рейсы в игре были бы на одно лицо и выбор маршрута исчез бы.
-    const adjacentChains = CHAINS.filter((chain) =>
-      citiesOf(chain.sourceType).some((source) =>
-        citiesOf(chain.processingType).some((plant) =>
+  it('ни одна цепочка не сводится к соседним парам', () => {
+    /*
+     * ПРОВЕРКА ПЕРЕЕХАЛА С МЕЖДУ-ЦЕПОЧЕК НА ВНУТРИ-ЦЕПОЧКИ, и это следствие
+     * карты страны, а не ослабление.
+     *
+     * На карте округа у каждой цепочки была одна пара «источник — завод», и
+     * спрашивать имело смысл только одно: не все ли три цепочки уложились в
+     * одно ребро. На карте страны у каждой цепочки по десять источников и
+     * десять заводов, соседняя пара найдётся у любой — и старая проверка стала
+     * бы падать, ничего не сообщая. Разнообразие теперь живёт ВНУТРИ цепочки:
+     * у зерна плечи от 183 км до восьмисот, у нефти от 280 до тысячи с лишним.
+     *
+     * Смысл сохранён дословно: если бы цепочка укладывалась в соседние пары
+     * целиком, все рейсы по ней были бы на одно лицо и выбор маршрута исчез бы.
+     */
+    for (const chain of CHAINS) {
+      const legs = legsOf(chain).filter((km) => Number.isFinite(km))
+      expect(legs.length, `${chain.sourceType} → ${chain.processingType}`).toBeGreaterThan(0)
+
+      const adjacent = citiesOf(chain.sourceType).flatMap((source) =>
+        citiesOf(chain.processingType).filter((plant) =>
           areAdjacent(source, plant),
         ),
-      ),
-    )
-    expect(adjacentChains.length).toBeLessThan(CHAINS.length)
+      )
+      expect(
+        adjacent.length,
+        `${chain.sourceType} → ${chain.processingType}: пар всего ${legs.length}`,
+      ).toBeLessThan(legs.length)
+    }
   })
 
-  it('плечи цепочек различаются по длине в разы', () => {
-    // Разнообразие плеч — это и есть разнообразие задач: короткое кормит
-    // новичка частыми рейсами, длинное требует второй машины и планирования.
-    const legs = CHAINS.map(shortestLeg)
-    for (const leg of legs) expect(Number.isFinite(leg)).toBe(true)
+  it('внутри каждой цепочки плечи различаются в разы', () => {
+    /*
+     * Разнообразие плеч — это и есть разнообразие задач: короткое кормит
+     * новичка частыми рейсами, длинное требует второй машины и планирования.
+     * Мерить его надо ВНУТРИ цепочки (разбор — у проверки выше): на карте
+     * страны минимальные плечи трёх цепочек сошлись к 183/230/280 км,
+     * отношение 1.53, — а внутри зерновой цепочки разброс от 183 до восьмисот.
+     */
+    for (const chain of CHAINS) {
+      const legs = legsOf(chain).filter((km) => Number.isFinite(km))
+      const label = `${chain.sourceType} → ${chain.processingType}`
 
-    expect(Math.min(...legs)).toBeGreaterThan(0)
-    expect(Math.max(...legs)).toBeGreaterThanOrEqual(Math.min(...legs) * 2)
+      expect(legs.length, label).toBeGreaterThan(0)
+      expect(Math.min(...legs), label).toBeGreaterThan(0)
+      expect(Math.max(...legs), label).toBeGreaterThanOrEqual(
+        Math.min(...legs) * 2,
+      )
+    }
   })
 
   it('на старте предприятия ещё не работали', () => {

@@ -79,13 +79,42 @@
  * то же правило, по которому в LineMesh чужая сеть рисуется следом, а не схемой:
  * с обочины видно, ЧТО за машина и КУДА она едет, но не что у неё в кузове.
  * Класс (длина плиты) и курс остаются — их видно и в жизни.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * НОЧЬЮ У МАШИН ГОРЯТ ФАРЫ.
+ *
+ * Партия начинается 1 января в полночь (sim/state.ts), то есть ПЕРВЫЙ ЖЕ КАДР
+ * игры — ночной, и до сих пор ночь на карте не значила ничего: свет, тон и
+ * машины выглядели одинаково в любой час. Теперь у едущей машины впереди лежит
+ * луч.
+ *
+ * ЭТО ТОТ САМЫЙ СЛУЧАЙ, РАДИ КОТОРОГО В ПАЛИТРЕ ЗАВЕДЁН СВЕТЯЩИЙСЯ АКЦЕНТ.
+ * Замок «светится только акцент» не нарушается ни на волос: луч — того же
+ * оранжевого, что и кабина, и никакого нового цвета в сцену не приходит. Он
+ * кладётся СЛОЖЕНИЕМ поверх кадра (единственный физически верный способ рисовать
+ * свет: свет не закрашивает поверхность, а добавляется к ней) и гаснет к
+ * дальнему концу через вершинный цвет, поэтому у него нет ни границы, ни
+ * силуэта — есть только пятно света на асфальте.
+ *
+ * КОГДА ЛУЧ ГОРИТ — три условия сразу, и каждое отсекает состояние, которое иначе
+ * соврало бы: темно, машина НА ПЕРЕГОНЕ и машина НА ХОДУ. Разбор всех трёх, а
+ * заодно и того, почему у конкурентов фар нет, — в шапке vehicleLights.ts. Там же
+ * живёт вся арифметика ночи: она чистая и проверяется юнит-тестом, здесь остаются
+ * только матрицы.
+ *
+ * ОТКУДА БЕРЁТСЯ НОЧЬ. Из общего буфера атмосферы (`atmosphere` в sky.ts) — того
+ * же, из которого Scene берёт свет, туман и цвет неба. Своей кривой суток у фар
+ * НЕТ и быть не должно: две синусоиды, посчитанные в разных файлах, однажды
+ * разойдутся на четверть часа, и получится кадр, где небо ещё дневное, а фары
+ * уже горят. Буфер читается так же, как `clock.alpha`: без подписки, прямо в
+ * кадре, ровно тем слоем, которому он нужен.
  */
 
 import { useFrame } from '@react-three/fiber'
 import { useEffect, useRef } from 'react'
 import type { JSX } from 'react'
-import { Color, DynamicDrawUsage, Matrix4, Quaternion, Vector3 } from 'three'
-import type { InstancedMesh } from 'three'
+import { AdditiveBlending, Color, DynamicDrawUsage, Matrix4, Quaternion, Vector3 } from 'three'
+import type { InstancedMesh, MeshBasicMaterial, MeshStandardMaterial } from 'three'
 
 import { clock } from '../app/loop'
 import { useGameStore } from '../app/store'
@@ -104,6 +133,16 @@ import type {
 import { CFO_ORIGIN, project } from '../sim/world/projection'
 import { layers } from './layers'
 import { palette } from './palette'
+import { atmosphere } from './sky'
+import {
+  BEAM_FAR_HALF_KM,
+  BEAM_LENGTH_KM,
+  BEAM_NEAR_HALF_KM,
+  beamStrength,
+  beamsBurn,
+  cabGlow,
+  nightFrom,
+} from './vehicleLights'
 
 // ─── Форма машины ──────────────────────────────────────────────────────────
 
@@ -243,6 +282,14 @@ type RigShape = {
    * правдоподобны.
    */
   plate: Matrix4
+  /**
+   * Луч фар: перенос в точку КАПОТА, дальше форма приходит из геометрии.
+   *
+   * Масштаба нет и не будет: фары у двадцатитонника и у ЗИЛа светят одинаково.
+   * Единственное, что зависит от класса, — где начинается луч, и зависит оно от
+   * длины сцепа, потому что кабина у длинного сцепа стоит дальше вперёд.
+   */
+  beam: Matrix4
 }
 
 /**
@@ -281,6 +328,7 @@ function shapeFor(capacity: number): RigShape {
       .makeScale(scale.length, scale.height, 1)
       .setPosition(length / 2 - rig / 2, GROUND_CLEARANCE + height / 2, 0),
     plate: platePlacement(rig),
+    beam: new Matrix4().makeTranslation(rig / 2, 0, 0),
   }
 
   shapes.set(capacity, shape)
@@ -327,6 +375,82 @@ const SOLO_CAB = new Matrix4().makeTranslation(
  * приписывать сопернику работающую единицу там, где стоит наполовину купленная.
  */
 const SOLO_PLATE = platePlacement(CAB.length)
+
+/** Луч у тягача без прицепа: капот стоит на полкабины впереди точки машины. */
+const SOLO_BEAM = new Matrix4().makeTranslation(CAB.length / 2, 0, 0)
+
+// ─── Луч фар ───────────────────────────────────────────────────────────────
+
+/**
+ * Свет от фар — плоская фигура, лежащая на полотне, а не конус в воздухе.
+ *
+ * ПОЧЕМУ ПЛОСКАЯ. Камера смотрит с 35 градусов сверху; объёмный конус света с
+ * этого ракурса проецируется ровно в то же пятно, что и плоская фигура, но
+ * требует прозрачного тела, сортировки по глубине и заметно большего числа
+ * вершин. Видно при этом одно и то же — освещённый асфальт перед машиной,
+ * который и есть то, что глаз читает как «фары горят».
+ *
+ * ПОЧЕМУ ДВА ЧЕТЫРЁХУГОЛЬНИКА, А НЕ ОДИН. Одна трапеция даёт клин с ЖЁСТКИМИ
+ * краями — он читается как ещё одна лента разметки поверх дороги, то есть как
+ * тело, а не как свет. Пущенный по середине шов позволяет держать яркость в трёх
+ * точках поперёк луча: ярко в центре, слабо по краям, — и граница света
+ * растворяется вместо того, чтобы быть нарисованной. Четыре треугольника на
+ * машину; при сотне машин это четыреста треугольников на весь парк.
+ *
+ * ЯРКОСТЬ ЖИВЁТ В ВЕРШИНАХ. К дальнему концу все вершины гаснут в ноль, и при
+ * сложении ноль не добавляет ничего — у луча физически нет дальней границы, он
+ * просто кончается. Это же снимает вопрос о длине: пятно не обрывается, поэтому
+ * никакой длины на экране не «видно».
+ */
+const BEAM_SIDE_GLOW = 0.3
+
+function beamMesh(): { positions: Float32Array; colors: Float32Array } {
+  const y = GROUND_CLEARANCE
+  const near = BEAM_NEAR_HALF_KM
+  const far = BEAM_FAR_HALF_KM
+  const length = BEAM_LENGTH_KM
+
+  const positions: number[] = []
+  const colors: number[] = []
+
+  const vertex = (x: number, z: number, glow: number): void => {
+    positions.push(x, y, z)
+    colors.push(glow, glow, glow)
+  }
+
+  /**
+   * Полоса луча между двумя значениями Z у капота и двумя — на дальнем конце.
+   *
+   * Обход вершин повторяет RoadMesh (см. buildRibbons) и по той же причине: при
+   * обратном обходе нормаль треугольника смотрит вниз, и фигура отбраковывается
+   * как задняя грань — то есть свет просто не появляется на экране. Порядок
+   * «меньший Z, больший Z, дальний» даёт нормаль в +Y, и оба вызова ниже обязаны
+   * его соблюдать, а не зеркалить друг друга.
+   */
+  const strip = (
+    nearLow: number,
+    nearHigh: number,
+    farLow: number,
+    farHigh: number,
+    glowLow: number,
+    glowHigh: number,
+  ): void => {
+    vertex(0, nearLow, glowLow)
+    vertex(0, nearHigh, glowHigh)
+    vertex(length, farLow, 0)
+    vertex(length, farLow, 0)
+    vertex(0, nearHigh, glowHigh)
+    vertex(length, farHigh, 0)
+  }
+
+  // Правая половина: от края к середине. Левая: от середины к краю.
+  strip(-near, 0, -far, 0, BEAM_SIDE_GLOW, 1)
+  strip(0, near, 0, far, 1, BEAM_SIDE_GLOW)
+
+  return { positions: new Float32Array(positions), colors: new Float32Array(colors) }
+}
+
+const BEAM = beamMesh()
 
 // ─── Признак груза ─────────────────────────────────────────────────────────
 
@@ -614,6 +738,7 @@ export function Vehicles(): JSX.Element {
   const coldRef = useRef<InstancedMesh>(null)
   const bodyRef = useRef<InstancedMesh>(null)
   const rivalRef = useRef<InstancedMesh>(null)
+  const beamRef = useRef<InstancedMesh>(null)
 
   /**
    * Последний известный курс каждой машины.
@@ -632,14 +757,23 @@ export function Vehicles(): JSX.Element {
    * в состояние React перерисовывала бы дерево каждый кадр — ровно то, чего этот
    * файл избегает целиком (см. шапку).
    */
-  const drawnRef = useRef({ hot: 0, cold: 0, body: 0, rival: 0 })
+  const drawnRef = useRef({ hot: 0, cold: 0, body: 0, rival: 0, beam: 0, night: 0 })
 
   useFrame(() => {
     const hot = hotRef.current
     const cold = coldRef.current
     const body = bodyRef.current
     const rival = rivalRef.current
-    if (hot === null || cold === null || body === null || rival === null) return
+    const beam = beamRef.current
+    if (
+      hot === null ||
+      cold === null ||
+      body === null ||
+      rival === null ||
+      beam === null
+    ) {
+      return
+    }
 
     // Прямое чтение стора вместо хука: см. шапку файла.
     const { state, prev } = useGameStore.getState()
@@ -648,31 +782,73 @@ export function Vehicles(): JSX.Element {
     const alpha = raw < 0 ? 0 : raw > 1 ? 1 : raw
 
     const headings = headingsRef.current
-    const vehicles = Object.values(state.vehicles)
+
+    /*
+     * ТЕМНОТА ЧИТАЕТСЯ ИЗ ОБЩЕГО БУФЕРА, А НЕ СЧИТАЕТСЯ ЗДЕСЬ.
+     *
+     * `atmosphere` пишет Scene раз в кадр, до отрисовки, из того же тика, по
+     * которому интерполируются машины. Фарам остаётся ровно один перевод — доля
+     * дневного света в глубину ночи, — и никакой своей астрономии у них нет: две
+     * кривые суток, посчитанные в разных файлах, однажды разойдутся, и получится
+     * кадр, где небо ещё дневное, а фары уже горят.
+     *
+     * Отставание на кадр здесь возможно (порядок useFrame зависит от порядка
+     * монтирования) и совершенно безразлично: свет за 1/60 секунды не меняется
+     * ни на что заметное, а положение машин от него не зависит вовсе.
+     */
+    const night = nightFrom(atmosphere.daylight)
+
+    /*
+     * Яркость света задаётся МАТЕРИАЛОМ, а не по-инстансно, и это не упрощение:
+     * ночь на карте одна на всех, и буфер, хранящий одно и то же число на каждую
+     * машину, был бы чистой тратой шины. Присваивание числа в существующий
+     * материал — не аллокация и не пересборка шейдера: и emissiveIntensity, и
+     * opacity живут униформами.
+     */
+    ;(hot.material as MeshStandardMaterial).emissiveIntensity = cabGlow(night)
+    ;(beam.material as MeshBasicMaterial).opacity = beamStrength(night)
 
     // Настоящий размер буферов, а не значение из рендера: между тиком,
     // добавившим машину, и перерисовкой компонента проходит кадр-другой, и в
-    // этом окне машин может оказаться больше, чем мест. Берём минимум из трёх —
+    // этом окне машин может оказаться больше, чем мест. Берём минимум из пяти —
     // ёмкость у них одна, но полагаться на это в кадре незачем.
     const limit = Math.min(
       hot.instanceMatrix.count,
       cold.instanceMatrix.count,
       body.instanceMatrix.count,
       rival.instanceMatrix.count,
+      beam.instanceMatrix.count,
     )
 
-    /** Сколько инстансов уже записано в каждый из четырёх мешей. */
+    /** Сколько инстансов уже записано в каждый из пяти мешей. */
     let hotCount = 0
     let coldCount = 0
     let bodyCount = 0
     let rivalCount = 0
+    let beamCount = 0
 
-    for (const vehicle of vehicles) {
+    /**
+     * Размер парка. Считается тут же, в проходе.
+     *
+     * `Object.values(state.vehicles)` был бы короче на строку и стоил бы нового
+     * массива КАЖДЫЙ КАДР — при трёхстах машинах это трёхсотэлементный массив
+     * шестьдесят раз в секунду, ровно тот мусор, из-за которого сборщик даёт
+     * подёргивания. Обход по ключам не создаёт ничего.
+     */
+    let fleetSize = 0
+
+    for (const id in state.vehicles) {
+      const vehicle = state.vehicles[id as VehicleId]
+      fleetSize++
+
       // У каждой машины на карте ровно одно ТЕЛО, определяющее её присутствие:
       // у своей это кабина (горячая либо холодная), у чужой — плита. Поэтому
       // лимит проверяется по их сумме: она и есть число нарисованных машин.
       // Кузовов не больше, чем своих машин, так что своей проверки им не нужно.
-      if (hotCount + coldCount + rivalCount >= limit) break
+      //
+      // continue, а не break: обход обязан дойти до конца, иначе fleetSize
+      // недосчитает парк и уборка карты курсов ниже станет срабатывать впустую.
+      if (hotCount + coldCount + rivalCount >= limit) continue
 
       resolvePlacement(vehicle.position, state.world, currentPlacement)
       if (!currentPlacement.valid) continue
@@ -745,13 +921,29 @@ export function Vehicles(): JSX.Element {
 
       partMatrix.multiplyMatrices(rigMatrix, shape === null ? SOLO_CAB : shape.cab)
 
-      if (isStalled(state, vehicle)) {
+      const stalled = isStalled(state, vehicle)
+      if (stalled) {
         cold.setMatrixAt(coldCount, partMatrix)
         cold.setColorAt(coldCount, vehicle.brokenDown ? CAB_BROKEN : CAB_UNMANNED)
         coldCount++
       } else {
         hot.setMatrixAt(hotCount, partMatrix)
         hotCount++
+      }
+
+      /*
+       * ФАРЫ. Условие «на перегоне» спрашивается у положения, а не у скорости:
+       * скорости у машины в состоянии нет вовсе, а «стоит в узле против идёт по
+       * ребру» — это и есть та разница, которую видно на карте. Разбор всех трёх
+       * условий — в шапке vehicleLights.ts.
+       */
+      if (beamsBurn(night, vehicle.position.kind === 'ребро', stalled)) {
+        partMatrix.multiplyMatrices(
+          rigMatrix,
+          shape === null ? SOLO_BEAM : shape.beam,
+        )
+        beam.setMatrixAt(beamCount, partMatrix)
+        beamCount++
       }
 
       if (shape !== null) {
@@ -787,27 +979,45 @@ export function Vehicles(): JSX.Element {
     cold.count = coldCount
     body.count = bodyCount
     rival.count = rivalCount
+
+    /*
+     * Днём у лучей ноль инстансов, и это не «невидимый меш», а отсутствие
+     * отрисовки: count отсекает их до вершинного шейдера.
+     *
+     * А вот буфер матриц Three отправляет на видеокарту НЕЗАВИСИМО от count —
+     * он про геометрию, а не про число инстансов. Восемь килобайт в кадр за
+     * пустой меш днём стоят ровно ничего полезного, поэтому обновление
+     * запрашивается только когда лучи есть или только что были: последний
+     * кадр после заката обязан дойти, иначе на экране останется вчерашняя
+     * россыпь лучей.
+     */
+    const hadBeams = beam.count > 0
+    beam.count = beamCount
+
     hot.instanceMatrix.needsUpdate = true
     cold.instanceMatrix.needsUpdate = true
     body.instanceMatrix.needsUpdate = true
     rival.instanceMatrix.needsUpdate = true
+    if (beamCount > 0 || hadBeams) beam.instanceMatrix.needsUpdate = true
 
     flushColors(cold)
     flushColors(body)
 
-    // Буфера цветов у чужих машин нет вовсе: признак у них один, и он задан
-    // цветом материала (см. RIVAL_TONE).
+    // Буфера цветов ни у чужих машин, ни у лучей нет вовсе: признак у них один,
+    // и он задан цветом материала (см. RIVAL_TONE и палитру луча ниже).
 
     const drawn = drawnRef.current
     drawn.hot = hotCount
     drawn.cold = coldCount
     drawn.body = bodyCount
     drawn.rival = rivalCount
+    drawn.beam = beamCount
+    drawn.night = night
 
     // Машины выбывают редко (продажа, банкротство), но карта курсов не должна
     // расти вечно. Сверка размеров дешевле полного обхода и срабатывает только
     // после реальной убыли парка.
-    if (headings.size > vehicles.length) {
+    if (headings.size > fleetSize) {
       for (const id of headings.keys()) {
         if (!(id in state.vehicles)) headings.delete(id)
       }
@@ -848,6 +1058,16 @@ export function Vehicles(): JSX.Element {
       bodies: bodyRef.current?.count ?? 0,
       /** Чужие машины — отдельный меш, отдельный материал, отдельный счёт. */
       rivals: rivalRef.current?.count ?? 0,
+      /**
+       * Горящие фары: столько лучей нарисовано в последнем кадре.
+       *
+       * Число снято с живого меша по той же причине, что и все остальные:
+       * посчитать ночь и не смонтировать луч — ровно тот дефект, который
+       * проверка из состояния не замечает. Днём здесь честный ноль.
+       */
+      beams: beamRef.current?.count ?? 0,
+      /** Насколько сейчас темно по мнению рендера: 0 — день, 1 — глухая ночь. */
+      night: drawnRef.current.night,
       /**
        * Тон чужой плиты — строкой из палитры.
        *
@@ -988,6 +1208,55 @@ export function Vehicles(): JSX.Element {
       >
         <boxGeometry args={[PLATE.length, PLATE_HEIGHT, PLATE.width]} />
         <meshBasicMaterial color={RIVAL_TONE} toneMapped={false} />
+      </instancedMesh>
+
+      {/*
+        ФАРЫ. Последний меш парка и единственный, которого днём на видеокарте
+        нет вовсе: count = 0 отсекает инстансы до вершинного шейдера, а прозрачный
+        материал с нулевой непрозрачностью всё равно стоил бы прохода.
+
+        СЛОЖЕНИЕ, А НЕ ПРОЗРАЧНОСТЬ. Свет не закрашивает поверхность — он к ней
+        добавляется, и в этом вся разница между лучом фар и наклейкой на асфальте.
+        Полупрозрачная фигура поверх дороги ЗАМЕНЯЛА бы её цвет своим и на тёмном
+        полотне выглядела бы светлее, а на светлом — темнее; сложение всегда
+        светлее того, на что легло, ровно как настоящий свет. Оно же снимает
+        вопрос порядка отрисовки: сумма не зависит от того, что нарисовали раньше,
+        поэтому пересекающиеся лучи двух встречных машин складываются, а не
+        затирают друг друга.
+
+        depthWrite выключён по той же причине: луч не тело и не имеет права
+        закрывать собой то, что за ним. depthTest при этом ОСТАВЛЕН — застройка
+        города обязана перекрывать луч, иначе свет светил бы сквозь дома.
+
+        Цвет — акцент, и никакого другого тут быть не может: это то самое
+        свечение, ради которого в палитре заведён единственный тёплый тон.
+        Вершинный цвет гасит его к дальнему концу и к бортам (см. beamMesh).
+        Тональная компрессия отключена по тем же соображениям, что у чужой плиты
+        и у линий: оттенок обязан совпадать с палитрой, а не с тем, сколько
+        яркого попало в кадр.
+
+        Тени луч не отбрасывает и не принимает: свет, отбрасывающий тень, — это
+        уже не свет.
+      */}
+      <instancedMesh
+        ref={beamRef}
+        args={[undefined, undefined, capacity]}
+        frustumCulled={false}
+        onUpdate={markDynamic}
+      >
+        <bufferGeometry>
+          <bufferAttribute attach="attributes-position" args={[BEAM.positions, 3]} />
+          <bufferAttribute attach="attributes-color" args={[BEAM.colors, 3]} />
+        </bufferGeometry>
+        <meshBasicMaterial
+          color={palette.accent}
+          vertexColors
+          transparent
+          opacity={0}
+          depthWrite={false}
+          blending={AdditiveBlending}
+          toneMapped={false}
+        />
       </instancedMesh>
     </>
   )

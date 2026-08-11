@@ -101,18 +101,47 @@ describe('снимок для модели', () => {
     expect(snapshot.you.fleet).toHaveLength(own.length)
     expect(snapshot.you.fleet.every((v) => v.id.startsWith(RIVAL))).toBe(true)
 
-    // Карта: все города и все дороги. Кольцо строится по расстояниям, и
-    // отсутствующее ребро — это маршрут, которого модель не увидит.
-    expect(snapshot.world.cities).toHaveLength(
+    /*
+     * КАРТА — КРАЙ КОМПАНИИ, А НЕ СТРАНА, и проверяется именно это.
+     *
+     * Прежде здесь стояло «все города и все дороги»: на карте округа весь мир
+     * умещался в бюджет снимка. На карте страны полный мир — 22 тысячи символов
+     * против бюджета в 16, и дело не только в токенах: модель, которой показали
+     * Мурманск, Краснодар и Новосибирск разом, выбирает из трёх тысяч колец,
+     * осмысленных из которых единицы.
+     *
+     * Требования к горизонту два, и оба существенные: он ограничен, и в него
+     * ОБЯЗАТЕЛЬНО входят города, где у конторы уже есть дела. Снимок,
+     * умолчавший о городе, в котором стоит своя же машина, хуже отсутствующего.
+     */
+    expect(snapshot.world.cities.length).toBeLessThanOrEqual(
       Object.keys(state.world.cities).length,
     )
-    expect(snapshot.world.roads).toHaveLength(
-      Object.keys(state.world.edges).length,
-    )
+    expect(snapshot.world.cities.length).toBeGreaterThan(0)
+
+    const shown = new Set(snapshot.world.cities.map((city) => city.id))
+    for (const line of Object.values(company.lines ?? {})) {
+      for (const stop of line.stops) {
+        expect(shown.has(stop.nodeId), `остановка ${stop.nodeId}`).toBe(true)
+      }
+    }
+    for (const vehicle of own) {
+      if (vehicle.position.kind === 'узел') {
+        expect(shown.has(vehicle.position.nodeId), vehicle.id).toBe(true)
+      }
+    }
+
+    // Дорога показывается, только если показаны ОБА её конца: ребро в
+    // невидимый город — это приглашение построить линию в никуда.
+    for (const road of snapshot.world.roads) {
+      expect(shown.has(road.from) && shown.has(road.to), `${road.from}-${road.to}`).toBe(true)
+    }
 
     // Спрос — то самое число, из-за которого кольцо запирает машину гружёной.
-    const moscow = snapshot.world.cities.find((city) => city.id === 'moscow')
-    expect(moscow?.demand['мука']).toBeGreaterThan(0)
+    const anyCity = snapshot.world.cities.find(
+      (city) => (city.demand['мука'] ?? 0) > 0,
+    )
+    expect(anyCity, 'хоть один город со спросом на муку').toBeDefined()
 
     // Цепочки: у переработки виден и вход, и выход, и склад.
     const mill = snapshot.world.industries.find((i) => i.type === 'мукомольный')

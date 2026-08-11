@@ -15,6 +15,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { CSSProperties, JSX } from 'react'
 
+import { toggleSound, useSoundOn } from '../app/sound'
 import { useGameStore } from '../app/store'
 import { palette } from '../render/palette'
 import { dateFromTick, formatDate, formatTime } from '../sim/time'
@@ -159,6 +160,15 @@ export function TimeControls(): JSX.Element {
 
   const [hovered, setHovered] = useState<GameSpeed | null>(null)
 
+  /*
+   * Звук. Состояние живёт в src/app/sound.ts и читается подпиской, а не
+   * копируется сюда в useState: источник правды один — модуль звука, кнопка
+   * лишь его отражение. Своя переменная наведения нужна потому, что hovered
+   * выше типизирован скоростями, а звук скоростью не является.
+   */
+  const soundOn = useSoundOn()
+  const [soundHovered, setSoundHovered] = useState(false)
+
   /**
    * Скорость, на которую возвращаемся из паузы.
    *
@@ -263,6 +273,43 @@ export function TimeControls(): JSX.Element {
           </button>
         ))}
       </div>
+
+      {/*
+        Кнопка звука.
+
+        ОТДЕЛЬНОЙ СТРОКОЙ, А НЕ ПЯТОЙ В РЯДУ СКОРОСТЕЙ, и это арифметика, а не
+        вкус: панель шириной 172 при отступах 12 отдаёт содержимому 148
+        пикселей, четыре кнопки по 28 с зазорами занимают 124, а пятая просит
+        ещё 32 — она вылезла бы за рамку панели.
+
+        ЗВУК ВЫКЛЮЧЕН ПО УМОЛЧАНИЮ, поэтому кнопка обязана читаться как
+        предложение, а не как индикатор: слово целиком и состояние словом же.
+        Включённый звук берёт акцент — тот же оранжевый, что и активная
+        скорость, потому что это тоже «что-то в игре сейчас идёт».
+
+        Именно нажатие и есть тот жест пользователя, без которого браузер не
+        даёт запустить Web Audio: обработчик — единственное место в игре, где
+        рождается AudioContext.
+      */}
+      <button
+        type="button"
+        onClick={() => toggleSound()}
+        onMouseEnter={() => setSoundHovered(true)}
+        onMouseLeave={() => setSoundHovered(false)}
+        style={{
+          ...buttonStyle(soundOn, soundHovered),
+          width: '100%',
+          justifyContent: 'space-between',
+          fontSize: 11,
+          letterSpacing: '0.08em',
+        }}
+        aria-pressed={soundOn}
+        aria-label="Звук"
+        title={soundOn ? 'Выключить звук' : 'Включить звук'}
+      >
+        <span>звук</span>
+        <span>{soundOn ? 'вкл' : 'выкл'}</span>
+      </button>
     </div>
   )
 }

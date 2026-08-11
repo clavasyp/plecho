@@ -48,15 +48,23 @@ describe('createInitialState', () => {
     expect(JSON.parse(JSON.stringify(state))).toEqual(state)
   })
 
-  it('партия начинается 1 января 1994 года в полночь', () => {
+  it('партия начинается 1 января 1994 года утром', () => {
+    /*
+     * УТРО, А НЕ ПОЛНОЧЬ, и это решение видно на первом же экране.
+     *
+     * Ноль означал первое января в 00:00 — зимнюю полночь, самый тёмный кадр из
+     * возможных. Пока света суток не было, это ничего не значило; с ним игра
+     * стала открываться чёрным экраном, на котором из всей карты читаются
+     * только подписи городов. Девять утра — зимний рассвет с длинными тенями,
+     * тот самый кадр, ради которого свет суток и делался.
+     */
     const state = createInitialState(1)
-    expect(state.tick).toBe(0)
     expect(state.startYear).toBe(START_YEAR)
     expect(dateFromTick(state.tick, state.startYear)).toMatchObject({
       year: 1994,
       month: 1,
       day: 1,
-      hour: 0,
+      hour: 9,
       minute: 0,
     })
   })

@@ -570,9 +570,12 @@ const STARTER_PRICE = STARTER_CLASS.price
 
 describe('tick: время', () => {
   it('увеличивает счётчик тиков ровно на единицу', () => {
+    // От ТЕКУЩЕГО значения, а не от нуля: партия начинается утром, а не в
+    // полночь (разбор — у createInitialState), и «стало равно единице» означало
+    // бы проверку стартового времени, а не работы часов.
     const state = movementOnly([])
-    expect(tick(state).tick).toBe(1)
-    expect(tick(tick(state)).tick).toBe(2)
+    expect(tick(state).tick).toBe(state.tick + 1)
+    expect(tick(tick(state)).tick).toBe(state.tick + 2)
   })
 
   it('длительность тика — четверть часа', () => {
@@ -850,7 +853,8 @@ describe('десять суток без единой машины: мир за�
   it('состояние остаётся исправным весь прогон', () => {
     expect(nine.broken).toEqual([])
     expect(ten.broken).toEqual([])
-    expect(day10.tick).toBe(DAY * 10)
+    // Разница, а не абсолют: партия начинается утром, а не в полночь.
+    expect(day10.tick - WORLD.tick).toBe(DAY * 10)
   })
 
   it('к десятым суткам всё производство в мире стоит', () => {
