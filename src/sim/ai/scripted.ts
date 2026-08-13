@@ -455,23 +455,56 @@ function decide(state: GameState, companyId: CompanyId): Decision {
     }
   }
 
-  const line = findLine(company, plan)
-  if (line === undefined) {
+  /*
+   * КОЛЬЦО ВЕДЁТСЯ НЕСКОЛЬКИМИ ЛИНИЯМИ, ЕСЛИ ОДНОЙ МАЛО.
+   *
+   * Раньше здесь бралась первая попавшаяся линия кольца, и на этом всё
+   * заканчивалось: парк кольца упирался в MAX_FLEET_PER_LINE, а потребность
+   * сверх того просто не существовала. Между тем разбиение — не обход потолка,
+   * а самостоятельный приём: машины ОДНОЙ линии выходят из одной точки и
+   * держат интервал, поэтому на длинном перегоне очередь растягивается и город
+   * получает груз пачками. Счётчик снабжения при этом рвётся не от нехватки
+   * тонн, а от ПАУЗ между пачками — в разборе видно, что два груза лежат с
+   * запасом на сутки, а третий в тот же тик равен нулю.
+   *
+   * Замер в эталонном тесте роста однозначен: при одной линии порог не брался
+   * НИКАКИМ парком (30.34 / 30.33 / 30.23 / 30.32 суток при запасе ×2, ×3, ×4,
+   * ×6), а разбивка по четыре-шесть машин взяла его на 28.82 вдвое меньшим.
+   */
+  const ringLines = linesFor(company, plan)
+  const ringTarget = fleetTarget(plan, personality)
+
+  /** Линия кольца, в которую ещё влезает машина. */
+  const room = ringLines.find(
+    (candidate) =>
+      vehiclesOnLine(state, companyId, candidate.id).length <
+      MAX_FLEET_PER_LINE,
+  )
+
+  /** Сколько машин кольца уже разложено по его линиям. */
+  const onRing = ringLines.reduce(
+    (sum, candidate) =>
+      sum + vehiclesOnLine(state, companyId, candidate.id).length,
+    0,
+  )
+
+  if (room === undefined && (ringLines.length === 0 || onRing < ringTarget)) {
     return toDecision([
       {
         command: {
           kind: 'создать-линию',
-          // Имя обрезается по тому же пределу, по которому его проверяет
-          // законность (MAX_LINE_NAME_LENGTH): длинное имя не «некрасивое», а
-          // НЕЗАКОННОЕ, то есть потерянный ход. Копия чужой линии с длинным
-          // названием — самый вероятный способ в него упереться.
-          name: plan.name.slice(0, MAX_LINE_NAME_LENGTH),
+          name: ringLineName(plan, ringLines.length),
           stops: copyStops(plan.stops),
         },
-        thought: openingThought(state, plan, personality, niche),
+        thought:
+          ringLines.length === 0
+            ? openingThought(state, plan, personality, niche)
+            : `На «${plan.name}» одной колонны мало — ставлю ещё одну, чтобы машины шли врозь.`,
       },
     ])
   }
+
+  const line = room ?? ringLines[0]
 
   const reserve = cashReserve(company, personality)
   const all = ownVehicles(state, companyId)
@@ -523,7 +556,25 @@ function decide(state: GameState, companyId: CompanyId): Decision {
    * ответ у них обязан быть общий. Разойдись они, и контора начнёт увольнять
    * водителя ровно за тик до покупки машины, под которую его же и нанимала.
    */
-  const target = fleetTarget(plan, personality)
+  /*
+   * ЦЕЛЬ СЧИТАЕТСЯ НА ЭТУ ЛИНИЮ, А НЕ НА ВСЁ КОЛЬЦО.
+   *
+   * Кольцу нужно ringTarget машин, но они разложены по нескольким линиям, и
+   * решение принимается про одну из них. Спрашивать у линии цель всего кольца
+   * значило бы покупать машины до тех пор, пока КАЖДАЯ линия не наберёт полный
+   * парк кольца, — то есть купить их втрое больше нужного.
+   */
+  const onOtherLines = ringLines
+    .filter((candidate) => candidate.id !== line.id)
+    .reduce(
+      (sum, candidate) =>
+        sum + vehiclesOnLine(state, companyId, candidate.id).length,
+      0,
+    )
+  const target = Math.max(
+    1,
+    Math.min(MAX_FLEET_PER_LINE, ringTarget - onOtherLines),
+  )
   // Считается ЭКИПАЖ КОЛЬЦА, а не парк конторы — разбор у объявления crew.
   const growth =
     crew.length < target ? affordableClass(state, company, plan, reserve) : null
@@ -697,20 +748,21 @@ function choosePlan(
    * ею заниматься, а не пришпилилась к ней и перестала думать.
    */
   const started = ranked.find((plan) => {
-    const line = findLine(company, plan)
-    if (line === undefined) return false
-    const manned = vehiclesOnLine(state, company.id, line.id).filter(
-      (vehicle) => vehicle.driverId !== null && !vehicle.brokenDown,
-    )
+    const lines = linesFor(company, plan)
+    if (lines.length === 0) return false
+    // Считается парк ВСЕГО КОЛЬЦА, по всем его линиям: недобор на кольце — это
+    // недобор, даже если каждая линия по отдельности полна.
+    const manned = lines
+      .flatMap((line) => vehiclesOnLine(state, company.id, line.id))
+      .filter((vehicle) => vehicle.driverId !== null && !vehicle.brokenDown)
     return manned.length < fleetTarget(plan, personality)
   })
   if (started !== undefined) return { plan: started, niche }
 
-  // Потолок линий: сеть шире характера не растёт. Считаются СВОИ линии, а не
-  // планы: линия, оставшаяся от прежнего замысла, тоже занимает место и тоже
-  // стоит денег.
-  const lines = Object.keys(company.lines ?? {}).length
-  if (lines >= MAX_LINES[personality]) {
+  // Потолок расползания: сеть шире характера не растёт. Считаются РАЗНЫЕ
+  // КОЛЬЦА, а не линии — разбор у ringCount. Кольцо, оставшееся от прежнего
+  // замысла, тоже занимает место и тоже стоит денег.
+  if (ringCount(company) >= MAX_LINES[personality]) {
     // Место кончилось — работаем по тому кольцу, которое уже есть.
     return {
       plan: ranked.find((plan) => findLine(company, plan) !== undefined) ?? null,
@@ -1679,12 +1731,28 @@ function writeOffPerKm(vc: VehicleClass): number {
  *
  * Единица снизу остаётся: кольцо, которое не кормит и одной машины, всё равно
  * обслуживается одной — иначе его незачем было бы и планировать.
+ *
+ * ─── ПОТОЛКА ЛИНИИ ЗДЕСЬ БОЛЬШЕ НЕТ, И ЭТО ВАЖНО ───────────────────────────
+ *
+ * Раньше результат обрезался по MAX_FLEET_PER_LINE, и число теряло смысл: оно
+ * называлось «сколько машин прокормит кольцо», а отвечало на другой вопрос —
+ * «сколько машин влезет в одну линию». Кольцо, кормящее двенадцать машин,
+ * докладывало о шести, и второй половины потока не существовало ни для кого.
+ *
+ * Теперь функция говорит правду о КОЛЬЦЕ, а ограничение линии применяется там,
+ * где оно и живёт, — при раскладывании этого парка по линиям. Разбивка нужна не
+ * ради обхода потолка: машины ОДНОЙ линии выходят из одной точки и держат
+ * интервал, поэтому на длинном перегоне очередь растягивается и город получает
+ * груз пачками. Замер в эталонном тесте роста однозначен — при одной линии
+ * порог снабжения не брался никаким парком (30.34 / 30.33 / 30.23 / 30.32 суток
+ * при запасе ×2, ×3, ×4, ×6), а разбивка по четыре-шесть машин взяла его на
+ * 28.82 при вдвое меньшем парке.
  */
 function fleetForRing(perVehicleTons: number, flowTons: number): number {
   if (!(perVehicleTons > 0)) return 1
 
   const needed = Math.floor(flowTons / perVehicleTons)
-  return Math.max(1, Math.min(MAX_FLEET_PER_LINE, needed))
+  return Math.max(1, needed)
 }
 
 /**
@@ -2455,12 +2523,63 @@ function buyStep(
   }
 }
 
-/** Сколько машин характер держит на этом кольце. */
+/**
+ * Имя очередной линии кольца.
+ *
+ * Первая носит имя самого кольца, у следующих к нему приписывается номер
+ * колонны. Не косметика: линии кольца видны игроку в панели соперников, и три
+ * строки с одинаковым текстом читались бы как ошибка интерфейса, а не как
+ * замысел конкурента.
+ *
+ * Обрезка по MAX_LINE_NAME_LENGTH обязательна и делается ДО приписки: длинное
+ * имя не «некрасивое», а НЕЗАКОННОЕ, то есть потерянный ход конторы. Копия
+ * чужой линии с длинным названием — самый вероятный способ в это упереться.
+ */
+function ringLineName(plan: ScriptedPlan, existing: number): string {
+  if (existing === 0) return plan.name.slice(0, MAX_LINE_NAME_LENGTH)
+
+  const suffix = ` · ${existing + 1}`
+  return (
+    plan.name.slice(0, MAX_LINE_NAME_LENGTH - suffix.length).trimEnd() + suffix
+  )
+}
+
+/**
+ * Сколько колонн контора ставит на ОДНО кольцо.
+ *
+ * Две. Число выведено замером, а не выбрано.
+ *
+ * Разбиение кольца на линии само по себе сработало: парк мира 17 → 21, годовая
+ * касса агрессивного 2.78 → 4.31 млн, то есть +55%. Но счётчик снабжения при
+ * этом упал с 0.21 обратно в РОВНЫЙ НОЛЬ, и причина оказалась не в разбиении, а
+ * в его безграничности.
+ *
+ * Потребность кольца, переставшая обрезаться потолком линии, стала настолько
+ * большой, что кольцо почти никогда не считается укомплектованным. А
+ * планировщик переходит к следующему кольцу только тогда, когда предыдущее
+ * добрано (см. `started` в choosePlan). Значит контора вечно доливает машины в
+ * первое кольцо и НЕ ОТКРЫВАЕТ ТРЕТЬЕ — а городу нужно ровно три, по одному на
+ * груз. Замер это и показал: агрессивный ушёл с трёх колец на два.
+ *
+ * Две колонны дают кольцу до двенадцати машин — больше, чем прокормит любое
+ * кольцо этой карты, — и при этом кольцо остаётся достижимо укомплектованным,
+ * то есть контора доходит до третьего направления.
+ */
+export const MAX_LINES_PER_RING = 2
+
+/**
+ * Сколько машин характер держит на этом кольце — по всем его линиям вместе.
+ *
+ * Потолок здесь, а не в fleetForRing: тот отвечает на вопрос «сколько кольцо
+ * прокормит» и обязан говорить правду, а этот — на вопрос «сколько контора
+ * готова туда вложить», и он про характер и про достижимость цели.
+ */
 function fleetTarget(
   plan: ScriptedPlan,
   personality: CompetitorPersonality,
 ): number {
-  return Math.max(1, Math.ceil(plan.fleetTarget * FLEET_SHARE[personality]))
+  const wanted = Math.ceil(plan.fleetTarget * FLEET_SHARE[personality])
+  return Math.max(1, Math.min(MAX_FLEET_PER_LINE * MAX_LINES_PER_RING, wanted))
 }
 
 /**
@@ -2701,6 +2820,22 @@ function citiesOf(state: GameState, companyId: CompanyId): Set<CityId> {
  * это разные маршруты с разными плечами.
  */
 function findLine(company: Company, plan: ScriptedPlan): Line | undefined {
+  return linesFor(company, plan)[0]
+}
+
+/**
+ * ВСЕ линии компании по этому кольцу, а не первая попавшаяся.
+ *
+ * Одно кольцо может вестись НЕСКОЛЬКИМИ линиями, и это не дубликат по
+ * недосмотру, а способ выпускать машины не одной пачкой. Разбор — у
+ * fleetForRing и у MAX_FLEET_PER_LINE.
+ *
+ * Порядок сохраняется тот же, в каком линии лежат в реестре: он устойчив между
+ * тиками, а значит устойчив и выбор линии, которую сейчас доукомплектовывают.
+ */
+function linesFor(company: Company, plan: ScriptedPlan): Line[] {
+  const found: Line[] = []
+
   for (const line of Object.values(company.lines ?? {})) {
     if (line.stops.length !== plan.stops.length) continue
 
@@ -2711,9 +2846,29 @@ function findLine(company: Company, plan: ScriptedPlan): Line | undefined {
         break
       }
     }
-    if (same) return line
+    if (same) found.push(line)
   }
-  return undefined
+
+  return found
+}
+
+/**
+ * Сколько РАЗНЫХ колец ведёт компания.
+ *
+ * Именно этим числом ограничивается расползание по карте (MAX_LINES), а не
+ * числом линий. Разница появилась вместе с разбиением кольца: контора, которая
+ * держит на одном кольце три линии, ведёт ОДНО направление, а не три, и считать
+ * ей это за расползание значит запретить разбиение вовсе.
+ *
+ * Кольцо опознаётся последовательностью городов — тем же признаком, по которому
+ * линии сопоставляются плану.
+ */
+function ringCount(company: Company): number {
+  const rings = new Set<string>()
+  for (const line of Object.values(company.lines ?? {})) {
+    rings.add(line.stops.map((stop) => stop.nodeId).join('>'))
+  }
+  return rings.size
 }
 
 /**
